@@ -96,6 +96,39 @@ test "agent loop construct" {
     try std.testing.expect(true);
 }
 
+test "agent loop seed and syncToSession" {
+    const alloc = std.testing.allocator;
+    var ctx = try cordis.Context.init(alloc);
+    defer ctx.deinit();
+
+    var reg = try tool_reg.ToolRegistry.init(alloc);
+    defer reg.deinit();
+    try tool_reg.registerBuiltins(&reg);
+
+    const cfg = agent.AgentConfig{ .system_prompt = "be brief", .max_turns = 4, .reasoning_effort = null };
+    const ag = try agent.Agent.init(alloc, ctx.root, &cfg);
+    defer ag.deinit(alloc);
+
+    const client = model.ChatClient.init(alloc, ctx.io(), "https://api.deepseek.com/chat/completions", "deepseek-chat", "");
+    var loop = try agent.AgentLoop.init(alloc, ctx, ag, client, &reg, "/tmp", null);
+    defer loop.deinit();
+
+    // Seed a prior transcript (as a resumed session would) and verify it can
+    // be mirrored back into a session for persistence.
+    try loop.seed(alloc, model.Message{ .role = .user, .content = "hello" });
+    try loop.seed(alloc, model.Message{ .role = .assistant, .content = "hi", .tool_calls_json = null });
+    try loop.seed(alloc, model.Message{ .role = .tool, .content = "ok", .tool_call_id = "1" });
+
+    var s = try session.Session.init(alloc, "bridge");
+    defer s.deinit();
+    try loop.syncToSession(&s);
+
+    try std.testing.expectEqual(@as(usize, 3), s.count());
+    try std.testing.expectEqualStrings("hello", s.messages.items[0].content);
+    try std.testing.expectEqual(model.Role.tool, s.messages.items[2].role);
+    try std.testing.expectEqualStrings("1", s.messages.items[2].tool_call_id.?);
+}
+
 test "session roundtrip" {
     const alloc = std.testing.allocator;
     var ctx = try cordis.Context.init(alloc);

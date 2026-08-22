@@ -11,6 +11,7 @@ const cordis = @import("cordis");
 const model_mod = @import("../model/model.zig");
 const tool_reg = @import("../tool/registry.zig");
 const tool_builtin = @import("../tool/builtin.zig");
+const session_mod = @import("../session/session.zig");
 const Message = model_mod.Message;
 const Role = model_mod.Role;
 const ChatClient = model_mod.ChatClient;
@@ -107,6 +108,33 @@ pub const AgentLoop = struct {
             if (m.tool_calls_json) |t| self.alloc.free(t);
         }
         self.messages.deinit(self.alloc);
+    }
+
+    /// Seed the loop's transcript from a previously-loaded session so a
+    /// conversation can be resumed (dev.md §XV). Each message is cloned into
+    /// the loop's allocator.
+    pub fn seed(self: *AgentLoop, alloc: std.mem.Allocator, m: Message) !void {
+        try self.messages.append(alloc, Message{
+            .role = m.role,
+            .content = try alloc.dupe(u8, m.content),
+            .tool_call_id = if (m.tool_call_id) |v| try alloc.dupe(u8, v) else null,
+            .tool_calls_json = if (m.tool_calls_json) |v| try alloc.dupe(u8, v) else null,
+        });
+    }
+
+    /// Mirror the loop's full transcript into a session (replacing any prior
+    /// content) so it can be persisted. The system prompt is not part of the
+    /// message list and is intentionally omitted.
+    pub fn syncToSession(self: *AgentLoop, s: *session_mod.Session) !void {
+        s.clear();
+        for (self.messages.items) |m| {
+            switch (m.role) {
+                .user => try s.addUser(m.content),
+                .assistant => try s.addAssistant(m.content, m.tool_calls_json),
+                .tool => try s.addToolResult(m.tool_call_id orelse "", m.content),
+                .system => {},
+            }
+        }
     }
 
     fn emit(self: *AgentLoop, kind: EventKind, payload: []const u8) void {

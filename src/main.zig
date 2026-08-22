@@ -7,6 +7,7 @@ const model = @import("model/model.zig");
 const tool_reg = @import("tool/registry.zig");
 const tool_builtin = @import("tool/builtin.zig");
 const agent = @import("agent/agent.zig");
+const session = @import("session/session.zig");
 
 const SYSTEM_PROMPT =
     \\You are zharness, a coding agent running inside a workspace. You help the user by
@@ -42,6 +43,7 @@ fn printUsage() void {
         \\  --model X        Override the model
         \\  --provider Y     Override the provider
         \\  --no-stream     Disable streaming
+        \\  --session ID     Resume/save a named session (persisted under .zharness/sessions/)
         \\
     , .{});
 }
@@ -107,21 +109,56 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config) !struct {
     return .{ .ctx = ctx, .tools = tools, .loop = loop, .ag = ag };
 }
 
-fn runTask(alloc: std.mem.Allocator, cfg: *config.Config, prompt: []const u8) !void {
+fn runTask(alloc: std.mem.Allocator, cfg: *config.Config, prompt: []const u8, session_id: ?[]const u8) !void {
     const built = try buildLoop(alloc, cfg);
     defer built.ctx.deinit();
     defer built.tools.deinit();
     defer built.loop.deinit();
     defer alloc.destroy(built.loop);
     defer alloc.destroy(built.tools);
+
+    const io = built.ctx.io();
+
+    // Optional named session: load any prior transcript and seed the loop so
+    // the run continues the conversation (dev.md §XV).
+    var session_ptr: ?*session.Session = null;
+    var session_path: ?[]u8 = null;
+    if (session_id) |sid| {
+        const dir = try std.fs.path.join(alloc, &.{ cfg.cwd, ".zharness", "sessions" });
+        std.Io.Dir.createDirPath(.cwd(), io, dir) catch {};
+        const p = try std.fmt.allocPrint(alloc, "{s}/{s}.json", .{ dir, sid });
+        alloc.free(dir);
+        session_path = p;
+        const s = try alloc.create(session.Session);
+        errdefer alloc.destroy(s);
+        s.* = try session.Session.init(alloc, sid);
+        errdefer s.deinit();
+        s.load(io, p) catch |e| switch (e) {
+            error.FileNotFound => {},
+            else => return e,
+        };
+        for (s.messages.items) |m| try built.loop.seed(alloc, m);
+        session_ptr = s;
+    }
+    defer if (session_ptr) |s| {
+        s.deinit();
+        alloc.destroy(s);
+    };
+    defer if (session_path) |p| alloc.free(p);
 
     const answer = try built.loop.run(prompt);
     // onEvent already prints the final answer; print a trailing newline for run too
     std.debug.print("\n", .{});
     alloc.free(answer);
+
+    if (session_ptr) |s| {
+        try built.loop.syncToSession(s);
+        try s.save(io, session_path.?);
+        std.debug.print("\nsession saved: {s}\n", .{session_path.?});
+    }
 }
 
-fn chatLoop(alloc: std.mem.Allocator, cfg: *config.Config) !void {
+fn chatLoop(alloc: std.mem.Allocator, cfg: *config.Config, session_id: ?[]const u8) !void {
     const built = try buildLoop(alloc, cfg);
     defer built.ctx.deinit();
     defer built.tools.deinit();
@@ -129,7 +166,38 @@ fn chatLoop(alloc: std.mem.Allocator, cfg: *config.Config) !void {
     defer alloc.destroy(built.loop);
     defer alloc.destroy(built.tools);
 
-    std.debug.print("zharness chat — type 'exit' or 'quit' to leave.\n\n", .{});
+    const io = built.ctx.io();
+
+    // Optional named session: load prior transcript, resume across turns and
+    // process invocations, and persist after every exchange.
+    var session_ptr: ?*session.Session = null;
+    var session_path: ?[]u8 = null;
+    if (session_id) |sid| {
+        const dir = try std.fs.path.join(alloc, &.{ cfg.cwd, ".zharness", "sessions" });
+        std.Io.Dir.createDirPath(.cwd(), io, dir) catch {};
+        const p = try std.fmt.allocPrint(alloc, "{s}/{s}.json", .{ dir, sid });
+        alloc.free(dir);
+        session_path = p;
+        const s = try alloc.create(session.Session);
+        errdefer alloc.destroy(s);
+        s.* = try session.Session.init(alloc, sid);
+        errdefer s.deinit();
+        s.load(io, p) catch |e| switch (e) {
+            error.FileNotFound => {},
+            else => return e,
+        };
+        for (s.messages.items) |m| try built.loop.seed(alloc, m);
+        session_ptr = s;
+    }
+    defer if (session_ptr) |s| {
+        s.deinit();
+        alloc.destroy(s);
+    };
+    defer if (session_path) |p| alloc.free(p);
+
+    std.debug.print("zharness chat", .{});
+    if (session_ptr) |s| std.debug.print(" — session '{s}' ({d} messages)", .{ s.id, s.count() });
+    std.debug.print(" — type 'exit' or 'quit' to leave.\n\n", .{});
 
     while (true) {
         std.debug.print("you> ", .{});
@@ -151,7 +219,17 @@ fn chatLoop(alloc: std.mem.Allocator, cfg: *config.Config) !void {
         };
         std.debug.print("\n", .{});
         alloc.free(answer);
+
+        if (session_ptr) |s| {
+            try built.loop.syncToSession(s);
+            try s.save(io, session_path.?);
+        }
         alloc.free(owned);
+    }
+
+    if (session_ptr) |s| {
+        try s.save(io, session_path.?);
+        std.debug.print("\nsession saved: {s}\n", .{session_path.?});
     }
     std.debug.print("\nbye.\n", .{});
 }
@@ -193,6 +271,7 @@ pub fn main(init: std.process.Init) !void {
         var model_opt: ?[]const u8 = null;
         var provider_opt: ?[]const u8 = null;
         var no_stream = false;
+        var session_id: ?[]const u8 = null;
 
         var prompt: ?[]const u8 = null;
         var i: usize = 2;
@@ -214,6 +293,13 @@ pub fn main(init: std.process.Init) !void {
                 provider_opt = args[i];
             } else if (std.mem.eql(u8, a, "--no-stream")) {
                 no_stream = true;
+            } else if (std.mem.eql(u8, a, "--session")) {
+                i += 1;
+                if (i >= args.len) {
+                    std.debug.print("error: --session requires a value\n", .{});
+                    std.process.exit(1);
+                }
+                session_id = args[i];
             } else {
                 prompt = a;
             }
@@ -237,7 +323,7 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
 
-        try runTask(alloc, &cfg, prompt.?);
+        try runTask(alloc, &cfg, prompt.?, session_id);
         return;
     }
 
@@ -246,6 +332,7 @@ pub fn main(init: std.process.Init) !void {
         var model_opt: ?[]const u8 = null;
         var provider_opt: ?[]const u8 = null;
         var no_stream = false;
+        var session_id: ?[]const u8 = null;
         var i: usize = 2;
         while (i < args.len) : (i += 1) {
             const a = args[i];
@@ -257,6 +344,9 @@ pub fn main(init: std.process.Init) !void {
                 if (i < args.len) provider_opt = args[i];
             } else if (std.mem.eql(u8, a, "--no-stream")) {
                 no_stream = true;
+            } else if (std.mem.eql(u8, a, "--session")) {
+                i += 1;
+                if (i < args.len) session_id = args[i];
             }
         }
 
@@ -272,7 +362,7 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
 
-        try chatLoop(alloc, &cfg);
+        try chatLoop(alloc, &cfg, session_id);
         return;
     }
 
