@@ -1,0 +1,21 @@
+# Zig build output
+zig-out/
+.zig-cache/
+
+# Vendored dependency downloads
+zig-pkg/
+
+# OS
+.DS_Store
+*.swp
+*.swo
+
+# Editor
+.vscode/
+.idea/
+
+# Build artifacts
+*.o
+*.a
+*.obj
+_ref/DeepSeek-Reasonix/

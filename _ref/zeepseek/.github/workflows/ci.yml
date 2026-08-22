@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    name: zig build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Zig (pinned in .zigversion)
+        uses: mlugg/setup-zig@v1
+
+      - name: Build (ReleaseFast)
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Unit tests
+        run: zig build test
+
+      - name: Integration tests compile
+        # Compiles the integration-test target (requires external services at
+        # runtime: an echo server on :18472 and/or DEEPSEEK_API_KEY). We only
+        # build it here so the target stays green; it is not executed.
+        run: zig build integration-test-compile

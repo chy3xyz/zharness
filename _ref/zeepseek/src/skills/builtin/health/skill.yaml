@@ -1,0 +1,56 @@
+name: health
+display_name: Health Check
+description: Code quality dashboard - runs type checker, linter, test runner, and computes a weighted composite 0-10 score
+version: 1.0.0
+author: zeepseek
+source:
+  local:
+    path: builtin/health
+
+commands:
+  - name: health
+    description: Run code quality checks and compute health score
+    usage: "/health"
+    handler: prompt:health_check
+
+  - name: lint
+    description: Run linter on the codebase
+    usage: "/lint [path]"
+    handler: prompt:lint_check
+
+  - name: test-all
+    description: Run all tests
+    usage: "/test-all"
+    handler: prompt:test_run
+
+tools:
+  - shell
+  - git_status
+  - git_diff
+
+prompts:
+  - name: health_check
+    template: |
+      Run code quality checks:
+      1. Type checker / compiler
+      2. Linter
+      3. Test runner
+      4. Dead code detector
+
+      Compute weighted composite 0-10 score:
+      - Tests passing (40%)
+      - No type errors (30%)
+      - No lint warnings (20%)
+      - Code coverage (10%)
+
+  - name: lint_check
+    template: |
+      Run the linter on the specified path.
+      Report all warnings and errors.
+      Suggest fixes for any issues found.
+
+  - name: test_run
+    template: |
+      Execute all tests in the project.
+      Report pass/fail for each test suite.
+      Identify any flaky or failing tests.

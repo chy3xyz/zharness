@@ -1,0 +1,44 @@
+name: design-review
+display_name: Design Review
+description: Designer's eye QA - finds visual inconsistency, spacing issues, hierarchy problems, AI slop patterns, and slow interactions
+version: 1.0.0
+author: zeepseek
+source:
+  local:
+    path: builtin/design-review
+
+commands:
+  - name: design-review
+    description: Designer's eye QA - finds visual inconsistency, spacing issues, hierarchy problems
+    usage: "/design-review [url]"
+    handler: prompt:design_review
+
+  - name: design-shotgun
+    description: Generate multiple AI design variants and open a comparison board
+    usage: "/design-shotgun [description]"
+    handler: prompt:design_shotgun
+
+  - name: plan-design-review
+    description: Designer's eye plan review before implementation
+    usage: "/plan-design-review"
+    handler: prompt:plan_design_review
+
+tools:
+  - gstack-design
+
+prompts:
+  - name: design_review
+    template: |
+      You are a design critic. Review the UI/UX for visual inconsistency, 
+      spacing issues, hierarchy problems, and slow interactions.
+      Focus on: alignment, contrast, typography, spacing, color harmony.
+
+  - name: design_shotgun
+    template: |
+      Generate 3-5 distinct design variants for the described feature.
+      Each variant should explore a different aesthetic direction.
+
+  - name: plan_design_review
+    template: |
+      Rate each design dimension 0-10, explain what would make it a 10,
+      then fix the plan to get there.

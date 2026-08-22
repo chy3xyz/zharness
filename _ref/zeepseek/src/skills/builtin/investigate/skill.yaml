@@ -1,0 +1,45 @@
+name: investigate
+display_name: Investigate
+description: Systematic debugging with root cause investigation. Four phases: investigate, analyze, hypothesize, implement.
+version: 1.0.0
+author: zeepseek
+source:
+  local:
+    path: builtin/investigate
+
+commands:
+  - name: investigate
+    description: Systematic debugging with root cause investigation
+    usage: "/investigate [issue description]"
+    handler: prompt:investigate
+
+  - name: debug
+    description: Debug and fix an error or bug
+    usage: "/debug [error description]"
+    handler: prompt:debug_flow
+
+tools:
+  - shell
+  - file_read
+  - grep
+
+prompts:
+  - name: investigate
+    template: |
+      You are a debugging expert. Follow this systematic approach:
+      1. INVESTIGATE: Gather facts, reproduce the issue, gather evidence
+      2. ANALYZE: Identify patterns, find correlations, check assumptions
+      3. HYPOTHESIZE: Generate possible causes, rank by likelihood
+      4. IMPLEMENT: Fix the root cause, verify the fix
+
+      Iron Law: No fixes without root cause.
+
+  - name: debug_flow
+    template: |
+      Debug workflow activated. Start by gathering:
+      - Error messages and stack traces
+      - When it started happening
+      - Recent changes
+      - Environment details
+
+      Then trace the execution path to find the root cause.

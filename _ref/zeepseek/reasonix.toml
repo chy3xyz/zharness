@@ -1,0 +1,2 @@
+[permissions]
+allow = ["Bash=cd /Users/n0x/w4_proj/dev_machine/zeepseek && cat zig-pkg/vaxis-0.6.0-BWNV_KwYCgDSbZigsbwnpd5oQXBDRcAKMlkZRwbKMX7t/build.zig.zon 2>/dev/null; echo \"=== zig-pkg dir ===\"; ls zig-pkg/; echo \"=== env ===\"; env | grep -i zig; echo \"=== zigup ===\"; ls ~/.local/share/zigup/ 2>/dev/null"]

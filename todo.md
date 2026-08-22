@@ -1,0 +1,1 @@
+使用zig 0.17 将deepseek-harness 重写为 zharness, 对应的参考源码在 _ref 文件下， 其中 deepseek 是我们做的项目，里头有大量的代码实现可以参考，复用，少造些轮子。   其中 zcordis 是我们的项目，也是用zig 0.17 开发的，代码在 /Users/n0x/w4_proj/dev_machine/zcordis 下，如果有问题，你可以直接修改，并提交。
