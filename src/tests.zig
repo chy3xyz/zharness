@@ -37,7 +37,10 @@ test "tool registry builds json" {
 
 test "builtin shell echo" {
     const alloc = std.testing.allocator;
-    var res = try tool_builtin.execute(alloc, "/tmp", .{ .name = "shell", .arguments = "{\"command\":\"echo hi\"}" });
+    var ctx = try cordis.Context.init(alloc);
+    defer ctx.deinit();
+    const io = ctx.io();
+    var res = try tool_builtin.execute(alloc, io, "/tmp", .{ .name = "shell", .arguments = "{\"command\":\"echo hi\"}" });
     defer tool_builtin.freeResult(alloc, &res);
     try std.testing.expect(res.success);
     try std.testing.expect(std.mem.indexOf(u8, res.output, "hi") != null);
@@ -45,22 +48,25 @@ test "builtin shell echo" {
 
 test "builtin file read write edit roundtrip" {
     const alloc = std.testing.allocator;
+    var ctx = try cordis.Context.init(alloc);
+    defer ctx.deinit();
+    const io = ctx.io();
     const path = "/tmp/zharness_test_file.txt";
 
-    var w = try tool_builtin.execute(alloc, "/tmp", .{ .name = "file_write", .arguments = "{\"path\":\"/tmp/zharness_test_file.txt\",\"content\":\"hello\\n\"}" });
+    var w = try tool_builtin.execute(alloc, io, "/tmp", .{ .name = "file_write", .arguments = "{\"path\":\"/tmp/zharness_test_file.txt\",\"content\":\"hello\\n\"}" });
     defer tool_builtin.freeResult(alloc, &w);
     try std.testing.expect(w.success);
 
-    var r = try tool_builtin.execute(alloc, "/tmp", .{ .name = "file_read", .arguments = "{\"path\":\"/tmp/zharness_test_file.txt\"}" });
+    var r = try tool_builtin.execute(alloc, io, "/tmp", .{ .name = "file_read", .arguments = "{\"path\":\"/tmp/zharness_test_file.txt\"}" });
     defer tool_builtin.freeResult(alloc, &r);
     try std.testing.expect(r.success);
     try std.testing.expectEqualSlices(u8, "hello\n", r.output);
 
-    var e = try tool_builtin.execute(alloc, "/tmp", .{ .name = "file_edit", .arguments = "{\"path\":\"/tmp/zharness_test_file.txt\",\"old_string\":\"hello\",\"new_string\":\"world\"}" });
+    var e = try tool_builtin.execute(alloc, io, "/tmp", .{ .name = "file_edit", .arguments = "{\"path\":\"/tmp/zharness_test_file.txt\",\"old_string\":\"hello\",\"new_string\":\"world\"}" });
     defer tool_builtin.freeResult(alloc, &e);
     try std.testing.expect(e.success);
 
-    var r2 = try tool_builtin.execute(alloc, "/tmp", .{ .name = "file_read", .arguments = "{\"path\":\"/tmp/zharness_test_file.txt\"}" });
+    var r2 = try tool_builtin.execute(alloc, io, "/tmp", .{ .name = "file_read", .arguments = "{\"path\":\"/tmp/zharness_test_file.txt\"}" });
     defer tool_builtin.freeResult(alloc, &r2);
     try std.testing.expect(r2.success);
     try std.testing.expectEqualSlices(u8, "world\n", r2.output);
@@ -92,21 +98,24 @@ test "agent loop construct" {
 
 test "session roundtrip" {
     const alloc = std.testing.allocator;
+    var ctx = try cordis.Context.init(alloc);
+    defer ctx.deinit();
+    const io = ctx.io();
     const path = "/tmp/zharness_session_test.json";
 
     var s = try session.Session.init(alloc, "s1");
     defer s.deinit();
     try s.addUser("hi");
     try s.addAssistant("ok", null);
-    try s.save(path);
+    try s.save(io, path);
 
     var s2 = try session.Session.init(alloc, "s2");
     defer s2.deinit();
-    try s2.load(path);
+    try s2.load(io, path);
 
     try std.testing.expectEqual(s2.count(), s.count());
 
-    clib.removeFile(path);
+    std.Io.Dir.deleteFileAbsolute(io, path) catch {};
 }
 
 test "model findMatchingBracket sample" {

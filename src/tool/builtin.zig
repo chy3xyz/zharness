@@ -128,12 +128,12 @@ fn freeArgs(alloc: std.mem.Allocator, map: *std.StringHashMap([]const u8)) void 
 
 /// Dispatch a tool call to the correct executor. `alloc` must outlive the
 /// returned `ToolResult.output`/`err_msg` (caller frees via freeResult).
-pub fn execute(alloc: std.mem.Allocator, cwd: []const u8, call: ToolCall) !ToolResult {
-    if (std.mem.eql(u8, call.name, "file_read")) return fileRead(alloc, cwd, call);
-    if (std.mem.eql(u8, call.name, "file_write")) return fileWrite(alloc, cwd, call);
-    if (std.mem.eql(u8, call.name, "file_edit")) return fileEdit(alloc, cwd, call);
+pub fn execute(alloc: std.mem.Allocator, io: std.Io, cwd: []const u8, call: ToolCall) !ToolResult {
+    if (std.mem.eql(u8, call.name, "file_read")) return fileRead(alloc, io, cwd, call);
+    if (std.mem.eql(u8, call.name, "file_write")) return fileWrite(alloc, io, cwd, call);
+    if (std.mem.eql(u8, call.name, "file_edit")) return fileEdit(alloc, io, cwd, call);
     if (std.mem.eql(u8, call.name, "glob")) return glob(alloc, cwd, call);
-    if (std.mem.eql(u8, call.name, "grep")) return grepTool(alloc, cwd, call);
+    if (std.mem.eql(u8, call.name, "grep")) return grepTool(alloc, io, cwd, call);
     if (std.mem.eql(u8, call.name, "shell")) return shell(alloc, cwd, call);
     if (std.mem.eql(u8, call.name, "git_status")) return gitRun(alloc, cwd, &.{ "status", "--porcelain" });
     if (std.mem.eql(u8, call.name, "git_diff")) return gitDiff(alloc, cwd, call);
@@ -148,7 +148,7 @@ pub fn freeResult(alloc: std.mem.Allocator, res: *const ToolResult) void {
     if (res.err_msg) |m| alloc.free(m);
 }
 
-fn fileRead(alloc: std.mem.Allocator, cwd: []const u8, call: ToolCall) !ToolResult {
+fn fileRead(alloc: std.mem.Allocator, io: std.Io, cwd: []const u8, call: ToolCall) !ToolResult {
     var map = try parseArgs(alloc, call.arguments);
     defer freeArgs(alloc, &map);
     const path = map.get("path") orelse return ToolResult{ .success = false, .output = "", .err_msg = "missing path" };
@@ -157,34 +157,21 @@ fn fileRead(alloc: std.mem.Allocator, cwd: []const u8, call: ToolCall) !ToolResu
     if (!isInsideWorkspace(resolved, cwd)) {
         return ToolResult{ .success = false, .output = "", .err_msg = "path is outside the workspace" };
     }
-    const content = readFileC(alloc, resolved) catch |e| {
+    const content = readFileC(alloc, io, resolved) catch |e| {
         return ToolResult{ .success = false, .output = "", .err_msg = try alloc.dupe(u8, @errorName(e)) };
     };
     return ToolResult{ .success = true, .output = content };
 }
 
-/// Read an entire file via libc (std.c.fopen/fread, chunked). Caller owns
-/// the returned slice (allocated with `alloc`). `fseek`/`ftell` are not
-/// exposed by Zig 0.17's `std.c`, so we grow a buffer as we read.
-fn readFileC(alloc: std.mem.Allocator, path: []const u8) ![]const u8 {
-    const path_z = try alloc.dupeSentinel(u8, path, 0);
-    defer alloc.free(path_z);
-
-    const fp = c.fopen(path_z.ptr, "rb") orelse return error.FileNotFound;
-    defer _ = c.fclose(fp);
-
-    var buf = try std.ArrayList(u8).initCapacity(alloc, 0);
-    errdefer buf.deinit(alloc);
-    var chunk: [8192]u8 = undefined;
-    while (true) {
-        const n = c.fread(&chunk, 1, chunk.len, fp);
-        if (n == 0) break;
-        try buf.appendSlice(alloc, chunk[0..n]);
-    }
-    return try buf.toOwnedSlice(alloc);
+/// Read an entire file via `std.Io.Dir` (Zig 0.17's file API; `std.fs.cwd`
+/// was relocated here). Caller owns the returned slice (allocated with
+/// `alloc`). `path` may be absolute — on POSIX `openFile` resolves an
+/// absolute `sub_path` against the process cwd regardless.
+fn readFileC(alloc: std.mem.Allocator, io: std.Io, path: []const u8) ![]const u8 {
+    return std.Io.Dir.readFileAlloc(.cwd(), io, path, alloc, .unlimited);
 }
 
-fn fileWrite(alloc: std.mem.Allocator, cwd: []const u8, call: ToolCall) !ToolResult {
+fn fileWrite(alloc: std.mem.Allocator, io: std.Io, cwd: []const u8, call: ToolCall) !ToolResult {
     var map = try parseArgs(alloc, call.arguments);
     defer freeArgs(alloc, &map);
     const path = map.get("path") orelse return ToolResult{ .success = false, .output = "", .err_msg = "missing path" };
@@ -197,7 +184,7 @@ fn fileWrite(alloc: std.mem.Allocator, cwd: []const u8, call: ToolCall) !ToolRes
     if (std.fs.path.dirname(resolved)) |dir| {
         ensureDir(alloc, dir);
     }
-    writeFileC(alloc, resolved, content) catch |e| {
+    writeFileC(alloc, io, resolved, content) catch |e| {
         return ToolResult{ .success = false, .output = "", .err_msg = try alloc.dupe(u8, @errorName(e)) };
     };
     const msg = try std.fmt.allocPrint(alloc, "wrote {} bytes to {s}", .{ content.len, resolved });
@@ -220,19 +207,14 @@ fn ensureDir(alloc: std.mem.Allocator, dir: []const u8) void {
     _ = alloc;
 }
 
-/// Write `content` to `path` via libc (std.c.fopen/fwrite/fclose).
-fn writeFileC(alloc: std.mem.Allocator, path: []const u8, content: []const u8) !void {
-    const path_z = try alloc.dupeSentinel(u8, path, 0);
-    defer alloc.free(path_z);
-
-    const fp = c.fopen(path_z.ptr, "wb") orelse return error.FileNotFound;
-    defer _ = c.fclose(fp);
-
-    const written = c.fwrite(content.ptr, 1, content.len, fp);
-    if (written != content.len) return error.WriteError;
+/// Write `content` to `path` via `std.Io.Dir` (Zig 0.17's file API;
+/// `std.fs.cwd` was relocated here).
+fn writeFileC(alloc: std.mem.Allocator, io: std.Io, path: []const u8, content: []const u8) !void {
+    _ = alloc;
+    try std.Io.Dir.writeFile(.cwd(), io, .{ .sub_path = path, .data = content });
 }
 
-fn fileEdit(alloc: std.mem.Allocator, cwd: []const u8, call: ToolCall) !ToolResult {
+fn fileEdit(alloc: std.mem.Allocator, io: std.Io, cwd: []const u8, call: ToolCall) !ToolResult {
     var map = try parseArgs(alloc, call.arguments);
     defer freeArgs(alloc, &map);
     const path = map.get("path") orelse return ToolResult{ .success = false, .output = "", .err_msg = "missing path" };
@@ -243,7 +225,7 @@ fn fileEdit(alloc: std.mem.Allocator, cwd: []const u8, call: ToolCall) !ToolResu
     if (!isInsideWorkspace(resolved, cwd)) {
         return ToolResult{ .success = false, .output = "", .err_msg = "path is outside the workspace" };
     }
-    const original = readFileC(alloc, resolved) catch |e| {
+    const original = readFileC(alloc, io, resolved) catch |e| {
         return ToolResult{ .success = false, .output = "", .err_msg = try alloc.dupe(u8, @errorName(e)) };
     };
     defer alloc.free(original);
@@ -260,7 +242,7 @@ fn fileEdit(alloc: std.mem.Allocator, cwd: []const u8, call: ToolCall) !ToolResu
     @memcpy(updated[idx .. idx + new_s.len], new_s);
     @memcpy(updated[idx + new_s.len ..], original[idx + old_s.len ..]);
     defer alloc.free(updated);
-    writeFileC(alloc, resolved, updated) catch |e| {
+    writeFileC(alloc, io, resolved, updated) catch |e| {
         return ToolResult{ .success = false, .output = "", .err_msg = try alloc.dupe(u8, @errorName(e)) };
     };
     const msg = try std.fmt.allocPrint(alloc, "edited {s} ({} -> {} bytes)", .{ resolved, original.len, updated.len });
@@ -374,7 +356,7 @@ fn matchGlob(path: []const u8, pattern: []const u8) bool {
     return pi == pattern.len;
 }
 
-fn grepTool(alloc: std.mem.Allocator, cwd: []const u8, call: ToolCall) !ToolResult {
+fn grepTool(alloc: std.mem.Allocator, io: std.Io, cwd: []const u8, call: ToolCall) !ToolResult {
     var map = try parseArgs(alloc, call.arguments);
     defer freeArgs(alloc, &map);
     const pattern = map.get("pattern") orelse return ToolResult{ .success = false, .output = "", .err_msg = "missing pattern" };
@@ -398,7 +380,7 @@ fn grepTool(alloc: std.mem.Allocator, cwd: []const u8, call: ToolCall) !ToolResu
     while (line_iter.next()) |rel| {
         if (rel.len == 0) continue;
         const abs = std.fs.path.join(alloc, &.{ resolved_base, rel }) catch continue;
-        const text = readFileC(alloc, abs) catch {
+        const text = readFileC(alloc, io, abs) catch {
             alloc.free(abs);
             continue;
         };

@@ -187,7 +187,7 @@ pub const AgentLoop = struct {
                 self.emit(.tool_call, try std.fmt.allocPrint(self.alloc, "{s}({s})", .{ tc.name, tc.arguments }));
 
                 const call = tool_builtin.ToolCall{ .name = tc.name, .arguments = tc.arguments };
-                var result = tool_builtin.execute(self.alloc, self.cwd, call) catch |e| tool_builtin.ToolResult{
+                var result = tool_builtin.execute(self.alloc, self.client.io, self.cwd, call) catch |e| tool_builtin.ToolResult{
                     .success = false,
                     .output = "",
                     .err_msg = @errorName(e),

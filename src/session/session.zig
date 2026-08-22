@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const clib = @import("../clib.zig");
+const cordis = @import("cordis");
 const model_mod = @import("../model/model.zig");
 
 pub const Session = struct {
@@ -92,9 +93,10 @@ pub const Session = struct {
 
     // ---- Persistence ----------------------------------------------------
 
-    pub fn save(self: *const Session, path: []const u8) !void {
+    pub fn save(self: *const Session, io: std.Io, path: []const u8) !void {
         // Build the JSON document into an allocator-backed buffer, then
-        // write it in one shot via libc (std.fs.cwd() was removed in Zig 0.17).
+        // write it in one shot via `std.Io.Dir` (Zig 0.17's file API;
+        // `std.fs.cwd` was relocated here).
         var buf = try std.ArrayList(u8).initCapacity(self.alloc, 0);
         errdefer buf.deinit(self.alloc);
 
@@ -128,17 +130,12 @@ pub const Session = struct {
         const out = try buf.toOwnedSlice(self.alloc);
         defer self.alloc.free(out);
 
-        const path_z = try self.alloc.dupeSentinel(u8, path, 0);
-        defer self.alloc.free(path_z);
-        const fp = std.c.fopen(path_z.ptr, "wb") orelse return error.FileNotFound;
-        defer _ = std.c.fclose(fp);
-        const written = std.c.fwrite(out.ptr, 1, out.len, fp);
-        if (written != out.len) return error.WriteError;
+        try std.Io.Dir.writeFile(.cwd(), io, .{ .sub_path = path, .data = out });
     }
 
-    pub fn load(self: *Session, path: []const u8) !void {
-        // std.fs.cwd() was removed in Zig 0.17; read via libc instead.
-        const raw = readFileC(self.alloc, path) catch |e| switch (e) {
+    pub fn load(self: *Session, io: std.Io, path: []const u8) !void {
+        // Read via `std.Io.Dir` (Zig 0.17's file API).
+        const raw = std.Io.Dir.readFileAlloc(.cwd(), io, path, self.alloc, .unlimited) catch |e| switch (e) {
             error.FileNotFound => return, // empty session, OK
             else => return e,
         };
@@ -261,28 +258,6 @@ const Obj = struct {
     }
 };
 
-/// Read an entire file via libc (std.c.fopen/fread, chunked). Caller owns
-/// the returned slice (allocated with `alloc`). Returns `error.FileNotFound`
-/// if the path does not exist. `fseek`/`ftell` are not exposed by Zig 0.17's
-/// `std.c`, so we read in chunks and grow a buffer.
-fn readFileC(alloc: std.mem.Allocator, path: []const u8) ![]const u8 {
-    const path_z = try alloc.dupeSentinel(u8, path, 0);
-    defer alloc.free(path_z);
-
-    const fp = std.c.fopen(path_z.ptr, "rb") orelse return error.FileNotFound;
-    defer _ = std.c.fclose(fp);
-
-    var buf = try std.ArrayList(u8).initCapacity(alloc, 0);
-    errdefer buf.deinit(alloc);
-    var chunk: [8192]u8 = undefined;
-    while (true) {
-        const n = std.c.fread(&chunk, 1, chunk.len, fp);
-        if (n == 0) break;
-        try buf.appendSlice(alloc, chunk[0..n]);
-    }
-    return try buf.toOwnedSlice(alloc);
-}
-
 fn findMatchingBrace(json: []const u8, start: usize) ?usize {
     if (start >= json.len or json[start] != '{') return null;
     var count: i32 = 1;
@@ -316,13 +291,17 @@ test "session add and roundtrip" {
     try std.testing.expectEqual(@as(usize, 3), s1.count());
 
     const tmp = "zharness_session_test.json";
-    defer clib.removeFile(tmp);
 
-    try s1.save(tmp);
+    var ctx = try cordis.Context.init(alloc);
+    defer ctx.deinit();
+    const io = ctx.io();
+    defer std.Io.Dir.deleteFile(.cwd(), io, tmp) catch {};
+
+    try s1.save(io, tmp);
 
     var s2 = try Session.init(alloc, "other");
     defer s2.deinit();
-    try s2.load(tmp);
+    try s2.load(io, tmp);
 
     try std.testing.expectEqual(@as(usize, 3), s2.count());
     try std.testing.expectEqualStrings("hello world", s2.messages.items[0].content);
