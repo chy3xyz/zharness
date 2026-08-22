@@ -5,6 +5,9 @@ A native coding-agent harness written in **Zig 0.17**, built on the
 filesystem / shell / git tools through an agent loop — "everything is a
 plugin". The first working target (MVP-1) is a CLI coding agent.
 
+➡️ **New here?** Start with [QUICKSTART.md](QUICKSTART.md) for a copy-paste
+getting-started in under five minutes.
+
 ## Requirements
 
 - **Zig `0.17.0-dev`** (the project pins `minimum_zig_version = "0.17.0"`).
