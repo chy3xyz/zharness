@@ -84,6 +84,7 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config) !struct {
     tools: *tool_reg.ToolRegistry,
     loop: *agent.AgentLoop,
     ag: *agent.Agent,
+    acfg: *agent.AgentConfig,
 } {
     var ctx = try cordis.Context.init(alloc);
     errdefer ctx.deinit();
@@ -95,27 +96,33 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config) !struct {
 
     const client = model.ChatClient.init(alloc, ctx.io(), cfg.endpoint, cfg.model, cfg.api_key);
 
-    const acfg = agent.AgentConfig{
+    // Heap-allocate the config so the pointer `Agent` holds stays valid after
+    // buildLoop returns (a stack-local would dangle and corrupt system_prompt).
+    const acfg = try alloc.create(agent.AgentConfig);
+    errdefer alloc.destroy(acfg);
+    acfg.* = .{
         .system_prompt = SYSTEM_PROMPT,
         .max_turns = cfg.max_turns,
         .reasoning_effort = cfg.reasoning_effort,
     };
-    const ag = try agent.Agent.init(alloc, ctx.root, &acfg);
+    const ag = try agent.Agent.init(alloc, ctx.root, acfg);
 
     const loop = try alloc.create(agent.AgentLoop);
     errdefer alloc.destroy(loop);
     loop.* = try agent.AgentLoop.init(alloc, ctx, ag, client, tools, cfg.cwd, onEvent);
 
-    return .{ .ctx = ctx, .tools = tools, .loop = loop, .ag = ag };
+    return .{ .ctx = ctx, .tools = tools, .loop = loop, .ag = ag, .acfg = acfg };
 }
 
 fn runTask(alloc: std.mem.Allocator, cfg: *config.Config, prompt: []const u8, session_id: ?[]const u8) !void {
     const built = try buildLoop(alloc, cfg);
     defer built.ctx.deinit();
+    defer built.ag.deinit(alloc);
     defer built.tools.deinit();
     defer built.loop.deinit();
     defer alloc.destroy(built.loop);
     defer alloc.destroy(built.tools);
+    defer alloc.destroy(built.acfg);
 
     const io = built.ctx.io();
 
@@ -161,10 +168,12 @@ fn runTask(alloc: std.mem.Allocator, cfg: *config.Config, prompt: []const u8, se
 fn chatLoop(alloc: std.mem.Allocator, cfg: *config.Config, session_id: ?[]const u8) !void {
     const built = try buildLoop(alloc, cfg);
     defer built.ctx.deinit();
+    defer built.ag.deinit(alloc);
     defer built.tools.deinit();
     defer built.loop.deinit();
     defer alloc.destroy(built.loop);
     defer alloc.destroy(built.tools);
+    defer alloc.destroy(built.acfg);
 
     const io = built.ctx.io();
 

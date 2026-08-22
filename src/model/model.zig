@@ -136,6 +136,17 @@ pub const ChatClient = struct {
         const resp_body = try out.toOwnedSlice(self.alloc);
         defer self.alloc.free(resp_body);
 
+        // Surface provider errors instead of silently parsing them into an
+        // empty answer. DeepSeek returns either a JSON envelope
+        // ({"error":{"message":...}}) or, for malformed requests, a plain-text
+        // body like "Failed to parse the request body as JSON: ..." with HTTP
+        // 400. Both must be treated as failures, so we reject any response
+        // that isn't a well-formed JSON object starting with '{'.
+        if (resp_body.len == 0) return error.HttpError;
+        if (resp_body[0] != '{' or std.mem.indexOf(u8, resp_body, "\"error\"") != null) {
+            return error.HttpError;
+        }
+
         return self.parseResponse(resp_body);
     }
 
@@ -213,14 +224,14 @@ pub const ChatClient = struct {
                 const vs = ci + 11;
                 if (std.mem.indexOfScalarPos(u8, msg, vs, '"')) |ve| {
                     self.alloc.free(res.content);
-                    res.content = try unescape(msg[vs..ve]);
+                    res.content = try unescape(self.alloc, msg[vs..ve]);
                 }
             }
             if (std.mem.indexOf(u8, msg, "\"reasoning_content\":\"")) |ri| {
                 const vs = ri + 22;
                 if (std.mem.indexOfScalarPos(u8, msg, vs, '"')) |ve| {
                     self.alloc.free(res.reasoning);
-                    res.reasoning = try unescape(msg[vs..ve]);
+                    res.reasoning = try unescape(self.alloc, msg[vs..ve]);
                 }
             }
         }
@@ -319,27 +330,28 @@ fn escape(alloc: std.mem.Allocator, input: []const u8, out: *std.ArrayList(u8)) 
     }
 }
 
-fn unescape(input: []const u8) ![]const u8 {
+fn unescape(alloc: std.mem.Allocator, input: []const u8) ![]const u8 {
     // Lightweight unescape for content/reasoning (backslash escapes only).
-    var out = try std.ArrayList(u8).initCapacity(std.heap.page_allocator, 0);
-    errdefer out.deinit(std.heap.page_allocator);
+    // Must allocate with the caller's allocator so deinit can free it.
+    var out = try std.ArrayList(u8).initCapacity(alloc, 0);
+    errdefer out.deinit(alloc);
     var i: usize = 0;
     while (i < input.len) : (i += 1) {
         if (input[i] == '\\' and i + 1 < input.len) {
             i += 1;
             switch (input[i]) {
-                '"' => try out.append(std.heap.page_allocator, '"'),
-                '\\' => try out.append(std.heap.page_allocator, '\\'),
-                'n' => try out.append(std.heap.page_allocator, '\n'),
-                'r' => try out.append(std.heap.page_allocator, '\r'),
-                't' => try out.append(std.heap.page_allocator, '\t'),
-                else => try out.append(std.heap.page_allocator, input[i]),
+                '"' => try out.append(alloc, '"'),
+                '\\' => try out.append(alloc, '\\'),
+                'n' => try out.append(alloc, '\n'),
+                'r' => try out.append(alloc, '\r'),
+                't' => try out.append(alloc, '\t'),
+                else => try out.append(alloc, input[i]),
             }
         } else {
-            try out.append(std.heap.page_allocator, input[i]);
+            try out.append(alloc, input[i]);
         }
     }
-    return out.toOwnedSlice(std.heap.page_allocator);
+    return out.toOwnedSlice(alloc);
 }
 
 fn findMatchingBrace(json: []const u8, start: usize) ?usize {

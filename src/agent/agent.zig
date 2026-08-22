@@ -163,7 +163,9 @@ pub const AgentLoop = struct {
         while (turn < self.agent.config.max_turns) {
             turn += 1;
             self.agent.state = .thinking;
-            self.emit(.turn_start, try std.fmt.allocPrint(self.alloc, "turn {d}", .{turn}));
+            const turn_msg = try std.fmt.allocPrint(self.alloc, "turn {d}", .{turn});
+            self.emit(.turn_start, turn_msg);
+            self.alloc.free(turn_msg);
 
             const req = model_mod.ChatRequest{
                 .messages = self.messages.items,
@@ -212,7 +214,9 @@ pub const AgentLoop = struct {
             // Execute each requested tool call (dev.md §VIII pipeline).
             self.agent.state = .executing_tool;
             for (resp.tool_calls) |tc| {
-                self.emit(.tool_call, try std.fmt.allocPrint(self.alloc, "{s}({s})", .{ tc.name, tc.arguments }));
+                const tc_msg = try std.fmt.allocPrint(self.alloc, "{s}({s})", .{ tc.name, tc.arguments });
+                self.emit(.tool_call, tc_msg);
+                self.alloc.free(tc_msg);
 
                 const call = tool_builtin.ToolCall{ .name = tc.name, .arguments = tc.arguments };
                 var result = tool_builtin.execute(self.alloc, self.client.io, self.cwd, call) catch |e| tool_builtin.ToolResult{

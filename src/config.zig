@@ -9,7 +9,7 @@ const std = @import("std");
 pub const Config = struct {
     alloc: std.mem.Allocator,
     provider: []const u8 = "deepseek",
-    model: []const u8 = "deepseek-chat",
+    model: []const u8 = "deepseek-v4-flash",
     api_key: []const u8 = "",
     endpoint: []const u8 = "https://api.deepseek.com/chat/completions",
     reasoning_effort: []const u8 = "medium",
@@ -66,7 +66,7 @@ pub fn load(alloc: std.mem.Allocator) !Config {
 
     // Provider defaults.
     cfg.provider = try alloc.dupe(u8, "deepseek");
-    cfg.model = try alloc.dupe(u8, "deepseek-chat");
+    cfg.model = try alloc.dupe(u8, "deepseek-v4-flash");
     cfg.endpoint = try alloc.dupe(u8, "https://api.deepseek.com/chat/completions");
     cfg.reasoning_effort = try alloc.dupe(u8, "medium");
     cfg.cwd = try alloc.dupe(u8, ".");

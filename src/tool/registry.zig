@@ -165,7 +165,9 @@ pub fn registerBuiltins(reg: *ToolRegistry) !void {
         .name = "git_status",
         .description = "Show the git working tree status (porcelain format).",
         .category = .vcs,
-        .parameters_json = \\{"type":"object","properties":{},"required":[]}\n                 ,
+        .parameters_json =
+        \\{"type":"object","properties":{},"required":[]}
+        ,
     });
     try reg.register(.{
         .name = "git_diff",
