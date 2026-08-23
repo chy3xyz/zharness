@@ -27,6 +27,13 @@
 //! end via length + positional write — single-process by design, so no
 //! O_APPEND inter-process locking is attempted.
 //!
+//! Live fan-out (`fanout`, dev.md §XXX ↔ §XXIII SSE bridge): an OPTIONAL
+//! function pointer invoked from `JsonlSink.emitAt` after the jsonl append,
+//! handing the serialized envelope line to a second sink (the serve-mode
+//! broadcast hub in server/events.zig). It is ADDITIVE: null by default, so
+//! CLI run/chat keep pure-jsonl logging and every existing caller is
+//! source-compatible. See the `fanout` doc below for the threading rules.
+//!
 //! Deliberately self-contained (JSON helpers adapted from
 //! src/session/checkpoint.zig): testable in isolation via
 //! `zig test -lc src/_t_obs.zig`.
@@ -34,6 +41,20 @@
 const std = @import("std");
 
 pub const default_log_path = ".zharness/logs/events.jsonl";
+
+/// Optional live fan-out hook (dev.md §XXX SSE feed). When non-null,
+/// `JsonlSink.emitAt` calls it AFTER the jsonl append attempt, passing the
+/// exact serialized envelope line WITHOUT trailing newline — the same bytes
+/// the sink appends to disk (plus '\n'). Serve mode sets it once at startup
+/// (`obs.fanout = &server_events.hubPublish`); CLI run/chat leave it null so
+/// logging stays pure-jsonl with zero overhead.
+///
+/// Threading: a plain variable, deliberately not atomic. Assign it during
+/// startup BEFORE any emitting thread exists (the httpd accept loop's spawn
+/// establishes the happens-before edge). The callee must be thread-safe:
+/// emitAt may run on any connection thread. Fan-out failures are invisible
+/// here by design — observability never breaks the run.
+pub var fanout: ?*const fn (envelope_json: []const u8) void = null;
 
 /// trace_id length in ASCII hex chars (8 random bytes encoded).
 pub const trace_id_hex_len = 16;
@@ -270,16 +291,20 @@ pub const JsonlSink = struct {
 
     /// Fallible core: serialize + append one envelope as a single line.
     pub fn write(self: *JsonlSink, io: std.Io, env: EventEnvelope) !void {
-        var line: std.ArrayList(u8) = .empty;
-        defer line.deinit(self.alloc);
-        try env.appendJson(self.alloc, &line);
-        try line.append(self.alloc, '\n');
-        try self.appendBytes(io, line.items);
+        const body = try env.toJson(self.alloc);
+        defer self.alloc.free(body);
+        try self.appendSerialized(io, body);
     }
 
     /// Log-and-continue emit: builds a fresh span under `ctx.trace_id`,
     /// applies the filter, appends, and converts any failure into a bump of
     /// `dropped_events`. This is the hook the agent loop should call.
+    ///
+    /// Serialization happens exactly ONCE: the same line goes to disk AND
+    /// (when `fanout` is installed) to the live feed, so both sinks observe
+    /// byte-identical envelopes. The fan-out hook fires after the jsonl
+    /// append attempt regardless of its outcome — the live stream must not
+    /// depend on disk health.
     pub fn emitAt(
         self: *JsonlSink,
         io: std.Io,
@@ -298,9 +323,26 @@ pub const JsonlSink = struct {
             .event_type = event_type,
             .payload_json = payload_json,
         };
-        self.write(io, env) catch {
+        const body = env.toJson(self.alloc) catch {
+            self.dropped_events += 1;
+            return;
+        };
+        defer self.alloc.free(body);
+
+        self.appendSerialized(io, body) catch {
             self.dropped_events += 1;
         };
+        if (fanout) |hook| hook(body);
+    }
+
+    /// Shared tail of `write` / `emitAt`: JSONL-frame one pre-serialized
+    /// envelope body (append '\n', positional-append to file end).
+    fn appendSerialized(self: *JsonlSink, io: std.Io, body: []const u8) !void {
+        var line: std.ArrayList(u8) = .empty;
+        defer line.deinit(self.alloc);
+        try line.appendSlice(self.alloc, body);
+        try line.append(self.alloc, '\n');
+        try self.appendBytes(io, line.items);
     }
 
     /// Open-append-close one pre-serialized line (newline included).

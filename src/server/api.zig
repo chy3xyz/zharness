@@ -10,8 +10,11 @@
 //!       deps.* = .{ .ctx = ..., .runTask = ..., ... };
 //!       var srv = try httpd.Server.init(alloc, .{ .ctx = deps, .call = api.handle }, .{ .port = p });
 //! - `route` is pure (no socket I/O) and returns a `RouteResult` so dispatch
-//!   can be unit-tested offline; `handle` adapts it to the live connection,
-//!   including the `/events` SSE stub (heartbeat comments until disconnect).
+//!   can be unit-tested offline; `handle` adapts it to the live connection.
+//! - GET /events streams SSE: when the broadcast hub (server/events.zig) is
+//!   installed it replays recent envelopes then tails live ones as bare
+//!   `data:` frames; without a hub it falls back to the original heartbeat
+//!   stub. Both paths honor client disconnects via Responder mechanics.
 //!
 //! Route table:
 //!   POST /run            {prompt, session?} -> deps.runTask
@@ -19,10 +22,11 @@
 //!   GET  /sessions                          -> deps.listSessions
 //!   GET  /sessions/:id                         -> deps.getSession
 //!   GET  /healthz                                -> {"ok":true}
-//!   GET  /events                                 -> SSE stub (heartbeats)
+//!   GET  /events                                 -> SSE (live hub feed or heartbeat fallback)
 
 const std = @import("std");
 const httpd = @import("httpd.zig");
+const events = @import("events.zig");
 
 // ── dependency surface ──────────────────────────────────────────────────────
 
@@ -83,12 +87,18 @@ pub const ServerDeps = struct {
     }
 };
 
-/// Heartbeat cadence for the /events stub.
+/// Heartbeat cadence for the /events fallback (no hub installed).
 pub const sse_heartbeat_ms: u64 = 15_000;
-/// Upper bound on how long one /events connection may stay open (the stub has
-/// no real event feed yet; without a cap a held stream would pin a thread in
-/// threaded mode forever).
+/// Upper bound on how long one FALLBACK /events connection may stay open
+/// (without a real event feed a held stream would pin a thread in threaded
+/// mode forever, so the stub self-terminates).
 pub const sse_max_lifetime_ms: u64 = 5 * 60 * 1000;
+/// Live-feed idle poll cadence: how often the hub stream checks its queue.
+pub const sse_poll_ms: u64 = 50;
+/// Live-feed keep-alive comment cadence. Doubles as the disconnect probe:
+/// the write fails on a vanished peer even when no events flow, bounding
+/// how long a dead /events connection lingers.
+pub const sse_keepalive_ms: u64 = 15_000;
 
 // ── route result (pure, testable) ───────────────────────────────────────────
 
@@ -258,23 +268,62 @@ pub fn handle(ctx: ?*anyopaque, alloc: std.mem.Allocator, req: *const httpd.Requ
     defer result.deinit(alloc);
 
     if (result.sse) {
-        try serveEventsStub(res);
+        try serveEvents(res);
     } else {
         try res.send(result.status, result.content_type, result.body);
     }
 }
 
-/// SSE stub: emit heartbeats every `sse_heartbeat_ms` until the client goes
-/// away or the max lifetime elapses. The real event feed arrives at
-/// integration time (obs.zig envelopes); this endpoint only pins the wire
-/// contract.
-fn serveEventsStub(res: *httpd.Responder) !void {
+/// /events entry point: live hub feed when the broadcast hub is installed,
+/// heartbeat stub otherwise. (Route dispatch stays pure; the mode decision
+/// happens here at handle time.)
+pub fn serveEvents(res: *httpd.Responder) !void {
+    if (events.hub()) |h| return serveHubStream(h, res);
+    return serveHeartbeatStream(res, sse_heartbeat_ms, sse_max_lifetime_ms);
+}
+
+/// Live SSE feed: replay the subscriber's history snapshot as bare
+/// `data: <json>` frames, then tail the queue. Disconnects surface through
+/// the Responder (`peerGone`) once a write fails — keep-alive comments make
+/// sure an idle-but-dead connection is detected within ~`sse_keepalive_ms`.
+///
+/// Requires httpd Options.threaded_connections = true in production: the
+/// loop runs until the client goes away and must not starve other routes.
+fn serveHubStream(h: *events.Hub, res: *httpd.Responder) !void {
     var stream = try res.startEventStream();
-    try stream.comment("zharness events (stub); heartbeats every 15s");
+    try stream.comment("zharness event stream; recent envelopes then live");
+
+    const sub = h.subscribe() catch return; // stream already open: just end it
+    defer h.unsubscribe(sub);
+
+    var quiet_ms: u64 = 0;
+    while (!stream.peerGone()) {
+        if (sub.take()) |line| {
+            // Borrowed line: valid only until the next take — write it out
+            // now. A failed write means the client is gone.
+            events.writeDataFrame(&stream, line) catch break;
+            quiet_ms = 0;
+            continue; // drain any backlog without sleeping
+        }
+        quiet_ms += sse_poll_ms;
+        if (quiet_ms >= sse_keepalive_ms) {
+            stream.comment("keep-alive") catch break;
+            quiet_ms = 0;
+        }
+        stream.sleepTicks(sse_poll_ms, 10);
+    }
+}
+
+/// Heartbeat fallback (no hub): emit SSE comments every `beat_ms` until the
+/// client goes away or `max_ms` elapses. Parametrized so offline tests can
+/// shrink the cadence; production passes the module constants above.
+pub fn serveHeartbeatStream(res: *httpd.Responder, beat_ms: u64, max_ms: u64) !void {
+    var stream = try res.startEventStream();
+    try stream.comment("zharness events (no feed installed); heartbeats");
     var elapsed: u64 = 0;
-    while (!stream.peerGone() and elapsed < sse_max_lifetime_ms) {
-        stream.sleepTicks(sse_heartbeat_ms, 250);
-        elapsed += sse_heartbeat_ms;
+    while (!stream.peerGone() and elapsed < max_ms) {
+        stream.sleepTicks(beat_ms, 250);
+        elapsed += beat_ms;
         if (stream.peerGone()) break;
         stream.comment("heartbeat") catch break;
     }
