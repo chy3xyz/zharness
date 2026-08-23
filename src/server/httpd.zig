@@ -77,7 +77,14 @@ pub const Status = enum(u16) {
     forbidden = 403,
     not_found = 404,
     method_not_allowed = 405,
+    /// 409 Conflict — added additively in wave 5 for session-rename/create
+    /// id collisions (api.zig); no existing mapping changed.
+    conflict = 409,
     payload_too_large = 413,
+    /// 415 Unsupported Media Type — added additively in wave 5 for the
+    /// apiproxy cross-site write fence (non-JSON POSTs to /api/*); no
+    /// existing mapping changed.
+    unsupported_media_type = 415,
     internal_server_error = 500,
     not_implemented = 501,
     service_unavailable = 503,
@@ -96,7 +103,9 @@ pub const Status = enum(u16) {
             .forbidden => "Forbidden",
             .not_found => "Not Found",
             .method_not_allowed => "Method Not Allowed",
+            .conflict => "Conflict",
             .payload_too_large => "Payload Too Large",
+            .unsupported_media_type => "Unsupported Media Type",
             .internal_server_error => "Internal Server Error",
             .not_implemented => "Not Implemented",
             .service_unavailable => "Service Unavailable",
@@ -363,6 +372,23 @@ pub const Responder = struct {
             "\r\n";
         try self.writeAll(head);
         return .{ .fd = self.fd, .responder = self };
+    }
+
+    /// Switch the connection into WebSocket mode (wave-5 apiproxy addition).
+    /// Writes the RFC 6455 101 handshake computed from the validated upgrade
+    /// request, then returns a frame-level connection. After this call no
+    /// regular `send*` may be used; see the WebSocket section's threading
+    /// contract for ownership rules.
+    pub fn startWebSocket(self: *Responder, upgrade: *const WsUpgrade) StartWsResult {
+        std.debug.assert(!self.responded);
+        const resp = upgrade.formatResponse(self.alloc) catch return error.OutOfMemory;
+        defer self.alloc.free(resp);
+        self.responded = true;
+        self.writeAll(resp) catch {
+            self.failed = true;
+            return error.HandshakeWriteFailed;
+        };
+        return WsConn.init(self.fd, self.alloc);
     }
 
     fn writeAll(self: *Responder, data: []const u8) !void {
@@ -666,6 +692,581 @@ fn configureConnSocket(fd: std.posix.socket_t) void {
     }
 }
 
+// ── WebSocket transport (RFC 6455) — wave-5 apiproxy addition ──────────────
+//
+// ADDITIVE layer over the one-request-per-connection server above: existing
+// routes, `parseRequest`, `formatResponse`, and SSE behavior are untouched.
+// A handler that recognizes a WebSocket upgrade request calls
+// `Responder.startWebSocket`, which writes the 101 handshake and hands back
+// a `WsConn` bound to the live fd.
+//
+// Threading contract (mirrors the SSE streams):
+// - An upgraded connection occupies its thread until the stream ends, so
+//   servers hosting WS streams MUST run with
+//   `Options.threaded_connections = true`; otherwise one open socket
+//   starves every other route (same rule as server/events.zig).
+// - `handleConnectionFd` closes the fd when the handler returns, so the
+//   pump loop runs INSIDE the handler call, exactly like SSE loops.
+// - `WsConn.init` disables SO_RCVTIMEO on the fd: long-lived idle sockets
+//   must not trip the 10 s per-request timeout. Liveness relies on loopback
+//   TCP teardown (the server binds 127.0.0.1; peer death always produces
+//   FIN/RST there) plus write-failure detection on push. No application-
+//   level heartbeat is implemented; the browser carrier's reconnect
+//   machine owns stale-socket recovery.
+// - Fan-out from publisher threads is safe: every write path takes the
+//   per-connection `wlock`, so a header+payload pair is never interleaved.
+
+/// The RFC 6455 §1.3 handshake GUID (fixed by the protocol, not tunable).
+pub const ws_magic_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+/// Reassembled-message cap (~1 MiB): an inbound text/binary message whose
+/// fragments sum beyond this fails the connection with close code 1009.
+pub const ws_max_message_bytes: usize = 1024 * 1024;
+
+pub const WsOpcode = enum(u4) {
+    continuation = 0,
+    text = 1,
+    binary = 2,
+    close = 8,
+    ping = 9,
+    pong = 10,
+
+    pub fn toByte(self: WsOpcode) u8 {
+        return @intFromEnum(self);
+    }
+
+    /// Strict decode: reserved/unknown opcodes are protocol errors.
+    pub fn fromByte(raw: u8) ?WsOpcode {
+        return switch (raw) {
+            0 => .continuation,
+            1 => .text,
+            2 => .binary,
+            8 => .close,
+            9 => .ping,
+            10 => .pong,
+            else => null,
+        };
+    }
+};
+
+pub const WsError = error{
+    /// Inbound framing violated RFC 6455 (bad opcode, unmasked client frame,
+    /// fragmented control frame, oversized control payload, RSV bits set).
+    ProtocolError,
+    /// Reassembled message exceeded `ws_max_message_bytes`.
+    MessageTooLarge,
+    WriteFailed,
+    ReadFailed,
+    /// Peer closed (clean close handshake completed or EOF mid-stream).
+    ConnectionClosed,
+    OutOfMemory,
+};
+
+/// Sec-WebSocket-Accept = base64(SHA-1(client_key ++ magic GUID)).
+/// Verified against the RFC 6455 §1.3 example vector in the tests below.
+pub fn computeWsAcceptKey(alloc: std.mem.Allocator, client_key: []const u8) ![]u8 {
+    var sha = std.crypto.hash.Sha1.init(.{});
+    sha.update(client_key);
+    sha.update(ws_magic_guid);
+    var digest: [20]u8 = undefined;
+    sha.final(&digest);
+    const enc = std.base64.standard.Encoder;
+    const out = try alloc.alloc(u8, enc.calcSize(digest.len));
+    errdefer alloc.free(out);
+    _ = enc.encode(out, &digest);
+    return out;
+}
+
+// ── frame codec (pure halves are unit-testable without sockets) ────────────
+
+pub const WsFrameHeader = struct {
+    fin: bool,
+    opcode: WsOpcode,
+    masked: bool,
+    payload_len: u64,
+    /// Total header bytes INCLUDING the 4-byte masking key when masked.
+    header_len: usize,
+};
+
+pub const FrameParseError = error{ NeedMoreData, ProtocolError };
+
+/// Parse a frame header from the front of `buf`. `NeedMoreData` means more
+/// bytes are required; `ProtocolError` means the header violates the RFC
+/// (RSV bits set without extension negotiation is checked by the caller —
+/// this pure function does not know negotiation state — plus non-minimal
+/// extended lengths and reserved opcodes).
+pub fn parseWsFrameHeader(buf: []const u8) FrameParseError!WsFrameHeader {
+    if (buf.len < 2) return error.NeedMoreData;
+    const b0 = buf[0];
+    const b1 = buf[1];
+    if (b0 & 0x70 != 0) return error.ProtocolError; // RSV bits: no extensions
+    const opcode_raw: u8 = b0 & 0x0F;
+    const opcode = WsOpcode.fromByte(opcode_raw) orelse return error.ProtocolError;
+    const masked = b1 & 0x80 != 0;
+
+    var payload_len: u64 = b1 & 0x7F;
+    var header_len: usize = 2;
+    if (payload_len == 126) {
+        if (buf.len < 4) return error.NeedMoreData;
+        payload_len = std.mem.readInt(u16, buf[2..4], .big);
+        header_len = 4;
+        if (payload_len < 126) return error.ProtocolError; // non-minimal
+    } else if (payload_len == 127) {
+        if (buf.len < 10) return error.NeedMoreData;
+        payload_len = std.mem.readInt(u64, buf[2..10], .big);
+        header_len = 10;
+        if (payload_len <= 0xFFFF) return error.ProtocolError; // non-minimal
+    }
+    if (masked) header_len += 4;
+    if (buf.len < header_len) return error.NeedMoreData;
+    return .{
+        .fin = b0 & 0x80 != 0,
+        .opcode = opcode,
+        .masked = masked,
+        .payload_len = payload_len,
+        .header_len = header_len,
+    };
+}
+
+/// Serialize one frame. Server-to-client frames are UNMASKED (`mask_key ==
+/// null`); test doubles playing the client pass a key to exercise the XOR
+/// path. Pure: returns freshly allocated bytes.
+pub fn encodeWsFrame(
+    alloc: std.mem.Allocator,
+    opcode: WsOpcode,
+    fin: bool,
+    payload: []const u8,
+    mask_key: ?[4]u8,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.ensureTotalCapacity(alloc, payload.len + 14);
+
+    const b0: u8 = (if (fin) @as(u8, 0x80) else 0) | opcode.toByte();
+    try out.append(alloc, b0);
+    if (mask_key) |_| {
+        try out.append(alloc, 0x80 | encodeLenBits(payload.len));
+    } else {
+        try out.append(alloc, encodeLenBits(payload.len));
+    }
+    switch (encodeExtendedLen(payload.len)) {
+        .none => {},
+        .u16 => |v| {
+            var ext: [2]u8 = undefined;
+            std.mem.writeInt(u16, &ext, v, .big);
+            try out.appendSlice(alloc, &ext);
+        },
+        .u64 => |v| {
+            var ext: [8]u8 = undefined;
+            std.mem.writeInt(u64, &ext, v, .big);
+            try out.appendSlice(alloc, &ext);
+        },
+    }
+    if (mask_key) |key| {
+        try out.appendSlice(alloc, &key);
+        try out.ensureTotalCapacity(alloc, out.items.len + payload.len);
+        const start = out.items.len;
+        try out.appendSlice(alloc, payload);
+        applyMask(out.items[start..], key);
+    } else {
+        try out.appendSlice(alloc, payload);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+const LenExt = union(enum) { none, u16: u16, u64: u64 };
+
+fn encodeExtendedLen(len: usize) LenExt {
+    if (len < 126) return .none;
+    if (len <= 0xFFFF) return .{ .u16 = @intCast(len) };
+    return .{ .u64 = len };
+}
+
+fn encodeLenBits(len: usize) u8 {
+    return switch (encodeExtendedLen(len)) {
+        .none => @intCast(len),
+        .u16 => 126,
+        .u64 => 127,
+    };
+}
+
+/// RFC 6455 §5.3 XOR obfuscation, in place, rotating the 4-byte key.
+pub fn applyMask(payload: []u8, key: [4]u8) void {
+    for (payload, 0..) |*b, i| {
+        b.* ^= key[i % 4];
+    }
+}
+
+// ── opening handshake ───────────────────────────────────────────────────────
+
+pub const WsUpgradeError = error{
+    NotWebSocket,
+    MissingKey,
+    BadVersion,
+    OutOfMemory,
+};
+
+/// Validated opening-handshake request (RFC 6455 §4.2.1). Borrows slices
+/// from the parsed request; valid as long as the request memory.
+pub const WsUpgrade = struct {
+    key: []const u8,
+
+    /// Validate a GET request's upgrade headers. Header token lists
+    /// ("Connection: keep-alive, Upgrade") are split on ',' and matched
+    /// case-insensitively, per the RFC.
+    pub fn fromRequest(req: *const Request) WsUpgradeError!WsUpgrade {
+        if (!std.mem.eql(u8, req.method, "GET")) return error.NotWebSocket;
+
+        const upg = req.header("upgrade") orelse return error.NotWebSocket;
+        if (!tokenListContains(upg, "websocket")) return error.NotWebSocket;
+
+        const conn = req.header("connection") orelse return error.NotWebSocket;
+        if (!tokenListContains(conn, "upgrade")) return error.NotWebSocket;
+
+        const key = req.header("sec-websocket-key") orelse return error.MissingKey;
+        // A valid key is base64 of 16 random bytes (24 chars unpadded).
+        const dec = std.base64.standard.Decoder;
+        const decoded_len = dec.calcSizeForSlice(key) catch return error.MissingKey;
+        if (decoded_len != 16) return error.MissingKey;
+
+        const ver = req.header("sec-websocket-version") orelse return error.BadVersion;
+        if (!std.mem.eql(u8, std.mem.trim(u8, ver, " \t"), "13")) return error.BadVersion;
+
+        return .{ .key = key };
+    }
+
+    /// The exact 101 response bytes (pure; testable without sockets).
+    pub fn formatResponse(self: *const WsUpgrade, alloc: std.mem.Allocator) ![]u8 {
+        const ws_accept = try computeWsAcceptKey(alloc, self.key);
+        defer alloc.free(ws_accept);
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(alloc);
+        try out.appendSlice(alloc, "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Accept: ");
+        try out.appendSlice(alloc, ws_accept);
+        try out.appendSlice(alloc, "\r\n\r\n");
+        return out.toOwnedSlice(alloc);
+    }
+};
+
+/// Case-insensitive token membership in a comma-separated header value.
+fn tokenListContains(value: []const u8, token: []const u8) bool {
+    var it = std.mem.splitScalar(u8, value, ',');
+    while (it.next()) |raw| {
+        const t = std.mem.trim(u8, raw, " \t");
+        if (std.ascii.eqlIgnoreCase(t, token)) return true;
+    }
+    return false;
+}
+
+// ── per-connection lock (same design as server/events.zig's private copy) ──
+// (nanosleep extern shared with the module-level decl above)
+
+const WsSpinLock = struct {
+    locked: std.atomic.Value(bool) = .init(false),
+
+    fn lock(self: *WsSpinLock) void {
+        var spins: u32 = 0;
+        while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            spins += 1;
+            if (spins >= 16) {
+                const req: std.c.timespec = .{ .sec = 0, .nsec = 1 * std.time.ns_per_ms };
+                _ = nanosleep(&req, null);
+            } else {
+                std.atomic.spinLoopHint();
+            }
+        }
+    }
+
+    fn unlock(self: *WsSpinLock) void {
+        self.locked.store(false, .release);
+    }
+};
+
+/// Switch an accepted connection into WebSocket mode. Writes the 101
+/// handshake, then returns a `WsConn` owning the socket for frame traffic.
+/// After this call no regular `send*` may be used.
+pub const StartWsError = error{
+    HandshakeWriteFailed,
+    SocketSetupFailed,
+    OutOfMemory,
+};
+
+pub const StartWsResult = StartWsError!WsConn;
+
+// ── live connection ─────────────────────────────────────────────────────────
+
+/// One upgraded WebSocket connection. Reads assemble fragments into complete
+/// messages (bounded by `max_message`); control frames are answered inline
+/// (ping→pong) or surfaced (close→echo + ConnectionClosed). All writes are
+/// serialized through the connection's `wlock`.
+pub const WsConn = struct {
+    fd: std.posix.socket_t,
+    alloc: std.mem.Allocator,
+    max_message: usize = ws_max_message_bytes,
+    close_sent: bool = false,
+    wlock: WsSpinLock = .{},
+
+    // Buffered reader state (rbuf[rpos..rend] holds unconsumed bytes).
+    rbuf: [4096]u8 = undefined,
+    rpos: usize = 0,
+    rend: usize = 0,
+
+    /// Bind to a live socket. Disables SO_RCVTIMEO (reads block until loopback
+    /// FIN/RST — see module doc) and bounds SO_SNDTIMEO at 2 s so hub fan-out
+    /// to a wedged client fails instead of stalling publisher threads.
+    pub fn init(fd: std.posix.socket_t, alloc: std.mem.Allocator) WsConn {
+        const tv: std.c.timeval = .{ .sec = 0, .usec = 0 }; // 0 = block forever
+        _ = setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.RCVTIMEO, &tv, @sizeOf(std.c.timeval));
+        const send_tv: std.c.timeval = .{ .sec = 2, .usec = 0 };
+        _ = setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.SNDTIMEO, &send_tv, @sizeOf(std.c.timeval));
+        return .{ .fd = fd, .alloc = alloc };
+    }
+
+    // ---- reading ----
+
+    fn fill(self: *WsConn) WsError!void {
+        if (self.rpos == self.rend) {
+            self.rpos = 0;
+            self.rend = 0;
+        }
+        if (self.rend == self.rbuf.len) {
+            // Compaction: reader consumed some head room.
+            const remaining = self.rend - self.rpos;
+            std.mem.copyForwards(u8, self.rbuf[0..remaining], self.rbuf[self.rpos..self.rend]);
+            self.rpos = 0;
+            self.rend = remaining;
+            if (remaining == self.rbuf.len) return error.ProtocolError; // header > buffer
+        }
+        while (true) {
+            const n = recv(self.fd, self.rbuf[self.rend..].ptr, self.rbuf.len - self.rend, 0);
+            if (n > 0) {
+                self.rend += @intCast(n);
+                return;
+            }
+            if (n == 0) return error.ConnectionClosed; // FIN
+            const err = std.c.errno(n);
+            if (err == .INTR) continue;
+            if (err == .AGAIN) continue; // timeout disabled post-upgrade; belt & braces
+            return error.ReadFailed;
+        }
+    }
+
+    fn readByte(self: *WsConn) WsError!u8 {
+        if (self.rpos == self.rend) try self.fill();
+        const b = self.rbuf[self.rpos];
+        self.rpos += 1;
+        return b;
+    }
+
+    fn readInto(self: *WsConn, dst: []u8) WsError!void {
+        var off: usize = 0;
+        while (off < dst.len) {
+            if (self.rpos == self.rend) try self.fill();
+            const avail = self.rend - self.rpos;
+            const take = @min(avail, dst.len - off);
+            @memcpy(dst[off .. off + take], self.rbuf[self.rpos .. self.rpos + take]);
+            self.rpos += take;
+            off += take;
+        }
+    }
+
+    /// Read ONE complete data message (fragments reassembled) appending its
+    /// payload to `out` (cleared first). Interleaved ping frames are answered
+    /// automatically; pong frames are dropped; a close frame completes the
+    /// closing handshake (echo) and yields `error.ConnectionClosed`.
+    ///
+    /// Any CLIENT-originated data frame received here is by definition a
+    /// protocol violation for our downstream-only streams — callers wanting
+    /// echo behavior should compare opcodes themselves; this layer delivers
+    /// whatever the peer legally sent.
+    pub fn readMessage(self: *WsConn, out: *std.ArrayList(u8)) WsError!WsOpcode {
+        out.clearRetainingCapacity();
+        var msg_opcode: ?WsOpcode = null;
+
+        while (true) {
+            const b0 = try self.readByte();
+            const fin = b0 & 0x80 != 0;
+            if (b0 & 0x70 != 0) return self.failProtocol(); // RSV bits
+            const opcode = WsOpcode.fromByte(b0 & 0x0F) orelse return self.failProtocol();
+
+            const b1 = try self.readByte();
+            const masked = b1 & 0x80 != 0;
+            if (!masked) return self.failProtocol(); // client frames MUST mask
+            var payload_len: u64 = b1 & 0x7F;
+            if (payload_len == 126) {
+                var ext: [2]u8 = undefined;
+                try self.readInto(&ext);
+                payload_len = std.mem.readInt(u16, &ext, .big);
+                if (payload_len < 126) return self.failProtocol();
+            } else if (payload_len == 127) {
+                var ext: [8]u8 = undefined;
+                try self.readInto(&ext);
+                payload_len = std.mem.readInt(u64, &ext, .big);
+                if (payload_len <= 0xFFFF) return self.failProtocol();
+            }
+
+            var mask_key: [4]u8 = undefined;
+            try self.readInto(&mask_key);
+
+            switch (opcode) {
+                .ping, .pong, .close => {
+                    // Control frames: never fragmented, payload ≤ 125.
+                    if (!fin or payload_len > 125) return self.failProtocol();
+                    var ctrl_buf: [125]u8 = undefined;
+                    const ctrl = ctrl_buf[0..@intCast(payload_len)];
+                    try self.readInto(ctrl);
+                    applyMask(ctrl, mask_key);
+                    switch (opcode) {
+                        .ping => try self.writeControlRaw(.pong, ctrl),
+                        .pong => {}, // unsolicited pongs are dropped
+                        .close => {
+                            // Echo the close (same code; default 1000 when empty).
+                            var close_code: u16 = 1000;
+                            if (ctrl.len >= 2) {
+                                close_code = std.mem.readInt(u16, ctrl[0..2], .big);
+                                // Unknown/invalid codes echo as 1002 protocol error.
+                                if (!isValidCloseCode(close_code)) close_code = 1002;
+                            }
+                            self.writeClose(close_code, "") catch {};
+                            return error.ConnectionClosed;
+                        },
+                        else => unreachable,
+                    }
+                    continue;
+                },
+                .continuation => {
+                    if (msg_opcode == null) return self.failProtocol();
+                },
+                .text, .binary => {
+                    if (msg_opcode != null) return self.failProtocol();
+                    msg_opcode = opcode;
+                },
+            }
+
+            // Data frame: enforce the reassembly cap, then consume payload.
+            const total = out.items.len + payload_len;
+            if (total > self.max_message) {
+                self.writeClose(1009, "") catch {}; // MESSAGE_TOO_BIG
+                self.close_sent = true;
+                return error.MessageTooLarge;
+            }
+            const start = out.items.len;
+            try out.resize(self.alloc, start + @as(usize, @intCast(payload_len)));
+            try self.readInto(out.items[start..]);
+            applyMask(out.items[start..], mask_key);
+
+            if (fin) return msg_opcode.?;
+        }
+    }
+
+    fn isValidCloseCode(code: u16) bool {
+        return switch (code) {
+            1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011 => true,
+            3000...4999 => true,
+            else => false,
+        };
+    }
+
+    /// Fail the connection with a 1002 close and surface ProtocolError.
+    fn failProtocol(self: *WsConn) WsError {
+        self.writeClose(1002, "") catch {};
+        self.close_sent = true;
+        return error.ProtocolError;
+    }
+
+    // ---- writing ----
+
+    fn writeAllLocked(self: *WsConn, data: []const u8) WsError!void {
+        self.wlock.lock();
+        defer self.wlock.unlock();
+        self.writeAllUnlocked(data) catch return error.WriteFailed;
+    }
+
+    /// Caller must hold `wlock` (header+payload pairs must not interleave).
+    fn writeAllUnlocked(self: *WsConn, data: []const u8) !void {
+        var off: usize = 0;
+        while (off < data.len) {
+            const n = libc_send(self.fd, data.ptr + off, data.len - off, send_flags);
+            if (n <= 0) return error.WriteFailed;
+            off += @intCast(n);
+        }
+    }
+
+    /// Send one complete unmasked frame: header from a stack buffer, payload
+    /// straight from caller memory (server frames are never masked, so no
+    /// payload copy is needed). Zero heap allocation.
+    pub fn writeFrame(self: *WsConn, opcode: WsOpcode, payload: []const u8) WsError!void {
+        var hdr: [10]u8 = undefined;
+        hdr[0] = 0x80 | opcode.toByte(); // server data frames: fin=1
+        const ext = encodeExtendedLen(payload.len);
+        hdr[1] = encodeLenBits(payload.len);
+        var hdr_len: usize = 2;
+        switch (ext) {
+            .none => {},
+            .u16 => |v| {
+                std.mem.writeInt(u16, hdr[2..4], v, .big);
+                hdr_len = 4;
+            },
+            .u64 => |v| {
+                std.mem.writeInt(u64, hdr[2..10], v, .big);
+                hdr_len = 10;
+            },
+        }
+        self.wlock.lock();
+        defer self.wlock.unlock();
+        self.writeAllUnlocked(hdr[0..hdr_len]) catch return error.WriteFailed;
+        if (payload.len > 0) {
+            self.writeAllUnlocked(payload) catch return error.WriteFailed;
+        }
+    }
+
+    pub fn writeText(self: *WsConn, payload: []const u8) WsError!void {
+        return self.writeFrame(.text, payload);
+    }
+
+    pub fn writeBinary(self: *WsConn, payload: []const u8) WsError!void {
+        return self.writeFrame(.binary, payload);
+    }
+
+    pub fn writePing(self: *WsConn, payload: []const u8) WsError!void {
+        return self.writeControlRaw(.ping, payload);
+    }
+
+    pub fn writePong(self: *WsConn, payload: []const u8) WsError!void {
+        return self.writeControlRaw(.pong, payload);
+    }
+
+    /// Control frames carry ≤125 bytes; longer payloads are truncated to the
+    /// RFC limit rather than failing the connection.
+    fn writeControlRaw(self: *WsConn, opcode: WsOpcode, payload: []const u8) WsError!void {
+        const n = @min(payload.len, 125);
+        var hdr: [2]u8 = .{ 0x80 | opcode.toByte(), @intCast(n) };
+        self.wlock.lock();
+        defer self.wlock.unlock();
+        self.writeAllUnlocked(&hdr) catch return error.WriteFailed;
+        if (n > 0) {
+            self.writeAllUnlocked(payload[0..n]) catch return error.WriteFailed;
+        }
+    }
+
+    /// Begin the closing handshake: send a close frame with `code` and
+    /// `reason` (reason truncated so the total payload stays ≤123 bytes).
+    /// Idempotent per connection (`close_sent` guard). Does NOT wait for the
+    /// peer's close reply; the fd owner closes the socket afterwards.
+    pub fn writeClose(self: *WsConn, code: u16, reason: []const u8) WsError!void {
+        if (self.close_sent) return;
+        self.close_sent = true;
+        var payload: [125]u8 = undefined;
+        std.mem.writeInt(u16, payload[0..2], code, .big);
+        const max_reason = @min(reason.len, 123);
+        @memcpy(payload[2 .. 2 + max_reason], reason[0..max_reason]);
+        return self.writeControlRaw(.close, payload[0 .. 2 + max_reason]);
+    }
+};
+
 // ── tests ───────────────────────────────────────────────────────────────────
 
 test "parseRequest round-trips method/path/query/headers/body" {
@@ -729,4 +1330,165 @@ test "percentDecode decodes escapes and tolerates stray percent" {
     const b = try percentDecode(alloc, "100%done%zz");
     defer alloc.free(b);
     try std.testing.expectEqualStrings("100%done%zz", b);
+}
+
+// ── WebSocket tests (wave-5 additive layer) ────────────────────────────────
+
+const ws_testing = std.testing;
+
+test "computeWsAcceptKey matches the RFC 6455 §1.3 example vector" {
+    // RFC: key "dGhlIHNhbXBsZSBub25jZQ==" → accept "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+    const key = try computeWsAcceptKey(ws_testing.allocator, "dGhlIHNhbXBsZSBub25jZQ==");
+    defer ws_testing.allocator.free(key);
+    try ws_testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", key);
+}
+
+/// Parse a request into an arena owned by the returned holder struct so
+/// upgrade tests can borrow header slices without manual frees.
+const ReqHolder = struct {
+    arena: std.heap.ArenaAllocator,
+    req: Request,
+
+    fn deinit(self: *ReqHolder) void {
+        self.arena.deinit();
+    }
+};
+
+fn makeWsRequest(raw: []const u8) !ReqHolder {
+    var holder = ReqHolder{
+        .arena = std.heap.ArenaAllocator.init(ws_testing.allocator),
+        .req = undefined,
+    };
+    errdefer holder.arena.deinit();
+    holder.req = try parseRequest(holder.arena.allocator(), raw);
+    return holder;
+}
+
+test "WsUpgrade.fromRequest validates handshake headers and rejects bad ones" {
+    const good_raw = "GET /api/events.mux HTTP/1.1\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n\r\n";
+    {
+        var h = try makeWsRequest(good_raw);
+        defer h.deinit();
+        const upg = try WsUpgrade.fromRequest(&h.req);
+        const resp = try upg.formatResponse(h.arena.allocator());
+        try ws_testing.expect(std.mem.indexOf(u8, resp, "HTTP/1.1 101 Switching Protocols\r\n") != null);
+        try ws_testing.expect(std.mem.indexOf(u8, resp, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n") != null);
+    }
+    // POST → NotWebSocket.
+    {
+        const raw = "POST /api/x HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        var h = try makeWsRequest(raw);
+        defer h.deinit();
+        try ws_testing.expectError(error.NotWebSocket, WsUpgrade.fromRequest(&h.req));
+    }
+    // Missing key.
+    {
+        const raw = "GET /api/events.mux HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
+            "Sec-WebSocket-Version: 13\r\n\r\n";
+        var h = try makeWsRequest(raw);
+        defer h.deinit();
+        try ws_testing.expectError(error.MissingKey, WsUpgrade.fromRequest(&h.req));
+    }
+    // Bad version.
+    {
+        const raw = "GET /api/events.mux HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 8\r\n\r\n";
+        var h = try makeWsRequest(raw);
+        defer h.deinit();
+        try ws_testing.expectError(error.BadVersion, WsUpgrade.fromRequest(&h.req));
+    }
+    // Upgrade header absent entirely.
+    {
+        const raw = "GET /api/events.mux HTTP/1.1\r\nHost: x\r\n\r\n";
+        var h = try makeWsRequest(raw);
+        defer h.deinit();
+        try ws_testing.expectError(error.NotWebSocket, WsUpgrade.fromRequest(&h.req));
+    }
+}
+
+test "encodeWsFrame/parseWsFrameHeader round-trip unmasked small frame" {
+    const alloc = ws_testing.allocator;
+    const payload = "hello ws";
+    const frame = try encodeWsFrame(alloc, .text, true, payload, null);
+    defer alloc.free(frame);
+    try ws_testing.expectEqual(@as(usize, 2 + payload.len), frame.len);
+
+    const hdr = try parseWsFrameHeader(frame);
+    try ws_testing.expect(hdr.fin);
+    try ws_testing.expectEqual(WsOpcode.text, hdr.opcode);
+    try ws_testing.expect(!hdr.masked);
+    try ws_testing.expectEqual(payload.len, hdr.payload_len);
+    try ws_testing.expectEqual(@as(usize, 2), hdr.header_len);
+    try ws_testing.expectEqualStrings(payload, frame[hdr.header_len..]);
+}
+
+test "frame codec round-trips masked payloads (client-style) of all length classes" {
+    const alloc = ws_testing.allocator;
+    const key: [4]u8 = .{ 0x12, 0x34, 0x56, 0x78 };
+
+    // 7-bit class, 16-bit class (300 bytes), 64-bit class is capped by the
+    // test below at 70000 bytes — all through the same encode/parse/unmask.
+    const sizes = [_]usize{ 0, 1, 125, 126, 300, 65535, 65536, 70000 };
+    for (sizes) |n| {
+        const payload = try alloc.alloc(u8, n);
+        defer alloc.free(payload);
+        for (payload, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+
+        const frame = try encodeWsFrame(alloc, .binary, true, payload, key);
+        defer alloc.free(frame);
+
+        const hdr = try parseWsFrameHeader(frame);
+        try ws_testing.expect(hdr.fin);
+        try ws_testing.expect(hdr.masked);
+        try ws_testing.expectEqual(n, hdr.payload_len);
+        const body = frame[hdr.header_len..];
+        try ws_testing.expectEqual(n, body.len);
+        // Masked on the wire…
+        if (n > 4) try ws_testing.expect(!std.mem.eql(u8, body[0..8], payload[0..8]));
+        // …and unmasks back exactly.
+        applyMask(@constCast(body), key);
+        try ws_testing.expectEqualSlices(u8, payload, body);
+    }
+}
+
+test "parseWsFrameHeader needs more data for truncated headers" {
+    const alloc = ws_testing.allocator;
+    var payload: [400]u8 = undefined;
+    @memset(&payload, 0xAB);
+    const frame = try encodeWsFrame(alloc, .text, false, &payload, null);
+    defer alloc.free(frame);
+    try ws_testing.expectError(error.NeedMoreData, parseWsFrameHeader(frame[0..1]));
+    try ws_testing.expectError(error.NeedMoreData, parseWsFrameHeader(frame[0..3]));
+    const hdr = try parseWsFrameHeader(frame);
+    try ws_testing.expect(!hdr.fin); // fragmented first frame
+}
+
+test "parseWsFrameHeader rejects RSV bits and reserved opcodes" {
+    // RSV1 set on a text frame.
+    const rsv = [4]u8{ 0x81 | 0x40, 0x80, 0, 0 };
+    try ws_testing.expectError(error.ProtocolError, parseWsFrameHeader(&rsv));
+    // Reserved opcode 0x3.
+    const resv_op = [2]u8{ 0x83, 0x00 };
+    try ws_testing.expectError(error.ProtocolError, parseWsFrameHeader(&resv_op));
+    // Non-minimal 16-bit length (len 5 declared as extended).
+    const nonmin = [4]u8{ 0x81, 126, 0x00, 0x05 };
+    try ws_testing.expectError(error.ProtocolError, parseWsFrameHeader(&nonmin));
+}
+
+test "close frame payload packs big-endian code plus reason" {
+    const alloc = ws_testing.allocator;
+    var close_payload: [128]u8 = undefined;
+    std.mem.writeInt(u16, close_payload[0..2], 1008, .big);
+    @memcpy(close_payload[2..9], "no dice");
+    const frame = try encodeWsFrame(alloc, .close, true, close_payload[0..9], null);
+    defer alloc.free(frame);
+    const hdr = try parseWsFrameHeader(frame);
+    try ws_testing.expectEqual(WsOpcode.close, hdr.opcode);
+    try ws_testing.expectEqual(@as(u64, 9), hdr.payload_len);
+    try ws_testing.expectEqual(@as(u16, 1008), std.mem.readInt(u16, frame[2..4], .big));
 }

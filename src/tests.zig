@@ -66,6 +66,12 @@ comptime {
     _ = @import("fuzz/checkpoint_session.zig");
     _ = @import("fuzz/manifest.zig");
     _ = @import("fuzz/envelope.zig");
+    // Wave-5: dsh apiproxy surface + SSE run pump.
+    _ = @import("server/apiproxy/jsonx.zig");
+    _ = @import("server/apiproxy/router.zig");
+    _ = @import("server/apiproxy/events_ws.zig");
+    _ = @import("server/apiproxy/sessions.zig");
+    _ = @import("server/sse_run.zig");
 }
 
 comptime {

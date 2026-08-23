@@ -106,7 +106,15 @@ const default_ctx: Ctx = .{};
 /// API territory.
 pub fn claims(url_path: []const u8) bool {
     if (std.mem.eql(u8, url_path, "/")) return true;
-    return std.mem.startsWith(u8, url_path, "/assets/");
+    // "/plugins/<pkg>/client.js" serves the vendored dsh client bundles
+    // (webui dist layout: plugins/@scope/pkg -> lib/client.js).
+    if (std.mem.startsWith(u8, url_path, "/plugins/")) return true;
+    if (std.mem.startsWith(u8, url_path, "/assets/")) return true;
+    // dsh dist keeps langs/, fonts/, favicon.svg, manifest at the root too.
+    if (!std.mem.startsWith(u8, url_path, "//") and std.mem.indexOfScalar(u8, url_path, '.') != null) {
+        return true; // any dotted path (favicon.svg, manifest.webmanifest, …)
+    }
+    return false;
 }
 
 pub const ResolveError = error{
@@ -145,14 +153,17 @@ pub fn resolvePath(alloc: std.mem.Allocator, root: []const u8, url_path: []const
     defer if (owned) |o| alloc.free(o);
 
     const full = blk: {
-        if (url_path.len == 1) // "/"
-            break :blk try std.fmt.allocPrint(alloc, "{s}/index.html", .{root});
-        // Decode the remainder of "/assets/" BEFORE validating segments.
-        const decoded = try httpd.percentDecode(alloc, url_path["/assets/".len..]);
+        if (url_path.len == 1) // "/" — prefer the boot-injected index when present
+            break :blk std.fmt.allocPrint(alloc, "{s}/index.injected.html", .{root}) catch
+                try std.fmt.allocPrint(alloc, "{s}/index.html", .{root});
+        // Decode the remainder of the URL path BEFORE validating segments,
+        // then map it directly under the root (general single-root layout:
+        // serves /assets/*, /plugins/*/client.js, /favicon.svg, … alike).
+        const decoded = try httpd.percentDecode(alloc, url_path[1..]);
         owned = decoded;
         type_ref = decoded;
         try validateSegments(decoded);
-        break :blk try std.fmt.allocPrint(alloc, "{s}/assets/{s}", .{ root, decoded });
+        break :blk try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root, decoded });
     };
     errdefer alloc.free(full);
     return .{ .path = full, .content_type = contentTypeFor(type_ref) };

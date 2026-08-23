@@ -258,3 +258,430 @@ fn providerEndpoint(provider: []const u8) []const u8 {
     if (std.mem.eql(u8, provider, "openrouter")) return "https://openrouter.ai/api/v1/chat/completions";
     return "https://api.deepseek.com/chat/completions";
 }
+
+// ── minimal flat TOML (the ~/.zharness/config.toml document) ────────────────
+//
+// The document is a flat section/key table: `[section]` headers plus
+// `key = value` lines. Values: basic strings ("…"), literal strings ('…'),
+// integers, booleans, and verbatim raw values starting with '[' or '{'
+// (JSON-compatible inline arrays/tables — written back byte-exact so no
+// array parser is needed). Comments and unknown sections/keys survive a
+// read-modify-write round trip; inline comments AFTER an updated value do
+// not (documented limitation).
+
+/// One TOML value in the supported subset.
+pub const TomlValue = union(enum) {
+    /// Decoded contents of a quoted string.
+    str: []const u8,
+    int: i64,
+    boolean: bool,
+    /// Verbatim slice of an inline array/table ('['- or '{'-prefixed).
+    raw: []const u8,
+
+    pub fn render(self: TomlValue, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        switch (self) {
+            .str => |s| try appendQuotedToml(alloc, out, s),
+            .int => |i| try out.print(alloc, "{d}", .{i}),
+            .boolean => |b| try out.appendSlice(alloc, if (b) "true" else "false"),
+            .raw => |r| try out.appendSlice(alloc, r),
+        }
+    }
+};
+
+/// One parsed `key = value` row with its owning section.
+pub const TomlEntry = struct {
+    section: []const u8,
+    key: []const u8,
+    val: TomlValue,
+};
+
+pub const TomlError = error{OutOfMemory};
+
+/// Parse the supported TOML subset into ordered entries. Malformed lines are
+/// skipped silently (a hand-edited document must not brick the GUI): the
+/// reader accepts strictly more than the writer emits.
+pub fn parseTomlFlat(alloc: std.mem.Allocator, text: []const u8) TomlError!?[]TomlEntry {
+    var entries: std.ArrayList(TomlEntry) = .empty;
+    errdefer entries.deinit(alloc);
+    var section: []const u8 = "";
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw_line| {
+        const line = trimWs(raw_line);
+        if (line.len == 0 or line[0] == '#') continue;
+        if (line[0] == '[') {
+            const end = std.mem.indexOfScalar(u8, line, ']') orelse continue;
+            section = line[1..end];
+            continue;
+        }
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = trimWs(line[0..eq]);
+        if (key.len == 0) continue;
+        var rest = trimWs(line[eq + 1 ..]);
+        // Strip a trailing unquoted comment.
+        rest = stripComment(rest);
+        const val = parseTomlValue(alloc, rest) catch continue;
+        try entries.append(alloc, .{ .section = section, .key = key, .val = val });
+    }
+    if (entries.items.len == 0) return null;
+    return try entries.toOwnedSlice(alloc);
+}
+
+/// Free an entry list returned by parseTomlFlat.
+pub fn freeTomlEntries(alloc: std.mem.Allocator, entries: ?[]TomlEntry) void {
+    const list = entries orelse return;
+    for (list) |e| {
+        switch (e.val) {
+            .str => |s| alloc.free(s),
+            else => {},
+        }
+    }
+    alloc.free(list);
+}
+
+fn parseTomlValue(alloc: std.mem.Allocator, v: []const u8) !TomlValue {
+    if (v.len == 0) return error.BadValue;
+    if (v[0] == '"') {
+        const s = try decodeBasicString(alloc, v);
+        return .{ .str = s };
+    }
+    if (v[0] == '\'') {
+        const end = std.mem.indexOfScalarPos(u8, v, 1, '\'') orelse return error.BadValue;
+        return .{ .str = try alloc.dupe(u8, v[1..end]) };
+    }
+    if (v[0] == '[' or v[0] == '{') return .{ .raw = try alloc.dupe(u8, v) };
+    if (std.mem.eql(u8, v, "true")) return .{ .boolean = true };
+    if (std.mem.eql(u8, v, "false")) return .{ .boolean = false };
+    return .{ .int = std.fmt.parseInt(i64, v, 10) catch return error.BadValue };
+}
+
+/// Decode a double-quoted TOML string with escapes into `alloc`.
+fn decodeBasicString(alloc: std.mem.Allocator, v: []const u8) ![]u8 {
+    // v starts with '"'; find the closing unescaped quote.
+    var i: usize = 1;
+    while (i < v.len) : (i += 1) {
+        if (v[i] == '\\') {
+            i += 1;
+            continue;
+        }
+        if (v[i] == '"') break;
+    }
+    if (i >= v.len) return error.BadValue;
+    const inner = v[1..i];
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var j: usize = 0;
+    while (j < inner.len) : (j += 1) {
+        if (inner[j] != '\\' or j + 1 >= inner.len) {
+            try out.append(alloc, inner[j]);
+            continue;
+        }
+        j += 1;
+        const c = inner[j];
+        const mapped: ?u8 = switch (c) {
+            'n' => '\n',
+            't' => '\t',
+            'r' => '\r',
+            '"' => '"',
+            '\\' => '\\',
+            else => null,
+        };
+        if (mapped) |m| try out.append(alloc, m) else {
+            try out.append(alloc, '\\');
+            try out.append(alloc, c);
+        }
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Render a string as a double-quoted TOML value with escapes.
+fn appendQuotedToml(alloc: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+    try out.append(alloc, '"');
+    for (s) |c| {
+        switch (c) {
+            '"' => try out.appendSlice(alloc, "\\\""),
+            '\\' => try out.appendSlice(alloc, "\\\\"),
+            '\n' => try out.appendSlice(alloc, "\\n"),
+            '\t' => try out.appendSlice(alloc, "\\t"),
+            '\r' => try out.appendSlice(alloc, "\\r"),
+            else => try out.append(alloc, c),
+        }
+    }
+    try out.append(alloc, '"');
+}
+
+/// One read-modify-write edit: set `key` in `section`, or remove it when
+/// `value` is null.
+pub const ConfigKv = struct {
+    section: []const u8,
+    key: []const u8,
+    /// Null removes the key's line from its section.
+    value: ?TomlValue,
+};
+
+/// Apply ordered edits to a TOML document, preserving everything this module
+/// does not touch (comments, unknown keys, unknown sections, ordering).
+/// Known keys update in place; new known keys join their section block
+/// (appended after the section's last line); missing sections are appended at
+/// EOF with one header per section. Returns the new document text.
+pub fn applyConfigKvs(
+    alloc: std.mem.Allocator,
+    original: []const u8,
+    kvs: []const ConfigKv,
+) TomlError![]u8 {
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(alloc);
+    var it = std.mem.splitScalar(u8, original, '\n');
+    while (it.next()) |l| try lines.append(alloc, l);
+    // A document ending in '\n' yields a phantom trailing "" from the split;
+    // dropping it keeps byte-exact round trips.
+    if (lines.items.len > 0 and lines.items[lines.items.len - 1].len == 0) {
+        _ = lines.pop();
+    }
+    //   - replace/remove: index of the key's line;
+    //   - insert: index the new line goes BEFORE (section end or EOF).
+    const Kind = enum { replace, remove, insert };
+    const Resolved = struct { kind: Kind, line_idx: usize, kv_idx: usize };
+    var resolved: std.ArrayList(Resolved) = .empty;
+    defer resolved.deinit(alloc);
+
+    outer: for (kvs, 0..) |kv, kv_idx| {
+        // Insert point when the section exists but lacks the key: after its
+        // last line. Starts at the section header's next line so an empty
+        // existing section still inserts correctly.
+        var insert_at: ?usize = null;
+        var current_section: []const u8 = "";
+        for (lines.items, 0..) |raw_line, li| {
+            const line = trimWs(raw_line);
+            if (line.len > 0 and line[0] == '[') {
+                if (std.mem.eql(u8, current_section, kv.section)) {
+                    // Ran off the end of the target section.
+                    break;
+                }
+                const end = std.mem.indexOfScalar(u8, line, ']') orelse continue;
+                current_section = line[1..end];
+                if (std.mem.eql(u8, current_section, kv.section)) insert_at = li + 1;
+                continue;
+            }
+            if (!std.mem.eql(u8, current_section, kv.section)) continue;
+            const eq = std.mem.indexOfScalar(u8, line, '=') orelse {
+                if (line.len > 0) insert_at = li + 1; // unknown row type still extends the block
+                continue;
+            };
+            const key = trimWs(line[0..eq]);
+            if (kv.key.len == key.len and std.mem.eql(u8, kv.key, key)) {
+                try resolved.append(alloc, .{
+                    .kind = if (kv.value == null) .remove else .replace,
+                    .line_idx = li,
+                    .kv_idx = kv_idx,
+                });
+                continue :outer;
+            }
+            insert_at = li + 1;
+        }
+        if (kv.value == null) continue; // removing an absent key is a no-op
+        try resolved.append(alloc, .{ .kind = .insert, .line_idx = insert_at orelse lines.items.len, .kv_idx = kv_idx });
+    }
+
+    // Emit in one pass over the original lines: replacements/removals in
+    // place, pending inserts flushed when the walk reaches their line.
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+
+    // Inserts sorted ASCENDING by line index; EOF tail handled after the walk.
+    std.mem.sort(Resolved, resolved.items, {}, struct {
+        fn less(_: void, x: Resolved, y: Resolved) bool {
+            if (x.line_idx != y.line_idx) return x.line_idx < y.line_idx;
+            // Equal index: an insert lands before the line's replace/remove.
+            return x.kind == .insert and y.kind != .insert;
+        }
+    }.less);
+    var inserts_only: std.ArrayList(Resolved) = .empty;
+    defer inserts_only.deinit(alloc);
+    for (resolved.items) |r| {
+        if (r.kind == .insert) try inserts_only.append(alloc, r);
+    }
+
+    var headers_written: std.ArrayList([]const u8) = .empty;
+    defer headers_written.deinit(alloc);
+
+    var pos: usize = 0; // cursor into inserts_only
+    var li: usize = 0;
+    while (li < lines.items.len) : (li += 1) {
+        while (pos < inserts_only.items.len and inserts_only.items[pos].line_idx == li) : (pos += 1) {
+            try emitInsert(alloc, &out, &headers_written, kvs[inserts_only.items[pos].kv_idx], lines.items);
+        }
+        var replaced = false;
+        for (resolved.items) |r| {
+            if (r.kind != .insert and r.line_idx == li) {
+                if (r.kind == .replace) try renderKvLine(alloc, &out, kvs[r.kv_idx]);
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) {
+            try out.appendSlice(alloc, lines.items[li]);
+            try out.append(alloc, '\n');
+        }
+    }
+    while (pos < inserts_only.items.len) : (pos += 1) {
+        try emitInsert(alloc, &out, &headers_written, kvs[inserts_only.items[pos].kv_idx], lines.items);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Render one insert action: a fresh section header first when the original
+/// document never declared it (once per section), then the key/value line.
+fn emitInsert(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    headers_written: *std.ArrayList([]const u8),
+    kv: ConfigKv,
+    original_lines: [][]const u8,
+) !void {
+    if (!sectionExists(original_lines, kv.section)) {
+        var seen = false;
+        for (headers_written.items) |h| {
+            if (std.mem.eql(u8, h, kv.section)) seen = true;
+        }
+        if (!seen) {
+            try out.append(alloc, '\n');
+            try out.append(alloc, '[');
+            try out.appendSlice(alloc, kv.section);
+            try out.appendSlice(alloc, "]\n");
+            try headers_written.append(alloc, kv.section);
+        }
+    }
+    try renderKvLine(alloc, out, kv);
+}
+
+fn sectionExists(lines: [][]const u8, section: []const u8) bool {
+    for (lines) |raw_line| {
+        const line = trimWs(raw_line);
+        if (line.len == 0 or line[0] != '[') continue;
+        const end = std.mem.indexOfScalar(u8, line, ']') orelse continue;
+        if (std.mem.eql(u8, line[1..end], section)) return true;
+    }
+    return false;
+}
+
+fn renderKvLine(alloc: std.mem.Allocator, out: *std.ArrayList(u8), kv: ConfigKv) !void {
+    try out.appendSlice(alloc, kv.key);
+    try out.appendSlice(alloc, " = ");
+    try kv.value.?.render(alloc, out);
+    try out.append(alloc, '\n');
+}
+
+fn trimWs(s: []const u8) []const u8 {
+    return std.mem.trim(u8, s, " \t\r");
+}
+
+/// Strip a trailing ` #comment` from a value slice (quoted-string aware).
+fn stripComment(v: []const u8) []const u8 {
+    var in_str: u8 = 0;
+    var i: usize = 0;
+    while (i < v.len) : (i += 1) {
+        const c = v[i];
+        if (in_str != 0) {
+            if (c == '\\' and in_str == '"') i += 1 else if (c == in_str) in_str = 0;
+            continue;
+        }
+        if (c == '"' or c == '\'') {
+            in_str = c;
+        } else if (c == '#') {
+            return trimWs(v[0..i]);
+        }
+    }
+    return trimWs(v);
+}
+
+// ── TOML round-trip tests ───────────────────────────────────────────────────
+
+test "toml parse flat subset" {
+    const alloc = std.testing.allocator;
+    const doc =
+        \\# top comment
+        \\[model]
+        \\provider = "deepseek"
+        \\model = "deepseek-v4-flash" # trailing comment
+        \\api_key = "sk-\"q\\"
+        \\
+        \\[agent]
+        \\max_turns = 64
+        \\stream = true
+        \\
+    ;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const entries = (try parseTomlFlat(arena.allocator(), doc)).?;
+    try std.testing.expectEqual(@as(usize, 5), entries.len);
+    try std.testing.expectEqualStrings("model", entries[0].section);
+    try std.testing.expectEqualStrings("deepseek", entries[0].val.str);
+    try std.testing.expectEqualStrings("sk-\"q\\", entries[2].val.str);
+    try std.testing.expectEqual(@as(i64, 64), entries[3].val.int);
+    try std.testing.expectEqual(true, entries[4].val.boolean);
+}
+
+test "toml apply kvs preserves unknown content" {
+    const alloc = std.testing.allocator;
+    const doc =
+        \\# header comment
+        \\[model]
+        \\provider = "deepseek"
+        \\custom_thing = "keep me"
+        \\
+        \\[agent]
+        \\stream = true
+        \\
+        \\[unknown_section]
+        \\x = 1
+        \\
+    ;
+    const updated = try applyConfigKvs(alloc, doc, &.{
+        .{ .section = "model", .key = "provider", .value = .{ .str = "anthropic" } },
+        .{ .section = "agent", .key = "max_turns", .value = .{ .int = 32 } },
+        .{ .section = "preferences", .key = "theme", .value = .{ .str = "dark" } },
+        .{ .section = "agent", .key = "stream", .value = null },
+    });
+    defer alloc.free(updated);
+
+    try std.testing.expect(std.mem.indexOf(u8, updated, "# header comment") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "provider = \"anthropic\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "custom_thing = \"keep me\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "[unknown_section]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "max_turns = 32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "[preferences]\ntheme = \"dark\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "stream") == null); // removed
+
+    // Round trip: parsing the rewritten document yields the same facts.
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const entries = (try parseTomlFlat(arena.allocator(), updated)).?;
+    var seen_provider: ?[]const u8 = null;
+    for (entries) |e| {
+        if (std.mem.eql(u8, e.key, "provider")) seen_provider = e.val.str;
+        if (std.mem.eql(u8, e.key, "max_turns")) try std.testing.expectEqual(@as(i64, 32), e.val.int);
+    }
+    try std.testing.expectEqualStrings("anthropic", seen_provider.?);
+}
+
+test "toml apply kvs into empty document creates sections" {
+    const alloc = std.testing.allocator;
+    const updated = try applyConfigKvs(alloc, "", &.{
+        .{ .section = "model", .key = "model", .value = .{ .str = "m1" } },
+        .{ .section = "preferences", .key = "locale", .value = .{ .str = "en" } },
+    });
+    defer alloc.free(updated);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "[model]\nmodel = \"m1\"\n\n[preferences]\nlocale = \"en\"") != null);
+}
+
+test "toml raw json value round trips verbatim" {
+    const alloc = std.testing.allocator;
+    const doc = "[model]\nmodels = [{\"id\":\"m1\",\"contextWindow\":128}]\n";
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const entries = (try parseTomlFlat(a, doc)).?;
+    try std.testing.expectEqualStrings("[{\"id\":\"m1\",\"contextWindow\":128}]", entries[0].val.raw);
+    const updated = try applyConfigKvs(a, doc, &.{});
+    try std.testing.expectEqualStrings(doc, updated);
+}

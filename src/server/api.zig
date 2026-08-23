@@ -17,16 +17,95 @@
 //!   stub. Both paths honor client disconnects via Responder mechanics.
 //!
 //! Route table:
-//!   POST /run            {prompt, session?} -> deps.runTask
+//!   POST /run            {prompt, session?} -> deps.runTask (buffered)
 //!   POST /chat           {prompt, session?} -> deps.runTask (conversational alias)
+//!   POST /run/stream     {prompt, session?, preset?, sandbox?}
+//!                                            -> deps.runStream (SSE frames;
+//!                                               see server/sse_run.zig)
 //!   GET  /sessions                          -> deps.listSessions
-//!   GET  /sessions/:id                         -> deps.getSession
-//!   GET  /healthz                                -> {"ok":true}
-//!   GET  /events                                 -> SSE (live hub feed or heartbeat fallback)
+//!   POST /sessions       {id?}              -> deps.createSession (501 when unwired)
+//!   GET  /sessions/:id                      -> deps.getSession
+//!   PATCH /sessions/:id  {rename:"new-id"}  -> deps.renameSession (501 when unwired)
+//!   DELETE /sessions/:id                    -> deps.deleteSession (501 when unwired)
+//!   GET  /healthz                           -> {"ok":true}
+//!   GET  /events                            -> SSE (live hub feed or heartbeat fallback)
+//!
+//! ── RUN SERIALIZATION (applies to /run AND /run/stream) ───────────────────
+//! Agent runs mutate shared process state (the DebugAllocator is not
+//! thread-safe), so BOTH run paths must hold one process-wide run mutex
+//! inside their ServerDeps implementations. HTTP connections stay concurrent
+//! (threaded_connections = true); concurrent runs merely QUEUE behind each
+//! other — at most one agent run is active at a time. Streaming clients keep
+//! receiving heartbeats from the pump while queued. See server/sse_run.zig.
+//!
+//! Session ids are validated against [A-Za-z0-9_-] (max 128 chars) on every
+//! /sessions/:id route BEFORE any dep runs — ids end up in file paths in the
+//! main.zig implementations, so this is the path-traversal guard.
 
 const std = @import("std");
 const httpd = @import("httpd.zig");
 const events = @import("events.zig");
+const sse_run = @import("sse_run.zig");
+
+/// Semantic errors the session-management deps may return; mapped to HTTP
+/// statuses by `sessionOpFailure`.
+pub const SessionOpError = error{
+    /// DELETE/PATCH source id unknown -> 404.
+    SessionNotFound,
+    /// Rename/create target id already taken -> 409 Conflict.
+    SessionExists,
+    /// Id outside [A-Za-z0-9_-] -> 400 (route pre-validates too).
+    InvalidSessionId,
+};
+
+/// Largest accepted session id length.
+pub const max_session_id_len: usize = 128;
+
+/// True when `id` is a well-formed session id: non-empty, ≤128 bytes, only
+/// [A-Za-z0-9_-]. Enforced before any session dep invocation.
+pub fn validSessionId(id: []const u8) bool {
+    if (id.len == 0 or id.len > max_session_id_len) return false;
+    for (id) |c| {
+        switch (c) {
+            'A'...'Z', 'a'...'z', '0'...'9', '_', '-' => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
+const CivilDate = struct { year: i64, month: u32, day: u32 };
+
+/// Days-since-epoch -> civil date (Howard Hinnant's algorithm).
+fn civilFromDays(days_since_epoch: i64) CivilDate {
+    const z = days_since_epoch + 719_468;
+    const era = @divFloor(z, 146_097);
+    const doe: u64 = @intCast(z - era * 146_097); // [0, 146096]
+    const yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    const y = @as(i64, @intCast(yoe)) + era * 400;
+    const doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    const mp = (5 * doy + 2) / 153; // [0, 11]
+    const d: u32 = @intCast(doy - (153 * mp + 2) / 5 + 1); // [1, 31]
+    const m: u32 = @intCast(if (mp < 10) mp + 3 else mp - 9); // [1, 12]
+    return .{ .year = if (m <= 2) y + 1 else y, .month = m, .day = d };
+}
+
+/// Mint a session id of the shape "web-YYYYMMDD-HHMMSS" (UTC) from a Unix
+/// timestamp in seconds. Written into `buf` (≥32 bytes recommended). Used by
+/// the POST /sessions implementation when the client sent no id.
+pub fn formatMintedSessionId(buf: []u8, now_secs: i64) []const u8 {
+    const days = @divFloor(now_secs, 86_400);
+    var secs_of_day = now_secs - days * 86_400;
+    const civ = civilFromDays(days);
+    const hour = @divFloor(secs_of_day, 3600);
+    secs_of_day -= hour * 3600;
+    const minute = @divFloor(secs_of_day, 60);
+    const sec = secs_of_day - minute * 60;
+    return std.fmt.bufPrint(buf, "web-{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}", .{
+        @as(u64, @intCast(civ.year)), civ.month, civ.day,
+        @as(u32, @intCast(hour)),      @as(u32, @intCast(minute)), @as(u32, @intCast(sec)),
+    }) catch "web-session"; // unreachable with a sane buf; degrade gracefully
+}
 
 // ── dependency surface ──────────────────────────────────────────────────────
 
@@ -78,6 +157,38 @@ pub const ServerDeps = struct {
     /// with `alloc` — release via `SessionDetail.deinit`.
     getSession: *const fn (ctx: ?*anyopaque, alloc: std.mem.Allocator, id: []const u8) anyerror!?SessionDetail,
 
+    // ── wave-5 additions (all optional; null ⇒ the route answers 501) ────
+
+    /// Streaming twin of `runTask` backing POST /run/stream. MUST hold the
+    /// same process-wide run mutex as `runTask` (see the module doc's RUN
+    /// SERIALIZATION note). Full RunEvent contract: server/sse_run.zig.
+    /// Null ⇒ POST /run/stream answers 501 {"ok":false,...}.
+    runStream: ?sse_run.RunStreamFn = null,
+
+    /// DELETE /sessions/:id backend: unlink
+    /// `<cwd>/.zharness/sessions/<id>.json` (stat first so a missing file
+    /// maps to error.SessionNotFound) and best-effort removeTree
+    /// `<cwd>/.zharness/checkpoints/<id>/` when present.
+    deleteSession: ?*const fn (ctx: ?*anyopaque, alloc: std.mem.Allocator, id: []const u8) anyerror!void = null,
+
+    /// PATCH /sessions/:id rename backend. Errors map:
+    /// SessionNotFound → 404, SessionExists → 409, InvalidSessionId → 400.
+    renameSession: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: std.mem.Allocator,
+        old_id: []const u8,
+        new_id: []const u8,
+    ) anyerror!void = null,
+
+    /// POST /sessions backend. `id == null` ⇒ mint one via
+    /// api.formatMintedSessionId. Returns the FINAL id allocated with
+    /// `alloc` (route frees it). error.SessionExists → 409.
+    createSession: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: std.mem.Allocator,
+        id: ?[]const u8,
+    ) anyerror![]const u8 = null,
+
     // ── helpers ─────────────────────────────────────────────────────────
 
     /// Release a `listSessions` result (no-op for empty slices).
@@ -106,11 +217,15 @@ pub const RouteResult = struct {
     status: httpd.Status = .ok,
     content_type: httpd.ContentType = .json,
     /// Response body, allocated with the route call's allocator. For SSE
-    /// routes (`sse == true`) the body is unused.
+    /// routes (`sse == true` or `run_stream == true`) the body is unused.
     body: []u8 = &.{},
     /// True when the request must be answered by streaming SSE instead of a
-    /// buffered response.
+    /// buffered response (GET /events).
     sse: bool = false,
+    /// True when the request must be answered by the /run/stream pump
+    /// (POST /run/stream). Dispatched in `handle`, which parses the body and
+    /// calls sse_run.serve.
+    run_stream: bool = false,
 
     pub fn deinit(self: *RouteResult, alloc: std.mem.Allocator) void {
         if (self.body.len > 0) alloc.free(self.body);
@@ -139,19 +254,42 @@ pub fn route(deps: *const ServerDeps, alloc: std.mem.Allocator, req: *const http
         return routeRun(deps, alloc, req);
     }
 
-    if (std.mem.eql(u8, path, "/sessions")) {
-        if (!req.isGetLike()) return methodNotAllowed(alloc);
-        return routeListSessions(deps, alloc);
+    if (std.mem.eql(u8, path, "/run/stream")) {
+        // Pure route decision only: body parsing + pump live in handle()
+        // (sse_run.serve needs the Responder).
+        if (!std.mem.eql(u8, req.method, "POST")) return methodNotAllowed(alloc);
+        if (deps.runStream == null) {
+            return jsonBody(alloc, .not_implemented, "{\"ok\":false,\"error\":\"streaming runs not available\"}");
+        }
+        return RouteResult{ .run_stream = true };
     }
 
-    // /sessions/:id
+    if (std.mem.eql(u8, path, "/sessions")) {
+        if (req.isGetLike()) return routeListSessions(deps, alloc);
+        if (std.mem.eql(u8, req.method, "POST")) return routeCreateSession(deps, alloc, req.body);
+        return methodNotAllowed(alloc);
+    }
+
+    // /sessions/:id — GET fetches, DELETE removes, PATCH renames.
     if (std.mem.startsWith(u8, path, "/sessions/")) {
         const raw_id = path["/sessions/".len..];
-        if (!req.isGetLike()) return methodNotAllowed(alloc);
-        if (raw_id.len == 0) return jsonBody(alloc, .not_found, "{\"ok\":false,\"error\":\"session not found\"}");
         const id = try httpd.percentDecode(alloc, raw_id);
         defer alloc.free(id);
-        return routeGetSession(deps, alloc, id);
+
+        if (req.isGetLike()) {
+            if (id.len == 0) return jsonBody(alloc, .not_found, "{\"ok\":false,\"error\":\"session not found\"}");
+            if (!validSessionId(id)) return jsonBody(alloc, .bad_request, "{\"ok\":false,\"error\":\"invalid session id\"}");
+            return routeGetSession(deps, alloc, id);
+        }
+        if (std.mem.eql(u8, req.method, "DELETE")) {
+            if (!validSessionId(id)) return jsonBody(alloc, .bad_request, "{\"ok\":false,\"error\":\"invalid session id\"}");
+            return routeDeleteSession(deps, alloc, id);
+        }
+        if (std.mem.eql(u8, req.method, "PATCH")) {
+            if (!validSessionId(id)) return jsonBody(alloc, .bad_request, "{\"ok\":false,\"error\":\"invalid session id\"}");
+            return routeRenameSession(deps, alloc, id, req.body);
+        }
+        return methodNotAllowed(alloc);
     }
 
     if (std.mem.eql(u8, path, "/events")) {
@@ -250,6 +388,76 @@ fn methodNotAllowed(alloc: std.mem.Allocator) RouteError!RouteResult {
     return jsonBody(alloc, .method_not_allowed, "{\"ok\":false,\"error\":\"method not allowed\"}");
 }
 
+/// Map a session-dep error onto a JSON failure response.
+/// SessionNotFound → 404, SessionExists → 409, InvalidSessionId → 400,
+/// anything else → 500 with the error name.
+fn sessionOpFailure(alloc: std.mem.Allocator, e: anyerror) RouteError!RouteResult {
+    switch (e) {
+        error.SessionNotFound => return jsonBody(alloc, .not_found, "{\"ok\":false,\"error\":\"session not found\"}"),
+        error.SessionExists => return jsonBody(alloc, .conflict, "{\"ok\":false,\"error\":\"session id already exists\"}"),
+        error.InvalidSessionId => return jsonBody(alloc, .bad_request, "{\"ok\":false,\"error\":\"invalid session id\"}"),
+        else => {
+            var buf: [160]u8 = undefined;
+            const body = std.fmt.bufPrint(&buf, "{{\"ok\":false,\"error\":\"{s}\"}}", .{@errorName(e)}) catch
+                "{\"ok\":false,\"error\":\"session op failed\"}";
+            return jsonBody(alloc, .internal_server_error, body);
+        },
+    }
+}
+
+fn routeDeleteSession(deps: *const ServerDeps, alloc: std.mem.Allocator, id: []const u8) RouteError!RouteResult {
+    const del = deps.deleteSession orelse
+        return jsonBody(alloc, .not_implemented, "{\"ok\":false,\"error\":\"session deletion not available\"}");
+    del(deps.ctx, alloc, id) catch |e| return sessionOpFailure(alloc, e);
+    return jsonBody(alloc, .ok, "{\"ok\":true}");
+}
+
+fn routeRenameSession(deps: *const ServerDeps, alloc: std.mem.Allocator, old_id: []const u8, body: []const u8) RouteError!RouteResult {
+    const rename = deps.renameSession orelse
+        return jsonBody(alloc, .not_implemented, "{\"ok\":false,\"error\":\"session renaming not available\"}");
+    const new_id = (try jsonStringField(alloc, body, "rename")) orelse
+        return jsonBody(alloc, .bad_request, "{\"ok\":false,\"error\":\"missing rename\"}");
+    defer alloc.free(new_id);
+    if (!validSessionId(new_id)) return jsonBody(alloc, .bad_request, "{\"ok\":false,\"error\":\"invalid session id\"}");
+
+    // Reject collisions at the ROUTE layer too (cheap stat-free guard for
+    // fakes); the dep remains the authority and re-checks atomically.
+    if (std.mem.eql(u8, old_id, new_id)) {
+        return jsonBody(alloc, .conflict, "{\"ok\":false,\"error\":\"session id already exists\"}");
+    }
+
+    rename(deps.ctx, alloc, old_id, new_id) catch |e| return sessionOpFailure(alloc, e);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"ok\":true,\"id\":\"");
+    try jsonEscape(alloc, new_id, &out);
+    try out.appendSlice(alloc, "\"}");
+    return RouteResult{ .status = .ok, .content_type = .json, .body = try out.toOwnedSlice(alloc) };
+}
+
+fn routeCreateSession(deps: *const ServerDeps, alloc: std.mem.Allocator, body: []const u8) RouteError!RouteResult {
+    const create = deps.createSession orelse
+        return jsonBody(alloc, .not_implemented, "{\"ok\":false,\"error\":\"session creation not available\"}");
+    const requested = try jsonStringField(alloc, body, "id");
+    defer if (requested) |r| alloc.free(r);
+    if (requested) |r| {
+        if (!validSessionId(r)) return jsonBody(alloc, .bad_request, "{\"ok\":false,\"error\":\"invalid session id\"}");
+    }
+
+    // Null ⇒ the dep mints an id (api.formatMintedSessionId shape). The dep
+    // returns the FINAL id either way; this route only echoes it.
+    const final_id = create(deps.ctx, alloc, requested) catch |e| return sessionOpFailure(alloc, e);
+    defer alloc.free(final_id);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"ok\":true,\"id\":\"");
+    try jsonEscape(alloc, final_id, &out);
+    try out.appendSlice(alloc, "\"}");
+    return RouteResult{ .status = .ok, .content_type = .json, .body = try out.toOwnedSlice(alloc) };
+}
+
 fn jsonBody(alloc: std.mem.Allocator, status: httpd.Status, literal: []const u8) RouteError!RouteResult {
     return RouteResult{
         .status = status,
@@ -261,12 +469,25 @@ fn jsonBody(alloc: std.mem.Allocator, status: httpd.Status, literal: []const u8)
 // ── live adapter (httpd.HandlerFn shape) ────────────────────────────────────
 
 /// Entry point for the http server: cast ctx back to *ServerDeps, route, and
-/// either send the buffered result or run the SSE heartbeat loop.
+/// dispatch to the buffered sender or one of the SSE pumps.
 pub fn handle(ctx: ?*anyopaque, alloc: std.mem.Allocator, req: *const httpd.Request, res: *httpd.Responder) anyerror!void {
     const deps: *const ServerDeps = @ptrCast(@alignCast(ctx orelse return error.MissingDeps));
     var result = try route(deps, alloc, req);
     defer result.deinit(alloc);
 
+    if (result.run_stream) {
+        // Route already guaranteed deps.runStream != null (501 otherwise).
+        const run_fn = deps.runStream.?;
+        var run_req = sse_run.parseRunRequest(alloc, req.body) catch |e| switch (e) {
+            error.MissingPrompt => {
+                try res.send(.bad_request, .json, "{\"ok\":false,\"error\":\"missing prompt\"}");
+                return;
+            },
+            else => return e,
+        };
+        defer sse_run.freeRunRequest(alloc, &run_req);
+        return sse_run.serve(run_fn, deps.ctx, run_req, res, .{});
+    }
     if (result.sse) {
         try serveEvents(res);
     } else {
@@ -459,6 +680,23 @@ fn fakeGetSession(ctx: ?*anyopaque, alloc: std.mem.Allocator, id: []const u8) an
     };
 }
 
+/// Never actually invoked in route tests (route only checks non-null);
+/// panics loudly if a dispatch path ever forgets to guard.
+fn stubRunStream(
+    ctx: ?*anyopaque,
+    alloc: std.mem.Allocator,
+    req: sse_run.RunRequest,
+    on_event: sse_run.OnEventFn,
+    userdata: ?*anyopaque,
+) anyerror!void {
+    _ = ctx;
+    _ = alloc;
+    _ = req;
+    _ = on_event;
+    _ = userdata;
+    @panic("stubRunStream must not be called from route()");
+}
+
 fn fakeDeps() ServerDeps {
     return .{
         .ctx = &fake_state,
@@ -578,11 +816,13 @@ test "route unknown path 404 and wrong methods 405" {
     defer r2.deinit(alloc);
     try std.testing.expectEqual(httpd.Status.method_not_allowed, r2.status);
 
+    // POST /sessions is now the CREATE route: with no createSession dep it
+    // answers 501 (previously a blanket 405).
     var wrong_sessions = try makeRequest(alloc, "POST", "/sessions", "{}");
     defer wrong_sessions.deinit(alloc);
     var r3 = try route(&deps, alloc, &wrong_sessions);
     defer r3.deinit(alloc);
-    try std.testing.expectEqual(httpd.Status.method_not_allowed, r3.status);
+    try std.testing.expectEqual(httpd.Status.not_implemented, r3.status);
 
     var wrong_events = try makeRequest(alloc, "DELETE", "/events", "");
     defer wrong_events.deinit(alloc);
@@ -599,6 +839,86 @@ test "route marks /events as SSE stub" {
     var r = try route(&deps, alloc, &req);
     defer r.deinit(alloc);
     try std.testing.expect(r.sse);
+}
+
+test "route POST /run/stream marks stream when wired, 501 and 405 otherwise" {
+    const alloc = std.testing.allocator;
+
+    // fakeDeps() leaves runStream null: buffered 501, no SSE marker.
+    const plain = fakeDeps();
+    var post = try makeRequest(alloc, "POST", "/run/stream", "{\"prompt\":\"p\"}");
+    defer post.deinit(alloc);
+    var r1 = try route(&plain, alloc, &post);
+    defer r1.deinit(alloc);
+    try std.testing.expectEqual(httpd.Status.not_implemented, r1.status);
+    try std.testing.expect(std.mem.indexOf(u8, r1.body, "streaming runs not available") != null);
+
+    // With runStream wired: pure SSE marker; body parsing happens in handle.
+    var wired = fakeDeps();
+    wired.runStream = stubRunStream;
+    var r2 = try route(&wired, alloc, &post);
+    defer r2.deinit(alloc);
+    try std.testing.expect(r2.run_stream);
+    try std.testing.expect(!r2.sse);
+
+    // GET and PUT are refused (POST-only resource).
+    var get = try makeRequest(alloc, "GET", "/run/stream", "");
+    defer get.deinit(alloc);
+    var r3 = try route(&wired, alloc, &get);
+    defer r3.deinit(alloc);
+    try std.testing.expectEqual(httpd.Status.method_not_allowed, r3.status);
+
+    var put = try makeRequest(alloc, "PUT", "/run/stream", "{}");
+    defer put.deinit(alloc);
+    var r4 = try route(&wired, alloc, &put);
+    defer r4.deinit(alloc);
+    try std.testing.expectEqual(httpd.Status.method_not_allowed, r4.status);
+}
+
+test "validSessionId gates charset, length and emptiness" {
+    try std.testing.expect(validSessionId("web-20260823-101112"));
+    try std.testing.expect(validSessionId("a_b-c"));
+    try std.testing.expect(validSessionId("0"));
+    try std.testing.expect(!validSessionId(""));
+    try testing_expectInvalid("../etc/passwd");
+    try testing_expectInvalid("a/b");
+    try testing_expectInvalid("a b");
+    try testing_expectInvalid("dot.dot");
+    try testing_expectInvalid("quote\"id");
+    // Over-length rejected; exact length accepted.
+    const over = comptime comptimeFill(max_session_id_len + 1, 'x');
+    const exact = comptime comptimeFill(max_session_id_len, 'x');
+    try std.testing.expect(!validSessionId(&over));
+    try std.testing.expect(validSessionId(&exact));
+}
+
+/// Comptime byte-fill (stand-in for the removed `str ** n` repetition).
+fn comptimeFill(comptime n: usize, comptime byte: u8) [n]u8 {
+    var a: [n]u8 = undefined;
+    for (&a) |*c| c.* = byte;
+    return a;
+}
+
+fn testing_expectInvalid(id: []const u8) !void {
+    try std.testing.expect(!validSessionId(id));
+}
+
+test "formatMintedSessionId renders web-YYYYMMDD-HHMMSS from unix seconds" {
+    var buf: [64]u8 = undefined;
+    // 2026-08-23 10:11:12 UTC == 1787479872 epoch seconds
+    // (2026-08-23T00:00:00Z == 1787443200 + 36672s).
+    const id = formatMintedSessionId(&buf, 1_787_479_872);
+    try std.testing.expectEqualStrings("web-20260823-101112", id);
+
+    const id2 = formatMintedSessionId(&buf, 0); // 1970-01-01 00:00:00
+    try std.testing.expectEqualStrings("web-19700101-000000", id2);
+
+    const id3 = formatMintedSessionId(&buf, 951_782_400); // 2000-02-29 00:00:00
+    try testing_expectEqualStrings(id3, "web-20000229-000000");
+}
+
+fn testing_expectEqualStrings(got: []const u8, want: []const u8) !void {
+    try std.testing.expectEqualStrings(want, got);
 }
 
 test "jsonStringField decodes escapes incl unicode" {

@@ -170,12 +170,10 @@ pub fn wrapServerRequestWithId(
     // "type" field (upstream frame() embeds it). Inject the discriminator
     // when a caller passed a bare payload.
     const payload_final = if (std.mem.indexOf(u8, payload_json, "\"type\"") == null) blk: {
-        const with_type = try std.fmt.allocPrint(alloc, "{{\"type\":{s},", .{json_str: {
-            var tmp: std.ArrayList(u8) = .empty;
-            errdefer tmp.deinit(alloc);
-            try jsonx.appendJsonString(alloc, &tmp, method);
-            break :json_str tmp.items;
-        }});
+        var tmp: std.ArrayList(u8) = .empty;
+        defer tmp.deinit(alloc); // allocPrint copies; the scratch buffer dies here
+        try jsonx.appendJsonString(alloc, &tmp, method);
+        const with_type = try std.fmt.allocPrint(alloc, "{{\"type\":{s},", .{tmp.items});
         // splice out the leading '{' of payload_json into with_type + rest
         const rest = if (payload_json.len > 0 and payload_json[0] == '{')
             payload_json[1..]

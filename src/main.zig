@@ -36,6 +36,9 @@ const plugin_loader = @import("pluginabi/loader.zig");
 const wasm_loader = @import("pluginabi/wasm_loader.zig");
 const server_events = @import("server/events.zig");
 const server_static = @import("server/static.zig");
+const apiproxy = @import("server/apiproxy/router.zig");
+const apix_sessions = @import("server/apiproxy/sessions.zig");
+const events_ws = @import("server/apiproxy/events_ws.zig");
 
 const SYSTEM_PROMPT =
     \\You are zharness, a coding agent running inside a workspace. You help the user by
@@ -45,8 +48,86 @@ const SYSTEM_PROMPT =
     \\summarizes what you did and any follow-up needed.
 ;
 
+/// Escape a string as a JSON literal (owned). Bridge-helper for mux frames.
+fn jsonEsc(alloc: std.mem.Allocator, s: []const u8) ?[]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    out.appendSlice(alloc, "\"") catch return null;
+    model.escape(alloc, s, &out) catch return null;
+    out.appendSlice(alloc, "\"") catch return null;
+    return out.toOwnedSlice(alloc) catch null;
+}
+
+// ── live SessionEvent envelopes (vendored-GUI mux fold) ─────────────────────
+// The client validates every session/event frame against the strict
+// sessionEventSchema ({type,seq,time,data} — sessions.schema.ts), so the
+// bridge publishes full envelopes, never bare data payloads. Seq starts above
+// any seq the transcript-adapter history can produce (message indices), so a
+// live frame can never be dropped as a replay overlap after a reload.
+
+var g_live_seq = std.atomic.Value(u64).init(1 << 20);
+
+/// Publish ONE strict-envelope SessionEvent for the parked run session.
+/// `surface_append` adds the fixture-parity `"surfaceOp":"append"` marker
+/// carried by whole-message events (user/message, assistant/message).
+fn muxPublishEvent(ev_type: []const u8, surface_append: bool, data_json: []const u8) void {
+    const A = gpaAlloc();
+    const tj = jsonEsc(A, ev_type) orelse return;
+    defer A.free(tj);
+    const io = g_io orelse return;
+    const seq = g_live_seq.fetchAdd(1, .monotonic);
+    const ms = std.Io.Timestamp.now(io, .real).toMilliseconds();
+    const line = if (surface_append)
+        std.fmt.allocPrint(A, "{{\"type\":{s},\"seq\":{d},\"time\":{d},\"surfaceOp\":\"append\",\"data\":{s}}}", .{ tj, seq, ms, data_json }) catch return
+    else
+        std.fmt.allocPrint(A, "{{\"type\":{s},\"seq\":{d},\"time\":{d},\"data\":{s}}}", .{ tj, seq, ms, data_json }) catch return;
+    defer A.free(line);
+    muxPublish(line);
+}
+
+/// Publish a SessionEvent whose data embeds exactly one JSON-escaped string.
+fn muxPublishEventEsc(
+    comptime ev_type: []const u8,
+    comptime data_fmt: []const u8,
+    surface_append: bool,
+    escaped: []const u8,
+) void {
+    const A = gpaAlloc();
+    const data = std.fmt.allocPrint(A, data_fmt, .{escaped}) catch return;
+    defer A.free(data);
+    muxPublishEvent(ev_type, surface_append, data);
+}
+
 fn onEvent(kind: agent.AgentLoop.EventKind, payload: []const u8) void {
     obsEmit(kind, payload);
+    // Live SessionEventMap folding for vendored-GUI runs (spec §3): when a
+    // session.prompt run is active, mirror the stream onto the mux hub as
+    // strict-envelope events. Shapes mirror the upstream fixture log and
+    // apiproxy/sessions.zig's history reconstruction exactly.
+    if (g_mux_run_session != null) {
+        switch (kind) {
+            .thinking => if (jsonEsc(gpaAlloc(), payload)) |t| {
+                defer gpaAlloc().free(t);
+                muxPublishEventEsc("assistant/chunk", "{{\"turn\":1,\"step\":1,\"chunk\":{{\"type\":\"reasoning-delta\",\"index\":0,\"text\":{s}}}}}", false, t);
+            },
+            .text => if (jsonEsc(gpaAlloc(), payload)) |t| {
+                defer gpaAlloc().free(t);
+                muxPublishEventEsc("assistant/chunk", "{{\"turn\":1,\"step\":1,\"chunk\":{{\"type\":\"text-delta\",\"index\":0,\"text\":{s}}}}}", false, t);
+            },
+            .tool_call => if (jsonEsc(gpaAlloc(), payload)) |n| {
+                defer gpaAlloc().free(n);
+                muxPublishEventEsc("tool/call", "{{\"turn\":1,\"step\":2,\"callId\":\"live\",\"name\":{s},\"arguments\":{{}}}}", false, n);
+            },
+            .tool_result => if (jsonEsc(gpaAlloc(), payload)) |o| {
+                defer gpaAlloc().free(o);
+                muxPublishEventEsc("tool/result", "{{\"turn\":1,\"step\":2,\"message\":{{\"id\":\"t-live\",\"role\":\"user\",\"content\":[{{\"type\":\"tool-result\",\"toolCallId\":\"live\",\"content\":[{{\"type\":\"text\",\"text\":{s}}}]}},\"source\":{{\"kind\":\"tool\",\"callId\":\"live\"}}]}}}}", false, o);
+            },
+            .done => if (jsonEsc(gpaAlloc(), payload)) |t| {
+                defer gpaAlloc().free(t);
+                muxPublishEventEsc("assistant/message", "{{\"turn\":1,\"step\":3,\"message\":{{\"id\":\"a-live\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":{s}}}],\"source\":{{\"kind\":\"model\"}}}}}}", true, t);
+            },
+            else => {},
+        }
+    }
     switch (kind) {
         .thinking => std.debug.print("[thinking] {s}\n", .{payload}),
         .text => std.debug.print("{s}", .{payload}),
@@ -54,7 +135,16 @@ fn onEvent(kind: agent.AgentLoop.EventKind, payload: []const u8) void {
         .tool_result => std.debug.print("  -> {s}\n", .{payload}),
         .turn_start => {},
         .done => std.debug.print("\n=== Final answer ===\n{s}\n", .{payload}),
-        .err => std.debug.print("\n[error] {s}\n", .{payload}),
+        .err => {
+            std.debug.print("\n[error] {s}\n", .{payload});
+            // Surface model failures on the vendored-GUI fold: the loop logs
+            // and returns success, so without this capture the turn would end
+            // 'completed' with no assistant content and no UI failure row.
+            if (g_mux_run_session != null) {
+                if (g_mux_run_error) |old| gpaAlloc().free(old);
+                g_mux_run_error = gpaAlloc().dupe(u8, payload) catch null;
+            }
+        },
     }
 }
 
@@ -80,6 +170,92 @@ const ObsState = struct {
 };
 
 var g_obs: ?ObsState = null;
+
+// ── dsh apiproxy run bridge (spec §3 phase-3 task 9) ────────────────────────
+// When a session.prompt arrives over the vendored GUI, its run executes on a
+// detached thread (serialized by the serve run mutex). While it runs, the
+// session id is parked here so the shared on_event callback can fold loop
+// events into SessionEventMap frames on the mux hub. Runs are serialized, so
+// a single slot is race-free.
+
+var g_mux_run_session: ?[]const u8 = null;
+
+/// Failure captured from the live run's .err event (owned; runs serialize on
+/// g_run_mutex, so a single slot is race-free). Non-null turns the turn/end
+/// reason into kind:'error' and raises host/agent-error for the failure card.
+var g_mux_run_error: ?[]const u8 = null;
+
+extern "c" fn nanosleep(req: *const std.c.timespec, rem: ?*std.c.timespec) c_int;
+
+/// Same spin-lock design as server/events.zig (std.Thread.Mutex lives under
+/// std.Io in this toolchain, which a plain static can't carry).
+const RunLock = struct {
+    locked: std.atomic.Value(bool) = .init(false),
+    fn lock(self: *RunLock) void {
+        var spins: u32 = 0;
+        while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            spins += 1;
+            if (spins >= 16) {
+                const req: std.c.timespec = .{ .sec = 0, .nsec = 1 * std.time.ns_per_ms };
+                _ = nanosleep(&req, null);
+            } else std.atomic.spinLoopHint();
+        }
+    }
+    fn unlock(self: *RunLock) void {
+        self.locked.store(false, .release);
+    }
+};
+
+var g_run_mutex: RunLock = .{};
+var g_apx_state: ?*ApxState = null;
+
+/// Publish one SessionEventMap payload onto the mux hub, wrapped in the
+/// wire envelope {type:'session/event', sessionId, event} (spec §4).
+fn muxPublish(payload_json: []const u8) void {
+    const sid = g_mux_run_session orelse return;
+    if (events_ws.sharedHubs()) |hubs| {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpaAlloc());
+        buf.appendSlice(gpaAlloc(), "{\"type\":\"session/event\",\"sessionId\":") catch return;
+        if (jsonEsc(gpaAlloc(), sid)) |s| {
+            defer gpaAlloc().free(s);
+            buf.appendSlice(gpaAlloc(), s) catch return;
+        } else return;
+        buf.appendSlice(gpaAlloc(), ",\"event\":") catch return;
+        buf.appendSlice(gpaAlloc(), payload_json) catch return;
+        buf.appendSlice(gpaAlloc(), "}") catch return;
+        hubs.mux.publish("session/event", buf.items);
+    } else |_| {}
+}
+
+fn hostPublishFmtSession(session_id: []const u8, running: bool) void {
+    if (jsonEsc(gpaAlloc(), session_id)) |sid| {
+        defer gpaAlloc().free(sid);
+        const flag: []const u8 = if (running) "true" else "false";
+        const line = std.fmt.allocPrint(gpaAlloc(), "{{\"sessionId\":{s},\"running\":{s}}}", .{ sid, flag }) catch return;
+        defer gpaAlloc().free(line);
+        hostPublish("host/session-status", line);
+    }
+}
+
+/// Push a frame on the HOST hub (workspace/session list liveness).
+fn hostPublish(method: []const u8, payload_json: []const u8) void {
+    if (events_ws.sharedHubs()) |hubs| {
+        hubs.host.publish(method, payload_json);
+    } else |_| {}
+}
+
+fn muxPublishFmt(comptime fmt: []const u8, args: anytype) void {
+    const s = std.fmt.allocPrint(gpaAlloc(), fmt, args) catch return;
+    defer gpaAlloc().free(s);
+    muxPublish(s);
+}
+
+/// Process-wide GPA for bridge allocations that may outlive request arenas.
+var g_gpa: ?std.mem.Allocator = null;
+fn gpaAlloc() std.mem.Allocator {
+    return g_gpa.?;
+}
 
 /// Long-lived Io for standalone commands (serve/workflow/plugin) that do not
 /// go through a cordis Context. Null for run/chat (they use the ctx's io).
@@ -577,6 +753,33 @@ fn serveGetSession(
     return .{ .id = try alloc.dupe(u8, id), .created_at = created_at, .messages = msgs };
 }
 
+/// Top-level serve dispatcher: /api/* → dsh apiproxy (vendored GUI),
+/// static URL space → Web UI files, everything else → legacy JSON API.
+const ServeBundle = struct {
+    apx_deps: *const apiproxy.ApiProxyDeps,
+    api_handler: httpd.Handler,
+    /// Static root for the Web UI (dsh dist preferred, vanilla web/ fallback).
+    static_root: []const u8,
+};
+
+fn serveDispatch(ctx: ?*anyopaque, alloc: std.mem.Allocator, req: *const httpd.Request, res: *httpd.Responder) anyerror!void {
+    const b: *ServeBundle = @ptrCast(@alignCast(@constCast(ctx.?)));
+    if (std.mem.startsWith(u8, req.path, "/api/")) {
+        return apiproxy.handleApiRequest(b.apx_deps, alloc, req, res);
+    }
+    if (server_static.claims(req.path)) {
+        var sctx = server_static.Ctx{ .root = b.static_root };
+        return server_static.handle(@ptrCast(&sctx), alloc, req, res);
+    }
+    return b.api_handler.call(b.api_handler.ctx, alloc, req, res);
+}
+
+/// obs.fanout chain: SSE hub (old /events) AND apiproxy WS hubs together.
+fn fanoutBoth(line: []const u8) void {
+    server_events.hubPublish(line);
+    events_ws.publishObsEnvelope(line);
+}
+
 fn cmdServe(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts, port_arg: ?[]const u8) !void {
     var port: u16 = 3080;
     if (port_arg) |pa| {
@@ -607,23 +810,62 @@ fn cmdServe(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts, port_
         .getSession = serveGetSession,
     };
 
-    // Live event feed (dev.md §XXX): agent-loop envelopes fan out to every
-    // /events subscriber. Install BEFORE the accept loop starts; obs.fanout
-    // is a plain var so it must be set before any thread observes it.
-    try server_events.install(alloc);
-    obs_mod.fanout = &server_events.hubPublish;
+    // Shared state for both API surfaces.
+    g_gpa = alloc;
+    const apx_state = try alloc.create(ApxState);
+    defer alloc.destroy(apx_state);
+    apx_state.* = .{ .alloc = alloc, .cfg = cfg, .opts = opts };
+    g_apx_state = apx_state;
 
-    // Static Web UI (Option B from docs/web.md): static.handle claims "/" and
-    // "/assets/*", everything else falls through to the JSON API.
-    const static_ctx = try alloc.create(server_static.Ctx);
-    defer alloc.destroy(static_ctx);
-    static_ctx.* = .{ .root = server_static.default_root, .fallback = .{ .ctx = deps, .call = api.handle } };
+    // dsh apiproxy surface (spec §4): unary RPC + WS event streams.
+    const apx_deps = try alloc.create(apiproxy.ApiProxyDeps);
+    defer alloc.destroy(apx_deps);
+    apx_deps.* = .{
+        .ctx = apx_state,
+        .cwd = cfg.cwd,
+        .home = homeDir() orelse "",
+        .provider = cfg.provider,
+        .model = cfg.model,
+        .listSessions = apxListSessions,
+        .sessionHistory = apxSessionHistory,
+        .createSession = apxCreateSession,
+        .promptSession = apxPromptSession,
+        .cancelSession = apxCancelSession,
+        .renameSession = apxRenameSession,
+    };
+
+    // Live event feed: agent-loop envelopes fan out to BOTH consumers —
+    // the legacy SSE hub (/events) and the dsh WS hubs (events.mux/.host).
+    // Install BEFORE the accept loop starts; obs.fanout is a plain var so
+    // it must be set before any thread observes it.
+    try server_events.install(alloc);
+    _ = events_ws.sharedHubs() catch {}; // eagerly create shared frame hubs
+    obs_mod.fanout = &fanoutBoth;
+    // Mux baseline: each new subscriber gets session/subscribed for every
+    // known session (lastSeq 0 — no durable seq store in v1).
+    events_ws.on_mux_open = &apxMuxOpen;
+
+    // Web root: prefer the vendored dsh dist; fall back to the vanilla UI.
+    const web_root: []const u8 = blk: {
+        if (std.Io.Dir.statFile(.cwd(), io, "webui/dsh/apps/web/dist/index.html", .{})) |_| {
+            break :blk "webui/dsh/apps/web/dist";
+        } else |_| {}
+        break :blk server_static.default_root;
+    };
+
+    const bundle = try alloc.create(ServeBundle);
+    defer alloc.destroy(bundle);
+    bundle.* = .{
+        .apx_deps = apx_deps,
+        .api_handler = .{ .ctx = deps, .call = api.handle },
+        .static_root = web_root,
+    };
 
     var server = try httpd.Server.init(alloc, .{
-        .ctx = static_ctx,
-        .call = server_static.handle,
-        // Live SSE subscribers need per-connection threads or one open
-        // /events stream starves every other route on the accept thread.
+        .ctx = bundle,
+        .call = serveDispatch,
+        // SSE + WebSocket subscribers need per-connection threads or one
+        // open stream starves every other route on the accept thread.
     }, .{ .port = port, .threaded_connections = true });
     defer server.deinit();
     defer {
@@ -633,13 +875,416 @@ fn cmdServe(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts, port_
 
     std.debug.print(
         \\zharness serve listening on http://127.0.0.1:{d}
-        \\  Web UI:      http://127.0.0.1:{d}/          (web/ directory)
+        \\  GUI (dsh):   http://127.0.0.1:{d}/          (webui dist; falls back to web/)
         \\  POST /run {{prompt, session?}}   POST /chat (same shape)
         \\  GET  /sessions  GET /sessions/<id>  GET /healthz  GET /events (live)
         \\Ctrl-C to stop.
         \\
     , .{ port, port });
     server.serveBlocking(); // never returns under normal operation
+}
+
+// ── dsh apiproxy deps: bridge vendored GUI onto zharness runtime ────────────
+
+const ApxState = struct {
+    alloc: std.mem.Allocator,
+    cfg: *config.Config,
+    opts: LoopOpts,
+};
+
+fn apxState(ctx: ?*anyopaque) *ApxState {
+    return @ptrCast(@alignCast(ctx.?));
+}
+
+/// session.list → SessionSummary rows via the shared transcript adapter.
+fn apxListSessions(ctx: ?*anyopaque, alloc: std.mem.Allocator) anyerror![]apiproxy.SessionSummary {
+    const st = apxState(ctx);
+    const io = g_io.?;
+    var out: std.ArrayList(apiproxy.SessionSummary) = .empty;
+    errdefer out.deinit(alloc);
+    const dir = try apix_sessions.transcriptDir(alloc, st.cfg.cwd);
+    defer alloc.free(dir);
+    const ids = try apix_sessions.listSessionIds(io, alloc, dir);
+    defer {
+        for (ids) |i| alloc.free(i);
+        alloc.free(ids);
+    }
+    for (ids) |id| {
+        const path = try std.fmt.allocPrint(alloc, "{s}/{s}.json", .{ dir, id });
+        defer alloc.free(path);
+        const updated = apix_sessions.mtimeMs(io, path);
+        // Summary rows render from lightweight data only; transcript loads
+        // happen on session.history. The blank bit IS list data though: the
+        // client's connectWorkspace reuse predicate reads it, so a hardcoded
+        // false would mint a fresh session on every New-Session pick instead
+        // of reusing the workspace's existing blank one. Sniffing the head
+        // byte range suffices: an empty session serializes without any
+        // message object ("[]"), and an oversized head implies content.
+        var blank = true;
+        if (std.Io.Dir.readFileAlloc(.cwd(), io, path, alloc, .limited(512))) |head| {
+            defer alloc.free(head);
+            blank = std.mem.indexOfScalar(u8, head, '{') == null;
+        } else |e| switch (e) {
+            error.StreamTooLong => blank = false,
+            error.FileNotFound => {},
+            else => return e,
+        }
+        try out.append(alloc, .{
+            .session_id = try alloc.dupe(u8, id),
+            .updated_at_ms = updated,
+            .running = false,
+            .blank = blank,
+            .cwd = try alloc.dupe(u8, st.cfg.cwd),
+        });
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// session.history → replay pages reconstructed from the stored transcript.
+fn apxSessionHistory(
+    ctx: ?*anyopaque,
+    alloc: std.mem.Allocator,
+    session_id: []const u8,
+    before_seq: ?i64,
+    max_messages: ?u32,
+) anyerror!apiproxy.HistoryPage {
+    _ = before_seq; // v1 stores one file per session; paging starts at tail
+    const st = apxState(ctx);
+    const io = g_io.?;
+    const path = try apix_sessions.transcriptPath(alloc, st.cfg.cwd, session_id);
+    defer alloc.free(path);
+    const raw = std.Io.Dir.readFileAlloc(.cwd(), io, path, alloc, .limited(16 * 1024 * 1024)) catch |e| switch (e) {
+        error.FileNotFound => return error.SessionNotFound,
+        else => return e,
+    };
+    defer alloc.free(raw);
+    const msgs = try apix_sessions.parseTranscript(alloc, raw);
+    defer {
+        for (msgs) |m| {
+            alloc.free(m.role);
+            alloc.free(m.content);
+            if (m.tool_call_id) |t| alloc.free(t);
+            if (m.tool_calls_json) |t| alloc.free(t);
+        }
+        alloc.free(msgs);
+    }
+    const updated = apix_sessions.mtimeMs(io, path);
+    return try apix_sessions.buildHistoryPage(alloc, msgs, updated, max_messages, session_id);
+}
+
+/// session.create → empty transcript file on disk.
+fn apxCreateSession(
+    ctx: ?*anyopaque,
+    alloc: std.mem.Allocator,
+    opts: apiproxy.CreateOptions,
+) anyerror![]const u8 {
+    const st = apxState(ctx);
+    const io = g_io.?;
+    var id_buf: [64]u8 = undefined;
+    const final_id: []const u8 = if (opts.session_id) |sid|
+        sid
+    else blk: {
+        const now_ms: i64 = std.Io.Timestamp.now(g_io.?, .real).toMilliseconds();
+        const minted = api.formatMintedSessionId(&id_buf, @divTrunc(now_ms, 1000));
+        break :blk try alloc.dupe(u8, minted);
+    };
+    errdefer if (opts.session_id == null) alloc.free(final_id);
+    if (!api.validSessionId(final_id)) return error.InvalidSessionId;
+
+    const dir = try std.fs.path.join(alloc, &.{ st.cfg.cwd, ".zharness", "sessions" });
+    defer alloc.free(dir);
+    std.Io.Dir.createDirPath(.cwd(), io, dir) catch {};
+    const path = try std.fmt.allocPrint(alloc, "{s}/{s}.json", .{ dir, final_id });
+    defer alloc.free(path);
+    if (std.Io.Dir.statFile(.cwd(), io, path, .{})) |_| {
+        return error.SessionExists;
+    } else |_| {}
+
+    const s = try alloc.create(session.Session);
+    defer {
+        s.deinit();
+        alloc.destroy(s);
+    }
+    s.* = try session.Session.init(alloc, final_id);
+    try s.save(io, path);
+    // Sidebar liveness: announce the new (blank) session on the host hub.
+    if (jsonEsc(gpaAlloc(), final_id)) |sid| {
+        defer gpaAlloc().free(sid);
+        const cwd_json = jsonEsc(gpaAlloc(), st.cfg.cwd) orelse null;
+        defer if (cwd_json) |cj| gpaAlloc().free(cj);
+        const line = if (cwd_json) |cj|
+            std.fmt.allocPrint(gpaAlloc(),
+                "{{\"sessionId\":{s},\"blank\":true,\"cwd\":{s}}}", .{ sid, cj }) catch null
+        else
+            std.fmt.allocPrint(gpaAlloc(),
+                "{{\"sessionId\":{s},\"blank\":true}}", .{sid}) catch null;
+        if (line) |l| {
+            defer gpaAlloc().free(l);
+            hostPublish("host/session-added", l);
+        }
+        // Mux baseline for the newborn session: the client's open() settles
+        // on this frame (upstream pushes it on session/created).
+        const sub = std.fmt.allocPrint(gpaAlloc(),
+            "{{\"type\":\"session/subscribed\",\"sessionId\":{s},\"lastSeq\":0}}", .{sid}) catch null;
+        if (sub) |sl| {
+            defer gpaAlloc().free(sl);
+            if (events_ws.sharedHubs()) |hubs| {
+                hubs.mux.publish("session/subscribed", sl);
+            } else |_| {}
+        }
+    }
+    // Workspace attachment contract (upstream fixture attachWorkspace): the
+    // newborn joins the synthesized default workspace immediately and the
+    // FULL updated view rides host/workspace-changed. The client never
+    // re-pulls workspace.list after create and ignores membership in every
+    // other frame, so without this push the session stays unaccounted
+    // forever — ConversationRoot's composer gate resolves chipTitle through
+    // workspace.sessionIds containment (the phase-ready state disables its
+    // cwd fallback), leaving the composer inert on a freshly picked
+    // workspace. Prepend order matches the fixture.
+    {
+        const scan = apix_sessions.listSessionIds(io, alloc, dir) catch null;
+        if (scan) |ids| {
+            defer {
+                for (ids) |i| alloc.free(i);
+                alloc.free(ids);
+            }
+            var ordered: std.ArrayList([]const u8) = .empty;
+            defer ordered.deinit(alloc);
+            ordered.append(alloc, final_id) catch {};
+            for (ids) |id| {
+                if (!std.mem.eql(u8, id, final_id)) ordered.append(alloc, id) catch {};
+            }
+            if (ordered.items.len > 0) {
+                var view: std.ArrayList(u8) = .empty;
+                defer view.deinit(alloc);
+                const now_ms_v: i64 = clib.nowTimestamp() * std.time.ms_per_s;
+                apiproxy.appendWorkspaceViewJson(
+                    alloc,
+                    &view,
+                    apiproxy.default_workspace_id,
+                    st.cfg.cwd,
+                    apiproxy.basename(st.cfg.cwd),
+                    ordered.items,
+                    now_ms_v,
+                    now_ms_v,
+                ) catch {};
+                if (view.items.len > 0) {
+                    // The wrapper owns the quotes around the view value.
+                    const wrapped = std.fmt.allocPrint(gpaAlloc(),
+                        "{{\"workspace\":{s}}}", .{view.items}) catch null;
+                    if (wrapped) |w| {
+                        defer gpaAlloc().free(w);
+                        hostPublish("host/workspace-changed", w);
+                    }
+                }
+            }
+        }
+    }
+    return try alloc.dupe(u8, final_id);
+}
+
+/// session.prompt → unary accept; the run itself executes detached and folds
+/// its events onto the mux hub (see onEvent bridge). Runs serialize behind
+/// g_run_mutex because the DebugAllocator is not thread-safe.
+fn apxPromptSession(ctx: ?*anyopaque, alloc: std.mem.Allocator, req: apiproxy.PromptRequest) anyerror!apiproxy.PromptAck {
+    _ = alloc;
+    const st = apxState(ctx);
+    if (req.mode == .steer) return error.SteerUnavailable;
+
+    // content_json is the client's message-parts ARRAY (already the raw
+    // value slice from the payload); v1 accepts the FIRST {"type":"text"}
+    // member as the prompt (spec §7 drops image parts). Parts are scanned
+    // structurally (brace matcher per element): a naive substring search
+    // would hit the "text" VALUE of {"type":"text"} before the text KEY and
+    // yield an empty prompt.
+    const jsonx = @import("server/apiproxy/jsonx.zig");
+    const prompt_text: ?[]const u8 = blk: {
+        const raw_arr = req.content_json;
+        if (raw_arr.len < 2 or raw_arr[0] != '[' or raw_arr[raw_arr.len - 1] != ']') break :blk null;
+        const inner = raw_arr[1 .. raw_arr.len - 1];
+        var i: usize = 0;
+        while (i < inner.len) {
+            while (i < inner.len and (inner[i] == ',' or inner[i] == ' ' or inner[i] == '\n' or inner[i] == '\t' or inner[i] == '\r')) : (i += 1) {}
+            if (i >= inner.len) break;
+            if (inner[i] != '{') break;
+            const end = jsonx.matchBraceFrom(inner, i) orelse break;
+            const part = inner[i..end];
+            i = end;
+            const t = jsonx.getRaw(part, "type") orelse continue;
+            if (!std.mem.eql(u8, t, "\"text\"")) continue;
+            break :blk (jsonx.getStringAlloc(st.alloc, part, "text") catch null) orelse "";
+        }
+        break :blk null;
+    };
+    const prompt_copy: []const u8 = if (prompt_text) |t|
+        t // ownership passes to the detached run
+    else
+        st.alloc.dupe(u8, "") catch return error.OutOfMemory;
+    // The session id must outlive the REQUEST: req slices die with the
+    // connection arena while the detached run is still emitting frames.
+    const sid_copy: []const u8 = st.alloc.dupe(u8, req.session_id) catch return error.OutOfMemory;
+
+    const th = try std.Thread.spawn(.{}, runDetachedForGui, .{ st.alloc, st.cfg, st.opts, sid_copy, prompt_copy });
+    th.detach();
+    return .{};
+}
+
+/// Detached GUI run: owns its own config copy; publishes turn/start +
+/// user/message before the loop and assistant/turn-end after (success or
+/// failure). The session id parks BEFORE the first frame — muxPublish drops
+/// everything while no run session is parked.
+fn runDetachedForGui(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts, session_id: []const u8, prompt: []const u8) void {
+    // ServeState outlives every detached run (serveBlocking never returns),
+    // so cfg is borrowed by pointer — no copy, no deinit here.
+    g_run_mutex.lock();
+    defer g_run_mutex.unlock();
+
+    // Route this run's loop events to the mux fold (parked before any frame).
+    const sid_dup = gpaAlloc().dupe(u8, session_id) catch return;
+    g_mux_run_session = sid_dup;
+    defer {
+        g_mux_run_session = null;
+        gpaAlloc().free(sid_dup);
+    }
+
+    // Canonical live-turn prefix (fixture order): turn/start then the user
+    // bubble carrying the actual prompt text.
+    muxPublishEvent("turn/start", false, "{\"turn\":1}");
+    if (jsonEsc(gpaAlloc(), prompt)) |t| {
+        defer gpaAlloc().free(t);
+        const data = std.fmt.allocPrint(
+            gpaAlloc(),
+            "{{\"id\":\"u-live\",\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":{s}}}],\"source\":{{\"kind\":\"user\"}}}}",
+            .{t},
+        ) catch null;
+        if (data) |d| {
+            defer gpaAlloc().free(d);
+            muxPublishEvent("user/message", true, d);
+        }
+    }
+
+    hostPublishFmtSession(session_id, true);
+    _ = agentRunOnce(alloc, cfg, opts, prompt, session_id) catch {
+        if (g_mux_run_error == null) g_mux_run_error = gpaAlloc().dupe(u8, "run failed") catch null;
+        muxPublishEvent("turn/end", false, "{{\"turn\":1,\"reason\":{{\"kind\":\"error\",\"error\":{{\"message\":\"run failed\"}}}}}}");
+        if (jsonEsc(gpaAlloc(), session_id)) |sid| {
+            defer gpaAlloc().free(sid);
+            const line = std.fmt.allocPrint(gpaAlloc(),
+                "{{\"sessionId\":{s},\"message\":\"run failed\"}}", .{sid}) catch null;
+            if (line) |l| {
+                defer gpaAlloc().free(l);
+                hostPublish("host/agent-error", l);
+            }
+        }
+        hostPublishFmtSession(session_id, false);
+        return;
+    };
+    if (g_mux_run_error) |msg| {
+        // The loop logs model failures and returns success; end the turn as a
+        // terminal error so the client renders its turn-error card.
+        defer {
+            gpaAlloc().free(msg);
+            g_mux_run_error = null;
+        }
+        const msg_json = jsonEsc(gpaAlloc(), msg) orelse "";
+        defer if (msg_json.len > 0) gpaAlloc().free(msg_json);
+        if (msg_json.len > 0) {
+            const data = std.fmt.allocPrint(gpaAlloc(),
+                "{{\"turn\":1,\"reason\":{{\"kind\":\"error\",\"error\":{{\"message\":{s}}}}}}}", .{msg_json}) catch null;
+            if (data) |d| {
+                defer gpaAlloc().free(d);
+                muxPublishEvent("turn/end", false, d);
+            }
+            if (jsonEsc(gpaAlloc(), session_id)) |sid| {
+                defer gpaAlloc().free(sid);
+                const line = std.fmt.allocPrint(gpaAlloc(),
+                    "{{\"sessionId\":{s},\"message\":{s}}}", .{ sid, msg_json }) catch null;
+                if (line) |l| {
+                    defer gpaAlloc().free(l);
+                    hostPublish("host/agent-error", l);
+                }
+            }
+        }
+    } else {
+        muxPublishEvent("turn/end", false, "{\"turn\":1,\"reason\":{\"kind\":\"completed\"}}");
+    }
+    hostPublishFmtSession(session_id, false);
+}
+
+/// session.cancel → best-effort no-op in v1: runs are not interruptible
+/// mid-model-request; the client's turn closes naturally on completion.
+fn apxCancelSession(ctx: ?*anyopaque, alloc: std.mem.Allocator, session_id: []const u8) anyerror!void {
+    _ = ctx;
+    _ = alloc;
+    _ = session_id;
+}
+
+/// session.rename → rename the transcript file (title == new id semantics).
+fn apxRenameSession(
+    ctx: ?*anyopaque,
+    alloc: std.mem.Allocator,
+    session_id: []const u8,
+    title: []const u8,
+) anyerror!apiproxy.RenameResult {
+    const st = apxState(ctx);
+    if (!api.validSessionId(title)) return error.TitleInvalid;
+    const dir = try std.fs.path.join(alloc, &.{ st.cfg.cwd, ".zharness", "sessions" });
+    defer alloc.free(dir);
+    const old_path = try std.fmt.allocPrint(alloc, "{s}/{s}.json", .{ dir, session_id });
+    defer alloc.free(old_path);
+    const new_path = try std.fmt.allocPrint(alloc, "{s}/{s}.json", .{ dir, title });
+    defer alloc.free(new_path);
+    const io = g_io.?;
+    _ = session.Session.deleteFile(io, old_path); // clears "absent vs busy"
+    if (std.Io.Dir.statFile(.cwd(), io, new_path, .{})) |_| {
+        return error.SessionExists;
+    } else |_| {}
+    if (std.Io.Dir.statFile(.cwd(), io, old_path, .{})) |_| {} else |_| {
+        return error.SessionNotFound;
+    }
+    // Pre-check target existence: this toolchain's RenameError has no
+    // PathAlreadyExists member, so collisions are detected before the call.
+    if (std.Io.Dir.statFile(.cwd(), io, new_path, .{})) |_| {
+        return error.SessionExists;
+    } else |_| {}
+    std.Io.Dir.rename(.cwd(), old_path, .cwd(), new_path, io) catch |e| switch (e) {
+        error.FileNotFound => return error.SessionNotFound,
+        else => return e,
+    };
+    return .{ .title = try alloc.dupe(u8, title), .seq = 1 };
+}
+
+/// Mux open hook: write a session/subscribed baseline per known session.
+fn apxMuxOpen(conn: *httpd.WsConn) void {
+    const st = g_apx_state orelse return;
+    const io = g_io orelse return;
+    const alloc = st.alloc;
+    const dir = apix_sessions.transcriptDir(alloc, st.cfg.cwd) catch return;
+    defer alloc.free(dir);
+    const ids = apix_sessions.listSessionIds(io, alloc, dir) catch return;
+    defer {
+        for (ids) |i| alloc.free(i);
+        alloc.free(ids);
+    }
+    for (ids) |id| {
+        var sid_esc_buf: [256]u8 = undefined;
+        const sid_json = std.fmt.bufPrint(&sid_esc_buf, "\"{s}\"", .{id}) catch continue;
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(alloc);
+        payload.appendSlice(alloc, "{\"type\":\"session/subscribed\",\"sessionId\":") catch continue;
+        payload.appendSlice(alloc, sid_json) catch continue;
+        payload.appendSlice(alloc, ",\"lastSeq\":0}") catch continue;
+
+        var frame: std.ArrayList(u8) = .empty;
+        defer frame.deinit(alloc);
+        frame.appendSlice(alloc, "{\"type\":\"server-request\",\"rpcId\":\"baseline-") catch continue;
+        frame.appendSlice(alloc, id) catch continue;
+        frame.appendSlice(alloc, "\",\"method\":\"session/subscribed\",\"payload\":") catch continue;
+        frame.appendSlice(alloc, payload.items) catch continue;
+        frame.appendSlice(alloc, "}") catch continue;
+        conn.writeText(frame.items) catch {};
+    }
 }
 
 // ── workflow (dev.md §XIX): JSON-defined multi-step agent runs ──────────────

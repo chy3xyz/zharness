@@ -184,6 +184,18 @@ pub const Session = struct {
         }
     }
 
+    // ---- filesystem helpers (wave 5: session-management routes) --------
+
+    /// Best-effort delete of a file relative to the process cwd. Returns
+    /// true only when the file existed and was removed; false when it was
+    /// absent OR could not be removed. Callers that must distinguish
+    /// not-found from failure (e.g. DELETE /sessions/:id → 404) should stat
+    /// first (std.Io.Dir.statFile) and treat false-after-stat as an error.
+    pub fn deleteFile(io: std.Io, path: []const u8) bool {
+        std.Io.Dir.deleteFile(.cwd(), io, path) catch return false;
+        return true;
+    }
+
     /// Decode the simple JSON string escapes zharness emits (\" \\ \n \r \t)
     /// into a fresh allocation owned by `alloc`.
     pub fn unescapeJson(alloc: std.mem.Allocator, input: []const u8) ![]const u8 {

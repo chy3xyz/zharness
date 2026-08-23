@@ -46,6 +46,7 @@
 const std = @import("std");
 const httpd = @import("../httpd.zig");
 const jsonx = @import("jsonx.zig");
+const config = @import("../../config.zig");
 const events_ws = @import("events_ws.zig");
 const clib = @import("../../clib.zig");
 
@@ -63,6 +64,12 @@ pub const RpcCode = enum {
     workspace_not_found,
     workspace_invalid_path,
     directory_picker_unavailable,
+    /// settings write rejected (validation / read-only credential) —
+    /// upstream `settings-rejected` (settings.ts SettingsApi docs).
+    settings_rejected,
+    /// stale expectedRevision on a settings write — upstream
+    /// `settings-conflict` (the Models editor keys its conflict copy on it).
+    settings_conflict,
 
     pub fn asStr(self: RpcCode) []const u8 {
         return switch (self) {
@@ -74,6 +81,8 @@ pub const RpcCode = enum {
             .workspace_not_found => "workspace-not-found",
             .workspace_invalid_path => "workspace-invalid-path",
             .directory_picker_unavailable => "directory-picker-unavailable",
+            .settings_rejected => "settings-rejected",
+            .settings_conflict => "settings-conflict",
         };
     }
 };
@@ -212,6 +221,31 @@ pub const OpenPathFn = *const fn (
     path: []const u8,
 ) anyerror!void;
 
+/// Settings-domain dep signatures. `describe` returns the full
+/// settings.describe VALUE JSON; write handlers return the namespace-view
+/// VALUE JSON (both wrapped into ok:true by the router). Errors map through
+/// mapSettingsError (settings-conflict / settings-rejected / internal).
+pub const SettingsDescribeFn = *const fn (ctx: ?*anyopaque, alloc: std.mem.Allocator) anyerror![]u8;
+pub const SettingsWriteFn = *const fn (
+    ctx: ?*anyopaque,
+    alloc: std.mem.Allocator,
+    payload: []const u8,
+) anyerror![]u8;
+/// llm.providers value builder for the Models section join.
+pub const LlmProvidersFn = *const fn (ctx: ?*anyopaque, alloc: std.mem.Allocator) anyerror![]u8;
+/// credentials.describe ({refs:[…]}) → {credentials:{…}} value JSON.
+pub const CredentialsDescribeFn = *const fn (
+    ctx: ?*anyopaque,
+    alloc: std.mem.Allocator,
+    payload: []const u8,
+) anyerror![]u8;
+/// credentials.set/unset → {} value JSON.
+pub const CredentialsWriteFn = *const fn (
+    ctx: ?*anyopaque,
+    alloc: std.mem.Allocator,
+    payload: []const u8,
+) anyerror!void;
+
 /// Function-pointer registry the integrator fills in. Required members are
 /// the conversation/session lifecycle only main.zig can know; every other
 /// method answers via the built-in default implementations below until an
@@ -239,6 +273,18 @@ pub const ApiProxyDeps = struct {
     // ── optional overrides (null ⇒ built-in default) ──
     searchSessions: ?SearchSessionsFn = null,
     openPath: ?OpenPathFn = null,
+
+    // Settings domain (null ⇒ legacy stub / not-implemented, or the
+    // module-level `default_settings_store` when installed — see
+    // installDefaultSettings; the integrator decides which seam to keep).
+    settingsDescribe: ?SettingsDescribeFn = null,
+    settingsUpdate: ?SettingsWriteFn = null,
+    settingsMutate: ?SettingsWriteFn = null,
+    settingsReplace: ?SettingsWriteFn = null,
+    llmProviders: ?LlmProvidersFn = null,
+    credentialsDescribe: ?CredentialsDescribeFn = null,
+    credentialsSet: ?CredentialsWriteFn = null,
+    credentialsUnset: ?CredentialsWriteFn = null,
 };
 
 // ── response rendering ──────────────────────────────────────────────────────
@@ -853,12 +899,532 @@ fn hHostOpenPath(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: []
     return okValue(alloc, rpc_id, "{\"opened\":true}");
 }
 
-fn hSettingsDescribe(alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8) !UnaryResponse {
-    _ = payload;
-    // Read stub per spec §4: an empty document view — the settings mirror
-    // degrades gracefully and the enter-behavior preference stays inert.
-    return okValue(alloc, rpc_id, "{\"writable\":false,\"hasDocument\":false,\"namespaces\":[]}");
+fn hSettingsDescribe(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8) !UnaryResponse {
+    _ = payload; // {} per settingsDescribeRequestSchema
+    if (deps.settingsDescribe) |f| {
+        return okValue(alloc, rpc_id, try f(deps.ctx, alloc));
+    }
+    if (settingsStoreOf(deps.home)) |s| {
+        return okValue(alloc, rpc_id, try apx_settings.describeValue(s, alloc, apx_settings.collectEnv()));
+    }
+    // Legacy read stub per spec §4 (no settings store installed): an empty
+    // document view EXCEPT the ui-onboarding row, which stays
+    // PRE-ACKNOWLEDGED at the vendored GUI's current notice version
+    // (ui-settings-models/onboarding-copy.ts). Its WelcomeNotice modal gates
+    // the whole composer behind an acknowledgement write; without a write
+    // path an unacknowledged document would render an overlay no user can
+    // ever dismiss. The scope binds a verbatim-object decoder
+    // (decodeWelcomeSection), so this bare row validates without a schema.
+    const value = "{\"writable\":false,\"hasDocument\":true,\"namespaces\":[" ++
+        "{\"ns\":\"ui-onboarding\",\"schema\":null," ++
+        "\"value\":{\"welcomeNoticeVersion\":\"" ++ onboarding_notice_version ++ "\"}," ++
+        "\"applies\":\"live\",\"secrets\":[],\"revision\":1}" ++
+        "]}";
+    return okValue(alloc, rpc_id, value);
 }
+
+// ── settings domain (real config.toml backend) ──────────────────────────────
+//
+// Built-in backend over ~/.zharness/config.toml via apiproxy/settings.zig.
+// Precedence: an explicit ApiProxyDeps fn pointer wins; otherwise the module
+// store below serves REAL config.toml-backed answers once installed via
+// installDefaultSettings(); with neither, describe falls back to the legacy
+// ui-onboarding stub above and every other settings method reports
+// not-implemented.
+//
+// INTERIM NOTE FOR THE INTEGRATOR: installDefaultSettings() exists so the GUI
+// works without touching main.zig while another agent owns that file. The
+// final wiring should either keep the one-line call in serve startup OR move
+// to explicit deps pointers — both are shown in docs/settings.md.
+
+const apx_settings = @import("settings.zig");
+
+/// The vendored GUI's current WelcomeNotice version (onboarding-copy.ts).
+/// Single source: apiproxy/settings.zig owns the constant.
+const onboarding_notice_version = apx_settings.onboarding_notice_version;
+
+/// Module-level store used when no explicit deps pointer overrides a method.
+var default_settings_store: ?*apx_settings.Store = null;
+
+/// Create the process-wide settings store backed by `<home>/.zharness/
+/// config.toml`. Idempotent; returns the existing store on re-entry.
+/// Process-lifetime singleton on the C allocator (it outlives any request
+/// arena and must not leak into one).
+pub fn installDefaultSettings(gpa: std.mem.Allocator, home: []const u8) !*apx_settings.Store {
+    _ = gpa;
+    if (default_settings_store) |s| return s;
+    const s = try std.heap.c_allocator.create(apx_settings.Store);
+    errdefer std.heap.c_allocator.destroy(s);
+    try s.initInPlace(std.heap.c_allocator, home);
+    default_settings_store = s;
+    return s;
+}
+
+/// Lazy accessor: installs the store on first use from the request's
+/// ApiProxyDeps.home (already wired by serve startup). Null without a home.
+fn settingsStoreOf(home: []const u8) ?*apx_settings.Store {
+    if (default_settings_store) |s| return s;
+    if (home.len == 0) return null;
+    return installDefaultSettings(std.heap.c_allocator, home) catch null;
+}
+
+fn settingsStore() ?*apx_settings.Store {
+    return default_settings_store;
+}
+
+/// Map settings-backend errors onto the RPC error vocabulary.
+fn mapSettingsError(alloc: std.mem.Allocator, rpc_id: []const u8, err: anyerror) !UnaryResponse {
+    switch (err) {
+        error.UnknownNamespace => return errValue(
+            alloc,
+            rpc_id,
+            .settings_rejected,
+            "unknown settings namespace",
+            "{}",
+        ),
+        error.UnknownField => return errValue(
+            alloc,
+            rpc_id,
+            .settings_rejected,
+            "unknown settings field",
+            "{\"issues\":[]}",
+        ),
+        error.BadValueType => return errValue(
+            alloc,
+            rpc_id,
+            .settings_rejected,
+            "value type does not match the namespace schema",
+            "{\"issues\":[]}",
+        ),
+        error.RevisionConflict => return errValue(
+            alloc,
+            rpc_id,
+            .settings_conflict,
+            "settings were changed elsewhere; reload and retry",
+            "{}",
+        ),
+        error.WriteFailed => return internalError(alloc, rpc_id, "failed to persist config.toml"),
+        error.CredentialReadOnly => return errValue(
+            alloc,
+            rpc_id,
+            .settings_rejected,
+            "credential is provided by the environment and cannot be edited here",
+            "{}",
+        ),
+        error.CredentialRefUnknown => return errValue(
+            alloc,
+            rpc_id,
+            .settings_rejected,
+            "credential reference is not managed by zharness",
+            "{}",
+        ),
+        else => {
+            var msg_buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "settings failure: {s}", .{@errorName(err)}) catch "settings failure";
+            return internalError(alloc, rpc_id, msg);
+        },
+    }
+}
+
+/// Translate a validateOp/kvFor domain rejection into handler errors that run()'s
+/// mapper renders in-band (only PayloadInvalid/OutOfMemory pass through raw).
+fn mapOpError(e: anyerror) anyerror {
+    return switch (e) {
+        error.UnknownNamespace, error.UnknownField, error.BadValueType => error.SettingsRejected,
+        error.RevisionConflict => error.SettingsConflict,
+        error.PathTooDeep => error.PayloadInvalid,
+        error.OutOfMemory => error.OutOfMemory,
+        else => e,
+    };
+}
+
+/// Parse `expectedRevision` from a settings write payload (optional int).
+fn expectedRevisionOf(payload: []const u8) ?i64 {
+    return jsonx.getInt(payload, "expectedRevision");
+}
+
+/// One validated write op ready for commitKvs.
+const PendingOp = struct {
+    ns_id: usize,
+    kv: config.ConfigKv,
+};
+
+fn parseTomlValueRaw(alloc: std.mem.Allocator, raw: []const u8) !config.TomlValue {
+    return apx_settings.tomlFromJsonRaw(alloc, raw) catch |e| switch (e) {
+        error.BadValueType => error.PayloadInvalid,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
+/// Convert one raw JSON value slice into a TomlValue — see parseTomlValueRaw.
+fn opsFromPatch(alloc: std.mem.Allocator, payload: []const u8, ns: []const u8, out: *std.ArrayList(PendingOp)) !void {
+    const patch_raw = jsonx.getRaw(payload, "patch") orelse return error.PayloadInvalid;
+    if (!isJsonObjectRaw(patch_raw)) return error.PayloadInvalid;
+    const body = jsonx.objectBody(patch_raw).?;
+    var it = jsonx.MemberIter.init(body);
+    while (it.next()) |m| {
+        const key = try jsonx.decodeString(alloc, m.key);
+        const val = try parseTomlValueRaw(alloc, m.value);
+        const ns_id = apx_settings.validateOp(ns, key, val) catch |e| return mapOpError(e);
+        const kv = apx_settings.kvFor(ns_id, key, val) catch |e| return mapOpError(e);
+        try out.append(alloc, .{ .ns_id = ns_id, .kv = kv });
+    }
+}
+
+fn asciiWs(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
+}
+
+/// Raw JSON type probes (jsonx keeps only isString).
+fn isJsonObjectRaw(raw: []const u8) bool {
+    const t = jsonx.trimWs(raw);
+    return t.len >= 2 and t[0] == '{' and t[t.len - 1] == '}';
+}
+
+fn isJsonArrayRaw(raw: []const u8) bool {
+    const t = jsonx.trimWs(raw);
+    return t.len >= 2 and t[0] == '[' and t[t.len - 1] == ']';
+}
+
+/// First path segment of `["a","b",…]` (decoded), or null when empty/malformed.
+fn firstPathSegment(alloc: std.mem.Allocator, arr_raw: []const u8) ?[]const u8 {
+    const inner = arr_raw[1 .. arr_raw.len - 1];
+    var it = std.mem.splitScalar(u8, inner, ',');
+    while (it.next()) |seg_raw| {
+        const seg = jsonx.trimWs(seg_raw);
+        if (seg.len == 0) continue;
+        if (!jsonx.isString(seg)) return null;
+        return jsonx.decodeString(alloc, seg[1 .. seg.len - 1]) catch null;
+    }
+    return null;
+}
+
+/// Whether the path array carries more than one segment (v1 fields are
+/// top-level scalars; deeper paths are rejected as bad-request).
+fn pathHasSecondSegment(arr_raw: []const u8) bool {
+    const inner = arr_raw[1 .. arr_raw.len - 1];
+    var seen_first = false;
+    var it = std.mem.splitScalar(u8, inner, ',');
+    while (it.next()) |seg_raw| {
+        const seg = jsonx.trimWs(seg_raw);
+        if (seg.len == 0) continue;
+        if (seen_first) return true;
+        seen_first = true;
+    }
+    return false;
+}
+
+/// Build the pending edit list for settings.mutate ({ns, ops:[…]}).
+fn opsFromMutate(alloc: std.mem.Allocator, payload: []const u8, ns: []const u8, out: *std.ArrayList(PendingOp)) !void {
+    const ops_raw = jsonx.getRaw(payload, "ops") orelse return error.PayloadInvalid;
+    if (!isJsonArrayRaw(ops_raw)) return error.PayloadInvalid;
+    const body = ops_raw[1 .. ops_raw.len - 1];
+    var i: usize = 0;
+    while (i < body.len) {
+        while (i < body.len and (body[i] == ',' or asciiWs(body[i]))) : (i += 1) {}
+        if (i >= body.len) break;
+        if (body[i] != '{') return error.PayloadInvalid;
+        const end = jsonx.matchBraceFrom(body, i) orelse return error.PayloadInvalid;
+        const op = body[i..end];
+        i = end;
+
+        const kind_raw = jsonx.getRaw(op, "op") orelse return error.PayloadInvalid;
+        const is_set = std.mem.eql(u8, kind_raw, "\"set\"");
+        const is_unset = std.mem.eql(u8, kind_raw, "\"unset\"");
+        if (!is_set and !is_unset) return error.PayloadInvalid;
+
+        const path_raw = jsonx.getRaw(op, "path") orelse return error.PayloadInvalid;
+        if (!isJsonArrayRaw(path_raw)) return error.PayloadInvalid;
+        const first = firstPathSegment(alloc, path_raw) orelse return error.PayloadInvalid;
+        if (pathHasSecondSegment(path_raw)) return error.PathTooDeep;
+
+        const val: ?config.TomlValue = if (is_set)
+            try parseTomlValueRaw(alloc, jsonx.getRaw(op, "value") orelse return error.PayloadInvalid)
+        else
+            null;
+        const ns_id = apx_settings.validateOp(ns, first, val) catch |e| return mapOpError(e);
+        const kv = apx_settings.kvFor(ns_id, first, val) catch |e| return mapOpError(e);
+        try out.append(alloc, .{ .ns_id = ns_id, .kv = kv });
+    }
+}
+
+fn namespaceIdOf(ns: []const u8) ?usize {
+    if (std.mem.eql(u8, ns, "agent")) return apx_settings.Store.ns_agent;
+    if (std.mem.eql(u8, ns, "llm-deepseek")) return apx_settings.Store.ns_llm_deepseek;
+    if (std.mem.eql(u8, ns, "ui-theme")) return apx_settings.Store.ns_theme;
+    if (std.mem.eql(u8, ns, "locale")) return apx_settings.Store.ns_locale;
+    if (std.mem.eql(u8, ns, "ui-onboarding")) return apx_settings.Store.ns_onboarding;
+    return null;
+}
+
+/// Shared write pipeline behind update/mutate: parse ops, commit through the
+/// store, answer with the new namespace view (settingsNamespaceViewSchema).
+fn settingsWrite(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8, mode: enum { update, mutate }) !UnaryResponse {
+    var pending: std.ArrayList(PendingOp) = .empty;
+    defer pending.deinit(alloc);
+    const ns = try reqString(alloc, payload, "ns");
+    switch (mode) {
+        .update => try opsFromPatch(alloc, payload, ns, &pending),
+        .mutate => try opsFromMutate(alloc, payload, ns, &pending),
+    }
+
+    const answer_ns = namespaceIdOf(ns) orelse return mapOpError(error.UnknownNamespace);
+
+    const s = settingsStoreOf(deps.home) orelse return internalError(alloc, rpc_id, "settings are not implemented on this host");
+    var kvs: std.ArrayList(config.ConfigKv) = .empty;
+    defer kvs.deinit(alloc);
+    var ns_ids: std.ArrayList(usize) = .empty;
+    defer ns_ids.deinit(alloc);
+    for (pending.items) |p| {
+        try kvs.append(alloc, p.kv);
+        try ns_ids.append(alloc, p.ns_id);
+    }
+    if (kvs.items.len == 0) {
+        // No-op writes still fence and answer with a fresh view.
+        try ns_ids.append(alloc, answer_ns);
+    }
+    const view = apx_settings.commitKvs(
+        s,
+        alloc,
+        kvs.items,
+        ns_ids.items,
+        answer_ns,
+        expectedRevisionOf(payload),
+        apx_settings.collectEnv(),
+    ) catch |e| return mapOpError(e);
+    return okValue(alloc, rpc_id, view);
+}
+
+fn hSettingsUpdate(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8) !UnaryResponse {
+    if (deps.settingsUpdate) |f| {
+        return okValue(alloc, rpc_id, try f(deps.ctx, alloc, payload));
+    }
+    return settingsWrite(deps, alloc, rpc_id, payload, .update);
+}
+
+fn hSettingsMutate(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8) !UnaryResponse {
+    if (deps.settingsMutate) |f| {
+        return okValue(alloc, rpc_id, try f(deps.ctx, alloc, payload));
+    }
+    return settingsWrite(deps, alloc, rpc_id, payload, .mutate);
+}
+
+/// settings.replace: reset semantics — clear every known field of the
+/// namespace first, then apply what `section` carries (clears-first mutate).
+fn hSettingsReplace(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8) !UnaryResponse {
+    if (deps.settingsReplace) |f| {
+        return okValue(alloc, rpc_id, try f(deps.ctx, alloc, payload));
+    }
+    const ns = try reqString(alloc, payload, "ns");
+    if (namespaceIdOf(ns) == null) return mapOpError(error.UnknownNamespace);
+    const known: []const []const u8 = blk: {
+        if (std.mem.eql(u8, ns, "llm-deepseek")) break :blk &.{ "baseURL", "models" };
+        if (std.mem.eql(u8, ns, "ui-theme") or std.mem.eql(u8, ns, "locale")) break :blk &.{"preference"};
+        break :blk &.{ "provider", "model", "maxTurns", "reasoningEffort", "stream", "sandboxMode" };
+    };
+    var merged: std.ArrayList(u8) = .empty;
+    defer merged.deinit(alloc);
+    try merged.appendSlice(alloc, "{\"ns\":");
+    try jsonx.appendJsonString(alloc, &merged, ns);
+    try merged.appendSlice(alloc, ",\"ops\":[");
+    for (known, 0..) |f, i| {
+        if (i > 0) try merged.append(alloc, ',');
+        try merged.appendSlice(alloc, "{\"op\":\"unset\",\"path\":[\"");
+        try merged.appendSlice(alloc, f);
+        try merged.appendSlice(alloc, "\"]}");
+    }
+    const section_raw = jsonx.getRaw(payload, "section") orelse return error.PayloadInvalid;
+    if (!isJsonObjectRaw(section_raw)) return error.PayloadInvalid;
+    const body = jsonx.objectBody(section_raw).?;
+    var it = jsonx.MemberIter.init(body);
+    while (it.next()) |m| {
+        const key = try jsonx.decodeString(alloc, m.key);
+        try merged.appendSlice(alloc, ",{\"op\":\"set\",\"path\":[\"");
+        try merged.appendSlice(alloc, key);
+        try merged.appendSlice(alloc, "\"],\"value\":");
+        try merged.appendSlice(alloc, m.value);
+        try merged.append(alloc, '}');
+    }
+    try merged.appendSlice(alloc, "]}");
+    if (expectedRevisionOf(payload)) |rev| {
+        try merged.appendSlice(alloc, ",\"expectedRevision\":");
+        try jsonx.appendInt(alloc, &merged, rev);
+    }
+    return settingsWrite(deps, alloc, rpc_id, merged.items, .mutate);
+}
+
+// ── credentials domain (config.toml-backed credential slots) ────────────────
+//
+// The Models editor derives DEEPSEEK_API_KEY from the provider route and
+// stores typed keys through credentials.set. zharness has no env vault: the
+// two harness-managed refs map onto [model] api_key; anything else is absent
+// and read-only. Environment-provided keys stay read-only here (env beats the
+// document at boot, so editing them here would be a lie).
+
+fn credentialState(alloc: std.mem.Allocator, ref: []const u8, home: []const u8) !struct { configured: bool, writable: bool, source: ?[]const u8 } {
+    _ = alloc;
+    const managed = std.mem.eql(u8, ref, "DEEPSEEK_API_KEY") or std.mem.eql(u8, ref, "ZHARNESS_API_KEY");
+    if (!managed) return .{ .configured = false, .writable = false, .source = null };
+    const env = apx_settings.collectEnv();
+    if (env.zharness_api_key != null or env.deepseek_api_key != null) {
+        return .{ .configured = true, .writable = false, .source = "environment" };
+    }
+    if (settingsStoreOf(home)) |s| {
+        var arena = std.heap.ArenaAllocator.init(s.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        if (try s.readDoc(a)) |doc| {
+            if (try config.parseTomlFlat(a, doc)) |entries| {
+                if (findApiKeyEntry(entries)) |k| {
+                    if (k.len > 0) return .{ .configured = true, .writable = true, .source = "~/.zharness/config.toml" };
+                }
+            }
+        }
+    }
+    return .{ .configured = false, .writable = true, .source = null };
+}
+
+fn findApiKeyEntry(entries: []const config.TomlEntry) ?[]const u8 {
+    for (entries) |e| {
+        if (std.mem.eql(u8, e.section, "model") and std.mem.eql(u8, e.key, "api_key")) {
+            return switch (e.val) {
+                .str => |s| s,
+                else => null,
+            };
+        }
+    }
+    return null;
+}
+
+fn hCredentialsDescribe(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8) !UnaryResponse {
+    if (deps.credentialsDescribe) |f| {
+        return okValue(alloc, rpc_id, try f(deps.ctx, alloc, payload));
+    }
+    if (settingsStoreOf(deps.home) == null) {
+        return internalError(alloc, rpc_id, "credentials are not implemented on this host");
+    }
+    const refs_raw = jsonx.getRaw(payload, "refs") orelse return error.PayloadInvalid;
+    if (!isJsonArrayRaw(refs_raw)) return error.PayloadInvalid;
+    var value: std.ArrayList(u8) = .empty;
+    errdefer value.deinit(alloc);
+    try value.appendSlice(alloc, "{\"credentials\":{");
+    const inner = refs_raw[1 .. refs_raw.len - 1];
+    var it = std.mem.splitScalar(u8, inner, ',');
+    var first = true;
+    while (it.next()) |seg_raw| {
+        const seg = jsonx.trimWs(seg_raw);
+        if (seg.len == 0) continue;
+        if (!jsonx.isString(seg)) return error.PayloadInvalid;
+        const ref = try jsonx.decodeString(alloc, seg[1 .. seg.len - 1]);
+        // POSIX-portable env-name guard (credentialRefNameSchema).
+        for (ref, 0..) |c, ci| {
+            const ok = (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or c == '_' or (ci > 0 and c >= '0' and c <= '9');
+            if (!ok) return badRequest(alloc, rpc_id, "invalid credential reference");
+        }
+        const st = try credentialState(alloc, ref, deps.home);
+        if (!first) try value.append(alloc, ',');
+        first = false;
+        try value.append(alloc, '"');
+        try value.appendSlice(alloc, ref);
+        try value.appendSlice(alloc, "\":{\"configured\":");
+        try value.appendSlice(alloc, if (st.configured) "true" else "false");
+        if (st.source) |src| {
+            try value.appendSlice(alloc, ",\"source\":");
+            try jsonx.appendJsonString(alloc, &value, src);
+        }
+        try value.appendSlice(alloc, ",\"writable\":");
+        try value.appendSlice(alloc, if (st.writable) "true" else "false");
+        try value.append(alloc, '}');
+    }
+    try value.appendSlice(alloc, "}}");
+    return okValue(alloc, rpc_id, value.items);
+}
+
+/// Write/clear [model] api_key under the llm-deepseek revision fence so the
+/// Models page stays coherent with settings writes. Answers {} per schema.
+fn credentialsSetUnset(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8, set: bool) !UnaryResponse {
+    const ref = try reqString(alloc, payload, "ref");
+    const managed = std.mem.eql(u8, ref, "DEEPSEEK_API_KEY") or std.mem.eql(u8, ref, "ZHARNESS_API_KEY");
+    if (!managed) {
+        return errValue(alloc, rpc_id, .settings_rejected, "credential reference is not managed by zharness", "{}");
+    }
+    const st = try credentialState(alloc, ref, deps.home);
+    if (st.configured and !st.writable) {
+        return errValue(alloc, rpc_id, .settings_rejected, "credential is provided by the environment and cannot be edited here", "{}");
+    }
+    const s = settingsStoreOf(deps.home) orelse return internalError(alloc, rpc_id, "credentials are not implemented on this host");
+    var kv_val: ?config.TomlValue = null;
+    if (set) {
+        const v = try reqString(alloc, payload, "value");
+        if (v.len == 0) return error.PayloadInvalid;
+        kv_val = .{ .str = v };
+    } else if (!st.configured) {
+        return okValue(alloc, rpc_id, "{}"); // idempotent unset
+    }
+    var kvs = [_]config.ConfigKv{.{ .section = "model", .key = "api_key", .value = kv_val }};
+    var ns_ids = [_]usize{apx_settings.Store.ns_llm_deepseek};
+    _ = apx_settings.commitKvs(s, alloc, &kvs, &ns_ids, apx_settings.Store.ns_llm_deepseek, expectedRevisionOf(payload), apx_settings.collectEnv()) catch |e| return mapOpError(e);
+    return okValue(alloc, rpc_id, "{}");
+}
+
+fn hCredentialsSet(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8) !UnaryResponse {
+    if (deps.credentialsSet) |f| {
+        try f(deps.ctx, alloc, payload);
+        return okValue(alloc, rpc_id, "{}");
+    }
+    return credentialsSetUnset(deps, alloc, rpc_id, payload, true);
+}
+
+fn hCredentialsUnset(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8) !UnaryResponse {
+    if (deps.credentialsUnset) |f| {
+        try f(deps.ctx, alloc, payload);
+        return okValue(alloc, rpc_id, "{}");
+    }
+    return credentialsSetUnset(deps, alloc, rpc_id, payload, false);
+}
+
+// ── llm domain (provider directory for the Models join) ─────────────────────
+
+fn hLlmProviders(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8) !UnaryResponse {
+    _ = payload; // {} per llmProvidersRequestSchema
+    if (deps.llmProviders) |f| {
+        return okValue(alloc, rpc_id, try f(deps.ctx, alloc));
+    }
+    // One configurable route: the DeepSeek-compatible endpoint zharness runs,
+    // addressed at the whole llm-deepseek section (settingsPath []). The row
+    // is usable without a stored key (apiKeyEnv resolves only once a key is
+    // configured), so no setup card blocks the page.
+    return okValue(alloc, rpc_id, "{\"providers\":[{\"provider\":\"deepseek\",\"displayName\":\"DeepSeek\",\"settingsNs\":\"llm-deepseek\",\"settingsPath\":[],\"active\":true}]}");
+}
+
+/// settings.openDocument: materialize the local document when absent, then
+/// hand the path to the platform opener through the same seam as
+/// host.openPath (macOS forces a text editor per upstream).
+fn hSettingsOpenDocument(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8) !UnaryResponse {
+    _ = payload; // {} per settingsOpenDocumentRequestSchema
+    const s = settingsStoreOf(deps.home) orelse {
+        return errValue(alloc, rpc_id, .directory_picker_unavailable, "no settings document on this host", "{\"capability\":\"openDocument\"}");
+    };
+    if (s.home.len == 0) {
+        return errValue(alloc, rpc_id, .directory_picker_unavailable, "home is unknown; cannot open the settings document", "{}");
+    }
+    const path = try s.configPath(alloc);
+    if (try s.readDoc(alloc) == null) {
+        const template =
+            \\# zharness configuration (~/.zharness/config.toml)
+            \\# Edited by the web UI's Settings page; keys not listed here fall back
+            \\# to defaults (see docs/settings.md).
+            \\
+        ;
+        try s.writeDoc(template);
+    }
+    const open = deps.openPath orelse {
+        return errValue(alloc, rpc_id, .directory_picker_unavailable, "openPath is not wired on this host", "{\"capability\":\"openDocument\"}");
+    };
+    try open(deps.ctx, alloc, path);
+    return okValue(alloc, rpc_id, "{\"opened\":true}");
+}
+
 
 // ── dispatch ────────────────────────────────────────────────────────────────
 
@@ -927,8 +1493,22 @@ pub fn dispatch(
     if (std.mem.eql(u8, m, "workspace.insertSessionBefore")) return run(alloc, env, wsInsertSessionBeforeDefault(deps, alloc, env.rpc_id, p));
     if (std.mem.eql(u8, m, "workspace.archiveSession")) return run(alloc, env, wsArchiveSessionDefault(alloc, env.rpc_id, p));
 
-    // settings domain (read stub only)
-    if (std.mem.eql(u8, m, "settings.describe")) return run(alloc, env, hSettingsDescribe(alloc, env.rpc_id, p));
+    // settings domain (config.toml-backed when a store is installed; else
+    // describe answers the legacy ui-onboarding stub and writes degrade)
+    if (std.mem.eql(u8, m, "settings.describe")) return run(alloc, env, hSettingsDescribe(deps, alloc, env.rpc_id, p));
+    if (std.mem.eql(u8, m, "settings.update")) return run(alloc, env, hSettingsUpdate(deps, alloc, env.rpc_id, p));
+    if (std.mem.eql(u8, m, "settings.mutate")) return run(alloc, env, hSettingsMutate(deps, alloc, env.rpc_id, p));
+    if (std.mem.eql(u8, m, "settings.replace")) return run(alloc, env, hSettingsReplace(deps, alloc, env.rpc_id, p));
+    if (std.mem.eql(u8, m, "settings.openDocument")) return run(alloc, env, hSettingsOpenDocument(deps, alloc, env.rpc_id, p));
+
+    // credentials domain (Models-page key slots over [model] api_key)
+    if (std.mem.eql(u8, m, "credentials.describe")) return run(alloc, env, hCredentialsDescribe(deps, alloc, env.rpc_id, p));
+    if (std.mem.eql(u8, m, "credentials.set")) return run(alloc, env, hCredentialsSet(deps, alloc, env.rpc_id, p));
+    if (std.mem.eql(u8, m, "credentials.unset")) return run(alloc, env, hCredentialsUnset(deps, alloc, env.rpc_id, p));
+
+    // llm domain (provider directory for the Models join; discovery is a
+    // pi-ai/custom-route feature zharness does not offer)
+    if (std.mem.eql(u8, m, "llm.providers")) return run(alloc, env, hLlmProviders(deps, alloc, env.rpc_id, p));
 
     return badRequest(alloc, env.rpc_id, "unknown method");
 }
