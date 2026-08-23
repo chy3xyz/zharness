@@ -1,9 +1,17 @@
 //! Builtin tool executors (dev.md §X–XI). Adapted from the proven zeepseek
 //! file/shell/git implementations, kept dependency-free on cwd + libc popen.
+//!
+//! Sandbox routing (dev.md §XI–XII): `execute` takes the configured
+//! `Config.SandboxMode`; when it is `.process` the shell tool routes through
+//! `sandbox/sandbox.zig` (deny-list classify, env allowlist, watchdog) and
+//! denied commands become failed ToolResults carrying the policy reason.
+//! All other modes keep the direct `/bin/sh -c` execution path (L0).
 
 const std = @import("std");
 const c = std.c;
 const clib = @import("../clib.zig");
+const config = @import("../config.zig");
+const sandbox_mod = @import("../sandbox/sandbox.zig");
 
 pub const ToolCall = struct {
     name: []const u8,
@@ -81,7 +89,9 @@ fn unescapeJson(alloc: std.mem.Allocator, raw: []const u8) ![]const u8 {
 }
 
 /// Parse a flat JSON object of string/number/boolean values into a map.
-fn parseArgs(alloc: std.mem.Allocator, json_args: []const u8) !std.StringHashMap([]const u8) {
+/// Public so wiring layers (main.zig extension tools) reuse the same
+/// tolerant flat-arg scanner instead of duplicating it.
+pub fn parseArgs(alloc: std.mem.Allocator, json_args: []const u8) !std.StringHashMap([]const u8) {
     var map = std.StringHashMap([]const u8).init(alloc);
     errdefer {
         var it = map.iterator();
@@ -132,7 +142,8 @@ fn parseArgs(alloc: std.mem.Allocator, json_args: []const u8) !std.StringHashMap
     return map;
 }
 
-fn freeArgs(alloc: std.mem.Allocator, map: *std.StringHashMap([]const u8)) void {
+/// Free a map returned by `parseArgs`.
+pub fn freeArgs(alloc: std.mem.Allocator, map: *std.StringHashMap([]const u8)) void {
     var it = map.iterator();
     while (it.next()) |e| {
         alloc.free(e.key_ptr.*);
@@ -141,20 +152,40 @@ fn freeArgs(alloc: std.mem.Allocator, map: *std.StringHashMap([]const u8)) void 
     map.deinit();
 }
 
+/// Failed result whose message is heap-owned. EVERY ToolResult returned from
+/// this module must be freeable via `freeResult` — raw string literals in
+/// err_msg/output would crash the caller's allocator (DebugAllocator /
+/// testing.allocator both fault on freeing static memory).
+fn failResult(alloc: std.mem.Allocator, msg: []const u8) ToolResult {
+    return .{
+        .success = false,
+        .output = alloc.dupe(u8, "") catch "",
+        .err_msg = alloc.dupe(u8, msg) catch null,
+    };
+}
+
 /// Dispatch a tool call to the correct executor. `alloc` must outlive the
 /// returned `ToolResult.output`/`err_msg` (caller frees via freeResult).
-pub fn execute(alloc: std.mem.Allocator, io: std.Io, cwd: []const u8, call: ToolCall) !ToolResult {
+/// `sandbox_mode` applies to the shell tool only (dev.md §XII): `.process`
+/// routes through sandbox.run(); every other mode executes directly.
+pub fn execute(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    call: ToolCall,
+    sandbox_mode: config.Config.SandboxMode,
+) !ToolResult {
     if (std.mem.eql(u8, call.name, "file_read")) return fileRead(alloc, io, cwd, call);
     if (std.mem.eql(u8, call.name, "file_write")) return fileWrite(alloc, io, cwd, call);
     if (std.mem.eql(u8, call.name, "file_edit")) return fileEdit(alloc, io, cwd, call);
     if (std.mem.eql(u8, call.name, "glob")) return glob(alloc, cwd, call);
     if (std.mem.eql(u8, call.name, "grep")) return grepTool(alloc, io, cwd, call);
-    if (std.mem.eql(u8, call.name, "shell")) return shell(alloc, cwd, call);
+    if (std.mem.eql(u8, call.name, "shell")) return shell(alloc, cwd, call, sandbox_mode);
     if (std.mem.eql(u8, call.name, "git_status")) return gitRun(alloc, cwd, &.{ "status", "--porcelain" });
     if (std.mem.eql(u8, call.name, "git_diff")) return gitDiff(alloc, cwd, call);
     if (std.mem.eql(u8, call.name, "git_log")) return gitLog(alloc, cwd, call);
     if (std.mem.eql(u8, call.name, "git_commit")) return gitCommit(alloc, cwd, call);
-    return ToolResult{ .success = false, .output = "", .err_msg = "unknown tool" };
+    return failResult(alloc, "unknown tool");
 }
 
 /// Free a result produced by `execute` (the slices are allocated with `alloc`).
@@ -166,11 +197,11 @@ pub fn freeResult(alloc: std.mem.Allocator, res: *const ToolResult) void {
 fn fileRead(alloc: std.mem.Allocator, io: std.Io, cwd: []const u8, call: ToolCall) !ToolResult {
     var map = try parseArgs(alloc, call.arguments);
     defer freeArgs(alloc, &map);
-    const path = map.get("path") orelse return ToolResult{ .success = false, .output = "", .err_msg = "missing path" };
+    const path = map.get("path") orelse return failResult(alloc, "missing path");
     const resolved = try resolvePath(alloc, cwd, path);
     defer alloc.free(resolved);
     if (!isInsideWorkspace(resolved, cwd)) {
-        return ToolResult{ .success = false, .output = "", .err_msg = "path is outside the workspace" };
+        return failResult(alloc, "path is outside the workspace");
     }
     const content = readFileC(alloc, io, resolved) catch |e| {
         return ToolResult{ .success = false, .output = "", .err_msg = try alloc.dupe(u8, @errorName(e)) };
@@ -189,12 +220,12 @@ fn readFileC(alloc: std.mem.Allocator, io: std.Io, path: []const u8) ![]const u8
 fn fileWrite(alloc: std.mem.Allocator, io: std.Io, cwd: []const u8, call: ToolCall) !ToolResult {
     var map = try parseArgs(alloc, call.arguments);
     defer freeArgs(alloc, &map);
-    const path = map.get("path") orelse return ToolResult{ .success = false, .output = "", .err_msg = "missing path" };
-    const content = map.get("content") orelse return ToolResult{ .success = false, .output = "", .err_msg = "missing content" };
+    const path = map.get("path") orelse return failResult(alloc, "missing path");
+    const content = map.get("content") orelse return failResult(alloc, "missing content");
     const resolved = try resolvePath(alloc, cwd, path);
     defer alloc.free(resolved);
     if (!isInsideWorkspace(resolved, cwd)) {
-        return ToolResult{ .success = false, .output = "", .err_msg = "path is outside the workspace" };
+        return failResult(alloc, "path is outside the workspace");
     }
     if (std.fs.path.dirname(resolved)) |dir| {
         ensureDir(alloc, dir);
@@ -232,13 +263,13 @@ fn writeFileC(alloc: std.mem.Allocator, io: std.Io, path: []const u8, content: [
 fn fileEdit(alloc: std.mem.Allocator, io: std.Io, cwd: []const u8, call: ToolCall) !ToolResult {
     var map = try parseArgs(alloc, call.arguments);
     defer freeArgs(alloc, &map);
-    const path = map.get("path") orelse return ToolResult{ .success = false, .output = "", .err_msg = "missing path" };
-    const old_s = map.get("old_string") orelse return ToolResult{ .success = false, .output = "", .err_msg = "missing old_string" };
-    const new_s = map.get("new_string") orelse return ToolResult{ .success = false, .output = "", .err_msg = "missing new_string" };
+    const path = map.get("path") orelse return failResult(alloc, "missing path");
+    const old_s = map.get("old_string") orelse return failResult(alloc, "missing old_string");
+    const new_s = map.get("new_string") orelse return failResult(alloc, "missing new_string");
     const resolved = try resolvePath(alloc, cwd, path);
     defer alloc.free(resolved);
     if (!isInsideWorkspace(resolved, cwd)) {
-        return ToolResult{ .success = false, .output = "", .err_msg = "path is outside the workspace" };
+        return failResult(alloc, "path is outside the workspace");
     }
     const original = readFileC(alloc, io, resolved) catch |e| {
         return ToolResult{ .success = false, .output = "", .err_msg = try alloc.dupe(u8, @errorName(e)) };
@@ -267,7 +298,7 @@ fn fileEdit(alloc: std.mem.Allocator, io: std.Io, cwd: []const u8, call: ToolCal
 fn glob(alloc: std.mem.Allocator, cwd: []const u8, call: ToolCall) !ToolResult {
     var map = try parseArgs(alloc, call.arguments);
     defer freeArgs(alloc, &map);
-    const pattern = map.get("pattern") orelse return ToolResult{ .success = false, .output = "", .err_msg = "missing pattern" };
+    const pattern = map.get("pattern") orelse return failResult(alloc, "missing pattern");
     const base = if (map.get("path")) |p| p else cwd;
     const resolved_base = try resolvePath(alloc, cwd, base);
     defer alloc.free(resolved_base);
@@ -374,7 +405,7 @@ fn matchGlob(path: []const u8, pattern: []const u8) bool {
 fn grepTool(alloc: std.mem.Allocator, io: std.Io, cwd: []const u8, call: ToolCall) !ToolResult {
     var map = try parseArgs(alloc, call.arguments);
     defer freeArgs(alloc, &map);
-    const pattern = map.get("pattern") orelse return ToolResult{ .success = false, .output = "", .err_msg = "missing pattern" };
+    const pattern = map.get("pattern") orelse return failResult(alloc, "missing pattern");
     const base = if (map.get("path")) |p| p else cwd;
     const ic = if (map.get("ignore_case")) |v| std.mem.eql(u8, v, "true") else false;
     const resolved_base = try resolvePath(alloc, cwd, base);
@@ -435,11 +466,31 @@ fn matchLine(hay: []const u8, needle: []const u8, ic: bool) bool {
     return std.mem.indexOf(u8, hay, needle) != null;
 }
 
-/// Run a command via /bin/sh -c with cwd prefix and 2>&1 merge.
-fn shell(alloc: std.mem.Allocator, cwd: []const u8, call: ToolCall) !ToolResult {
+/// Run a command via /bin/sh -c with cwd prefix and 2>&1 merge. When
+/// `sandbox_mode == .process` the command is executed through the L1 sandbox
+/// (policy classify → env allowlist → watchdog); a denied command never runs
+/// and surfaces its policy reason as a failed result.
+fn shell(alloc: std.mem.Allocator, cwd: []const u8, call: ToolCall, sandbox_mode: config.Config.SandboxMode) !ToolResult {
     var map = try parseArgs(alloc, call.arguments);
     defer freeArgs(alloc, &map);
-    const cmd = map.get("command") orelse return ToolResult{ .success = false, .output = "", .err_msg = "missing command" };
+    const cmd = map.get("command") orelse return failResult(alloc, "missing command");
+
+    if (sandbox_mode == .process) {
+        var r = sandbox_mod.run(alloc, .{}, cwd, cmd) catch |e| {
+            return ToolResult{
+                .success = false,
+                .output = "",
+                .err_msg = try std.fmt.allocPrint(alloc, "sandbox spawn failed: {s}", .{@errorName(e)}),
+            };
+        };
+        defer r.deinit(alloc);
+        // Copy out of the sandbox Result (deinit frees its own slices).
+        const out_copy = try alloc.dupe(u8, r.output);
+        errdefer alloc.free(out_copy);
+        const err_copy: ?[]const u8 = if (r.err_msg) |m| try alloc.dupe(u8, m) else null;
+        return ToolResult{ .success = r.success, .output = out_copy, .err_msg = err_copy };
+    }
+
     var full = try std.ArrayList(u8).initCapacity(alloc, 0);
     defer full.deinit(alloc);
     try full.appendSlice(alloc, "cd ");
@@ -449,7 +500,7 @@ fn shell(alloc: std.mem.Allocator, cwd: []const u8, call: ToolCall) !ToolResult 
     try full.appendSlice(alloc, " 2>&1");
     const full_z = try alloc.dupeSentinel(u8, full.items, 0);
     defer alloc.free(full_z);
-    const fp = clib.popenRead(full_z.ptr) orelse return ToolResult{ .success = false, .output = "", .err_msg = "spawn failed" };
+    const fp = clib.popenRead(full_z.ptr) orelse return failResult(alloc, "spawn failed");
     var out = try std.ArrayList(u8).initCapacity(alloc, 0);
     errdefer out.deinit(alloc);
     var buf: [8192]u8 = undefined;
@@ -511,7 +562,7 @@ fn gitLog(alloc: std.mem.Allocator, cwd: []const u8, call: ToolCall) !ToolResult
 fn gitCommit(alloc: std.mem.Allocator, cwd: []const u8, call: ToolCall) !ToolResult {
     var map = try parseArgs(alloc, call.arguments);
     defer freeArgs(alloc, &map);
-    const message = map.get("message") orelse return ToolResult{ .success = false, .output = "", .err_msg = "missing message" };
+    const message = map.get("message") orelse return failResult(alloc, "missing message");
     var out = try std.ArrayList(u8).initCapacity(alloc, 0);
     errdefer out.deinit(alloc);
     const add = try gitRun(alloc, cwd, &.{ "add", "-A" });
@@ -539,7 +590,7 @@ fn runArgv(alloc: std.mem.Allocator, cwd: []const u8, argv: []const []const u8) 
     try cmd.appendSlice(alloc, " 2>&1");
     const cmd_z = try alloc.dupeSentinel(u8, cmd.items, 0);
     defer alloc.free(cmd_z);
-    const fp = clib.popenRead(cmd_z.ptr) orelse return ToolResult{ .success = false, .output = "", .err_msg = "spawn failed" };
+    const fp = clib.popenRead(cmd_z.ptr) orelse return failResult(alloc, "spawn failed");
     var out = try std.ArrayList(u8).initCapacity(alloc, 0);
     errdefer out.deinit(alloc);
     var buf: [8192]u8 = undefined;
@@ -568,7 +619,7 @@ test "parseArgs flat object" {
 
 test "shell echo" {
     const alloc = std.testing.allocator;
-    var res = try shell(alloc, "/tmp", .{ .name = "shell", .arguments = "{\"command\":\"echo hello\"}" });
+    var res = try shell(alloc, "/tmp", .{ .name = "shell", .arguments = "{\"command\":\"echo hello\"}" }, .none);
     defer freeResult(alloc, &res);
     try std.testing.expect(res.success);
     try std.testing.expect(std.mem.indexOf(u8, res.output, "hello") != null);
@@ -588,10 +639,31 @@ test "shell runs in workspace whose path contains spaces" {
             _ = std.c.rmdir(&dz);
         }
     }
-    var res = try shell(alloc, dir, .{ .name = "shell", .arguments = "{\"command\":\"pwd\"}" });
+    var res = try shell(alloc, dir, .{ .name = "shell", .arguments = "{\"command\":\"pwd\"}" }, .none);
     defer freeResult(alloc, &res);
     try std.testing.expect(res.success);
     try std.testing.expect(std.mem.indexOf(u8, res.output, dir) != null);
+}
+
+// Sandbox routing (dev.md §XII): .process mode classifies before executing;
+// denied commands never run and carry the policy reason. .none keeps the
+// legacy direct path.
+test "shell sandbox process mode denies destructive command" {
+    const alloc = std.testing.allocator;
+    var res = try shell(alloc, "/tmp", .{ .name = "shell", .arguments = "{\"command\":\"echo start && rm -rf /\"}" }, .process);
+    defer freeResult(alloc, &res);
+    try std.testing.expect(!res.success);
+    try std.testing.expect(std.mem.indexOf(u8, res.err_msg.?, "blocked by sandbox policy") != null);
+    // The command must not have executed at all.
+    try std.testing.expectEqualStrings("", res.output);
+}
+
+test "shell sandbox process mode still runs benign commands" {
+    const alloc = std.testing.allocator;
+    var res = try shell(alloc, "/tmp", .{ .name = "shell", .arguments = "{\"command\":\"echo sandboxed-ok\"}" }, .process);
+    defer freeResult(alloc, &res);
+    try std.testing.expect(res.success);
+    try std.testing.expect(std.mem.indexOf(u8, res.output, "sandboxed-ok") != null);
 }
 
 test "glob matches zig files" {

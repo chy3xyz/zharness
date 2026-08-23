@@ -16,6 +16,18 @@ const tool_builtin = @import("tool/builtin.zig");
 const agent = @import("agent/agent.zig");
 const session = @import("session/session.zig");
 
+// Orphan modules wired by W1-integration — imported so their inline test
+// blocks join `zig build test`.
+const checkpoint = @import("session/checkpoint.zig");
+const sandbox_mod = @import("sandbox/sandbox.zig");
+const skill_mod = @import("skill/skill.zig");
+const skill_loader = @import("skill/loader.zig");
+const mem_persistent = @import("memory/persistent.zig");
+const mem_working = @import("memory/working.zig");
+const plan_mod = @import("agent/plan.zig");
+const goal_mod = @import("agent/goal.zig");
+const main_mod = @import("main.zig");
+
 comptime {
     // Pull in the CLI flag parser so its inline tests join the suite.
     _ = @import("cli_flags.zig");
@@ -45,7 +57,7 @@ test "builtin shell echo" {
     var ctx = try cordis.Context.init(alloc);
     defer ctx.deinit();
     const io = ctx.io();
-    var res = try tool_builtin.execute(alloc, io, "/tmp", .{ .name = "shell", .arguments = "{\"command\":\"echo hi\"}" });
+    var res = try tool_builtin.execute(alloc, io, "/tmp", .{ .name = "shell", .arguments = "{\"command\":\"echo hi\"}" }, .none);
     defer tool_builtin.freeResult(alloc, &res);
     try std.testing.expect(res.success);
     try std.testing.expect(std.mem.indexOf(u8, res.output, "hi") != null);
@@ -58,20 +70,20 @@ test "builtin file read write edit roundtrip" {
     const io = ctx.io();
     const path = "/tmp/zharness_test_file.txt";
 
-    var w = try tool_builtin.execute(alloc, io, "/tmp", .{ .name = "file_write", .arguments = "{\"path\":\"/tmp/zharness_test_file.txt\",\"content\":\"hello\\n\"}" });
+    var w = try tool_builtin.execute(alloc, io, "/tmp", .{ .name = "file_write", .arguments = "{\"path\":\"/tmp/zharness_test_file.txt\",\"content\":\"hello\\n\"}" }, .none);
     defer tool_builtin.freeResult(alloc, &w);
     try std.testing.expect(w.success);
 
-    var r = try tool_builtin.execute(alloc, io, "/tmp", .{ .name = "file_read", .arguments = "{\"path\":\"/tmp/zharness_test_file.txt\"}" });
+    var r = try tool_builtin.execute(alloc, io, "/tmp", .{ .name = "file_read", .arguments = "{\"path\":\"/tmp/zharness_test_file.txt\"}" }, .none);
     defer tool_builtin.freeResult(alloc, &r);
     try std.testing.expect(r.success);
     try std.testing.expectEqualSlices(u8, "hello\n", r.output);
 
-    var e = try tool_builtin.execute(alloc, io, "/tmp", .{ .name = "file_edit", .arguments = "{\"path\":\"/tmp/zharness_test_file.txt\",\"old_string\":\"hello\",\"new_string\":\"world\"}" });
+    var e = try tool_builtin.execute(alloc, io, "/tmp", .{ .name = "file_edit", .arguments = "{\"path\":\"/tmp/zharness_test_file.txt\",\"old_string\":\"hello\",\"new_string\":\"world\"}" }, .none);
     defer tool_builtin.freeResult(alloc, &e);
     try std.testing.expect(e.success);
 
-    var r2 = try tool_builtin.execute(alloc, io, "/tmp", .{ .name = "file_read", .arguments = "{\"path\":\"/tmp/zharness_test_file.txt\"}" });
+    var r2 = try tool_builtin.execute(alloc, io, "/tmp", .{ .name = "file_read", .arguments = "{\"path\":\"/tmp/zharness_test_file.txt\"}" }, .none);
     defer tool_builtin.freeResult(alloc, &r2);
     try std.testing.expect(r2.success);
     try std.testing.expectEqualSlices(u8, "world\n", r2.output);
@@ -95,7 +107,7 @@ test "agent loop construct" {
     const io = ctx.io();
     const client = model.ChatClient.init(alloc, io, "https://api.deepseek.com/chat/completions", "deepseek-chat", "");
 
-    var loop = try agent.AgentLoop.init(alloc, ctx, ag, client, &reg, "/tmp", null);
+    var loop = try agent.AgentLoop.init(alloc, ctx, ag, client, &reg, "/tmp", null, null, null);
     defer loop.deinit();
 
     try std.testing.expect(true);
@@ -115,7 +127,7 @@ test "agent loop seed and syncToSession" {
     defer ag.deinit(alloc);
 
     const client = model.ChatClient.init(alloc, ctx.io(), "https://api.deepseek.com/chat/completions", "deepseek-chat", "");
-    var loop = try agent.AgentLoop.init(alloc, ctx, ag, client, &reg, "/tmp", null);
+    var loop = try agent.AgentLoop.init(alloc, ctx, ag, client, &reg, "/tmp", null, null, null);
     defer loop.deinit();
 
     // Seed a prior transcript (as a resumed session would) and verify it can
@@ -159,7 +171,7 @@ test "session multi-turn resume" {
 
     // Turn 1: fresh conversation -> persist.
     {
-        var loop = try agent.AgentLoop.init(alloc, ctx, ag, client, &reg, "/tmp", null);
+        var loop = try agent.AgentLoop.init(alloc, ctx, ag, client, &reg, "/tmp", null, null, null);
         defer loop.deinit();
         try loop.seed(alloc, model.Message{ .role = .user, .content = "q1" });
         try loop.seed(alloc, model.Message{ .role = .assistant, .content = "a1" });
@@ -176,7 +188,7 @@ test "session multi-turn resume" {
         try s.load(io, path);
         try std.testing.expectEqual(@as(usize, 2), s.count()); // resumed with q1,a1
 
-        var loop = try agent.AgentLoop.init(alloc, ctx, ag, client, &reg, "/tmp", null);
+        var loop = try agent.AgentLoop.init(alloc, ctx, ag, client, &reg, "/tmp", null, null, null);
         defer loop.deinit();
         for (s.messages.items) |m| try loop.seed(alloc, m);
         try std.testing.expectEqual(@as(usize, 2), loop.messages.items.len); // seeded prior turns
@@ -193,7 +205,7 @@ test "session multi-turn resume" {
         try s.load(io, path);
         try std.testing.expectEqual(@as(usize, 4), s.count()); // q1,a1,q2,a2
 
-        var loop = try agent.AgentLoop.init(alloc, ctx, ag, client, &reg, "/tmp", null);
+        var loop = try agent.AgentLoop.init(alloc, ctx, ag, client, &reg, "/tmp", null, null, null);
         defer loop.deinit();
         for (s.messages.items) |m| try loop.seed(alloc, m);
         try loop.seed(alloc, model.Message{ .role = .user, .content = "q3" });
@@ -329,7 +341,7 @@ test "session multi-turn resume integration" {
                 error.FileNotFound => {},
                 else => return e,
             };
-            var loop = try agent.AgentLoop.init(a, context, agent_p, cli, registry, "/tmp", null);
+            var loop = try agent.AgentLoop.init(a, context, agent_p, cli, registry, "/tmp", null, null, null);
             defer loop.deinit();
             for (s.messages.items) |m| try loop.seed(a, m);
             if (!seed_only) {
@@ -368,5 +380,379 @@ test "session multi-turn resume integration" {
     try std.testing.expectEqual(model.Role.assistant, s.messages.items[1].role);
     try std.testing.expectEqual(model.Role.user, s.messages.items[4].role);
     try std.testing.expectEqual(model.Role.assistant, s.messages.items[5].role);
+}
+
+// ── W1-integration tests (sandbox / checkpoint / extension wiring) ──────────
+
+var w1_dir_counter: u32 = 0;
+
+/// Fresh unique /tmp dir path (caller frees).
+fn w1TempDir(alloc: std.mem.Allocator, prefix: []const u8) ![]u8 {
+    w1_dir_counter += 1;
+    return std.fmt.allocPrint(alloc, "/tmp/zh_w1_{s}_{d}_{d}", .{ prefix, clib.nowTimestamp(), w1_dir_counter });
+}
+
+test "builtin execute routes shell through sandbox in process mode" {
+    const alloc = std.testing.allocator;
+    var ctx = try cordis.Context.init(alloc);
+    defer ctx.deinit();
+    const io = ctx.io();
+
+    // Benign command runs fine under .process.
+    var ok = try tool_builtin.execute(alloc, io, "/tmp", .{ .name = "shell", .arguments = "{\"command\":\"echo routed\"}" }, .process);
+    defer tool_builtin.freeResult(alloc, &ok);
+    try std.testing.expect(ok.success);
+    try std.testing.expect(std.mem.indexOf(u8, ok.output, "routed") != null);
+
+    // Denied command never executes; reason surfaces as err_msg.
+    var denied = try tool_builtin.execute(
+        alloc,
+        io,
+        "/tmp",
+        .{ .name = "shell", .arguments = "{\"command\":\"echo nope && rm -rf /\"}" },
+        .process,
+    );
+    defer tool_builtin.freeResult(alloc, &denied);
+    try std.testing.expect(!denied.success);
+    try std.testing.expect(std.mem.indexOf(u8, denied.err_msg.?, "blocked by sandbox policy") != null);
+    try std.testing.expectEqualStrings("", denied.output);
+
+    // Unknown tools still report as unknown in both modes.
+    for ([_]config.Config.SandboxMode{ .none, .process }) |mode| {
+        var unk = try tool_builtin.execute(alloc, io, "/tmp", .{ .name = "nope", .arguments = "{}" }, mode);
+        defer tool_builtin.freeResult(alloc, &unk);
+        try std.testing.expect(!unk.success);
+        try std.testing.expectEqualStrings("unknown tool", unk.err_msg.?);
+    }
+}
+
+test "agent loop saves checkpoints at boundaries and post-tool-batch" {
+    const alloc = std.testing.allocator;
+    var ctx = try cordis.Context.init(alloc);
+    defer ctx.deinit();
+    const io = ctx.io();
+
+    var reg = try tool_reg.ToolRegistry.init(alloc);
+    defer reg.deinit();
+    try tool_reg.registerBuiltins(&reg);
+
+    const cfg = agent.AgentConfig{ .system_prompt = "sys", .max_turns = 4, .reasoning_effort = null, .sandbox_mode = .none };
+    const ag = try agent.Agent.init(alloc, ctx.root, &cfg);
+    defer ag.deinit(alloc);
+    const client = model.ChatClient.init(alloc, io, "https://localhost.invalid", "m", "");
+
+    const dir = try w1TempDir(alloc, "cp");
+    defer alloc.free(dir);
+    defer std.Io.Dir.deleteTree(.cwd(), io, dir) catch {};
+
+    var store = try checkpoint.CheckpointStore.init(alloc, dir);
+    defer store.deinit();
+
+    var loop = try agent.AgentLoop.init(alloc, ctx, ag, client, &reg, "/tmp", null, &store, null);
+    defer loop.deinit();
+
+    try loop.seed(alloc, model.Message{ .role = .user, .content = "q1" });
+    try loop.seed(alloc, model.Message{ .role = .assistant, .content = "working", .tool_calls_json = "[{\"id\":\"c1\"}]" });
+
+    // Turn boundary snapshot.
+    loop.saveCheckpoint("turn 1");
+    const latest = (try store.latest(io)).?;
+    defer latest.deinit(alloc);
+    try std.testing.expectEqualStrings("turn 1", latest.label);
+    try std.testing.expectEqual(@as(usize, 2), latest.message_count);
+
+    // Post-tool-batch snapshot appends another entry and captures tool state.
+    try loop.seed(alloc, model.Message{ .role = .tool, .content = "result", .tool_call_id = "c1" });
+    loop.saveCheckpoint("turn 1 post-tools");
+
+    const metas = try store.list(io, alloc);
+    defer {
+        for (metas) |m| m.deinit(alloc);
+        alloc.free(metas);
+    }
+    try std.testing.expectEqual(@as(usize, 2), metas.len);
+    try std.testing.expectEqualStrings("turn 1", metas[0].label);
+    try std.testing.expectEqualStrings("turn 1 post-tools", metas[1].label);
+    try std.testing.expectEqual(@as(usize, 3), metas[1].message_count);
+
+    // Round-trip: the stored snapshot decodes back into loop-shaped messages.
+    var cp = try store.load(io, alloc, metas[1].id);
+    defer cp.deinit(alloc);
+    try std.testing.expectEqual(checkpoint.Role.tool, cp.messages[2].role);
+    try std.testing.expectEqualStrings("c1", cp.messages[2].tool_call_id.?);
+
+    // Without a wired store this must be a silent no-op.
+    var bare_loop = try agent.AgentLoop.init(alloc, ctx, ag, client, &reg, "/tmp", null, null, null);
+    defer bare_loop.deinit();
+    bare_loop.saveCheckpoint("ignored"); // must not crash
+}
+
+// Fake extension used to prove the loop-side plumbing without any of the
+// concrete main.zig subsystems.
+const FakeExt = struct {
+    renders: usize = 0,
+
+    fn render(ctx: *anyopaque, alloc: std.mem.Allocator) anyerror![]const u8 {
+        const self: *FakeExt = @ptrCast(@alignCast(ctx));
+        self.renders += 1;
+        return try alloc.dupe(u8, "## Fake section\nhello");
+    }
+
+    fn exec(ctx: *anyopaque, alloc: std.mem.Allocator, io: std.Io, call: tool_builtin.ToolCall) anyerror!?tool_builtin.ToolResult {
+        _ = io;
+        const self: *FakeExt = @ptrCast(@alignCast(ctx));
+        _ = self;
+        if (std.mem.eql(u8, call.name, "fake_ping")) {
+            return tool_builtin.ToolResult{ .success = true, .output = try alloc.dupe(u8, "pong"), .err_msg = null };
+        }
+        return null; // unknown → builtin fallback
+    }
+};
+
+test "agent loop extensions serve tools and fall back to builtins" {
+    const alloc = std.testing.allocator;
+    var ctx = try cordis.Context.init(alloc);
+    defer ctx.deinit();
+    const io = ctx.io();
+
+    var reg = try tool_reg.ToolRegistry.init(alloc);
+    defer reg.deinit();
+    try tool_reg.registerBuiltins(&reg);
+
+    const cfg = agent.AgentConfig{ .system_prompt = "base prompt", .max_turns = 4, .reasoning_effort = null, .sandbox_mode = .none };
+    const ag = try agent.Agent.init(alloc, ctx.root, &cfg);
+    defer ag.deinit(alloc);
+    const client = model.ChatClient.init(alloc, io, "https://localhost.invalid", "m", "");
+
+    var fake = FakeExt{};
+    const ext = agent.Extensions{ .ctx = &fake, .renderContext = FakeExt.render, .executeTool = FakeExt.exec };
+
+    var loop = try agent.AgentLoop.init(alloc, ctx, ag, client, &reg, "/tmp", null, null, &ext);
+    defer loop.deinit();
+
+    // Extension-served tool.
+    var pong = try loop.dispatchTool(.{ .id = "1", .name = "fake_ping", .arguments = "{}" });
+    defer tool_builtin.freeResult(alloc, &pong);
+    try std.testing.expect(pong.success);
+    try std.testing.expectEqualStrings("pong", pong.output);
+
+    // Unknown name falls through to the builtin executors.
+    var echo = try loop.dispatchTool(.{ .id = "2", .name = "shell", .arguments = "{\"command\":\"echo fallback-ok\"}" });
+    defer tool_builtin.freeResult(alloc, &echo);
+    try std.testing.expect(echo.success);
+    try std.testing.expect(std.mem.indexOf(u8, echo.output, "fallback-ok") != null);
+
+    // Context rendering hook works and reports through its own state.
+    const section = try ext.renderContext(ext.ctx, alloc);
+    defer alloc.free(section);
+    try std.testing.expectEqualStrings("## Fake section\nhello", section);
+    try std.testing.expectEqual(@as(usize, 1), fake.renders);
+}
+
+test "loop extensions wiring: plan goal memory skills end to end" {
+    const alloc = std.testing.allocator;
+    var ctx = try cordis.Context.init(alloc);
+    defer ctx.deinit();
+    const io = ctx.io();
+
+    // Boards + working memory.
+    var pb = plan_mod.PlanBoard.init(alloc);
+    defer pb.deinit();
+    var gb = goal_mod.GoalBoard.init(alloc);
+    defer gb.deinit();
+    var wm = mem_working.WorkingMemory.init(alloc);
+    defer wm.deinit();
+
+    // One sample skill.
+    var reg = skill_mod.SkillRegistry.init(alloc);
+    defer reg.deinit();
+    const sample_doc =
+        \\---
+        \\name: debugging
+        \\description: Root-cause playbook
+        \\---
+        \\## Steps
+        \\1. Reproduce
+        \\
+    ;
+    try reg.add(try skill_mod.parseSkillMd(alloc, sample_doc, "/skills/debugging/SKILL.md"));
+
+    // Persistent memory in a fresh dir.
+    const dir = try w1TempDir(alloc, "mem");
+    defer alloc.free(dir);
+    defer std.Io.Dir.deleteTree(.cwd(), io, dir) catch {};
+    var store = try mem_persistent.PersistentStore.init(alloc, dir);
+    defer store.deinit();
+    try store.open(io);
+
+    var lext = main_mod.LoopExtensions{
+        .alloc = alloc,
+        .io = io,
+        .skills = &reg,
+        .memory = &store,
+        .working = &wm,
+        .plan_board = &pb,
+        .goal_board = &gb,
+    };
+    const ext = lext.extensions();
+
+    // plan_set replaces the checklist (markers parsed into statuses).
+    {
+        var r = (try ext.executeTool(ext.ctx, alloc, io, .{
+            .name = "plan_set",
+            .arguments = "{\"tasks\":\"[x] done one\\n[~] working\\nplain pending\\n\\n[!] blocked one\"}",
+        })).?;
+        defer tool_builtin.freeResult(alloc, &r);
+        try std.testing.expect(r.success);
+        try std.testing.expectEqual(@as(usize, 4), pb.count());
+        try std.testing.expectEqual(plan_mod.TaskStatus.done, pb.tasks.items[0].status);
+        try std.testing.expectEqual(plan_mod.TaskStatus.in_progress, pb.tasks.items[1].status);
+        try std.testing.expectEqual(plan_mod.TaskStatus.pending, pb.tasks.items[2].status);
+        try std.testing.expectEqual(plan_mod.TaskStatus.blocked, pb.tasks.items[3].status);
+    }
+
+    // plan_update delegation + plan_add.
+    {
+        var r = (try ext.executeTool(ext.ctx, alloc, io, .{
+            .name = "plan_update",
+            .arguments = "{\"task_id\":2,\"status\":\"done\",\"note\":\"verified\"}",
+        })).?;
+        defer tool_builtin.freeResult(alloc, &r);
+        try std.testing.expect(r.success);
+        try std.testing.expectEqual(plan_mod.TaskStatus.done, pb.tasks.items[1].status);
+
+        var r2 = (try ext.executeTool(ext.ctx, alloc, io, .{
+            .name = "plan_add",
+            .arguments = "{\"text\":\"extra task\"}",
+        })).?;
+        defer tool_builtin.freeResult(alloc, &r2);
+        try std.testing.expect(r2.success);
+        try std.testing.expectEqual(@as(usize, 5), pb.count());
+
+        // Bad args become failed results, not errors.
+        var bad = (try ext.executeTool(ext.ctx, alloc, io, .{
+            .name = "plan_update",
+            .arguments = "{\"task_id\":999,\"status\":\"done\"}",
+        })).?;
+        defer tool_builtin.freeResult(alloc, &bad);
+        try std.testing.expect(!bad.success);
+    }
+
+    // goal_set text mirrors into working memory; status transition works.
+    {
+        var r = (try ext.executeTool(ext.ctx, alloc, io, .{
+            .name = "goal_set",
+            .arguments = "{\"text\":\"ship zharness\"}",
+        })).?;
+        defer tool_builtin.freeResult(alloc, &r);
+        try std.testing.expect(r.success);
+        try std.testing.expectEqualStrings("ship zharness", gb.current().?.text);
+        try std.testing.expectEqualStrings("ship zharness", wm.get("goal").?);
+
+        var r2 = (try ext.executeTool(ext.ctx, alloc, io, .{
+            .name = "goal_set",
+            .arguments = "{\"status\":\"achieved\"}",
+        })).?;
+        defer tool_builtin.freeResult(alloc, &r2);
+        try std.testing.expect(r2.success);
+        try std.testing.expectEqual(goal_mod.Status.achieved, gb.current().?.status);
+
+        var bad = (try ext.executeTool(ext.ctx, alloc, io, .{
+            .name = "goal_set",
+            .arguments = "{}",
+        })).?;
+        defer tool_builtin.freeResult(alloc, &bad);
+        try std.testing.expect(!bad.success);
+    }
+
+    // skill_use returns the body; unknown names fail gracefully.
+    {
+        var r = (try ext.executeTool(ext.ctx, alloc, io, .{
+            .name = "skill_use",
+            .arguments = "{\"name\":\"debugging\"}",
+        })).?;
+        defer tool_builtin.freeResult(alloc, &r);
+        try std.testing.expect(r.success);
+        try std.testing.expect(std.mem.indexOf(u8, r.output, "1. Reproduce") != null);
+
+        var bad = (try ext.executeTool(ext.ctx, alloc, io, .{
+            .name = "skill_use",
+            .arguments = "{\"name\":\"missing\"}",
+        })).?;
+        defer tool_builtin.freeResult(alloc, &bad);
+        try std.testing.expect(!bad.success);
+    }
+
+    // memory_set / memory_get round-trip against the real backing file.
+    {
+        var set = (try ext.executeTool(ext.ctx, alloc, io, .{
+            .name = "memory_set",
+            .arguments = "{\"key\":\"user.color\",\"value\":\"cobalt\"}",
+        })).?;
+        defer tool_builtin.freeResult(alloc, &set);
+        try std.testing.expect(set.success);
+
+        var get = (try ext.executeTool(ext.ctx, alloc, io, .{
+            .name = "memory_get",
+            .arguments = "{\"key\":\"user.color\"}",
+        })).?;
+        defer tool_builtin.freeResult(alloc, &get);
+        try std.testing.expect(get.success);
+        try std.testing.expectEqualStrings("cobalt", get.output);
+
+        var miss = (try ext.executeTool(ext.ctx, alloc, io, .{
+            .name = "memory_get",
+            .arguments = "{\"key\":\"absent.key\"}",
+        })).?;
+        defer tool_builtin.freeResult(alloc, &miss);
+        try std.testing.expect(miss.success);
+        try std.testing.expect(std.mem.indexOf(u8, miss.output, "no value stored") != null);
+
+        var badkey = (try ext.executeTool(ext.ctx, alloc, io, .{
+            .name = "memory_set",
+            .arguments = "{\"key\":\"bad key!\",\"value\":\"v\"}",
+        })).?;
+        defer tool_builtin.freeResult(alloc, &badkey);
+        try std.testing.expect(!badkey.success);
+    }
+
+    // Unhandled names return null so builtin executors take over.
+    try std.testing.expect((try ext.executeTool(ext.ctx, alloc, io, .{
+        .name = "file_read",
+        .arguments = "{}",
+    })) == null);
+
+    // Dynamic context section joins every active subsystem.
+    {
+        const section = try ext.renderContext(ext.ctx, alloc);
+        defer alloc.free(section);
+        try std.testing.expect(std.mem.indexOf(u8, section, "Available skills") != null);
+        try std.testing.expect(std.mem.indexOf(u8, section, "## Current goal [achieved]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, section, "## Plan") != null);
+        try std.testing.expect(std.mem.indexOf(u8, section, "## Working memory") != null);
+        try std.testing.expect(std.mem.indexOf(u8, section, "goal: ship zharness") != null);
+    }
+}
+
+test "registerExtensionTools respects availability flags" {
+    const alloc = std.testing.allocator;
+
+    var full = try tool_reg.ToolRegistry.init(alloc);
+    defer full.deinit();
+    try main_mod.registerExtensionTools(&full, .{ .skills = true, .memory = true });
+    for ([_][]const u8{ "plan_add", "plan_update", "plan_set", "goal_set", "skill_use", "memory_get", "memory_set" }) |n| {
+        try std.testing.expect(full.contains(n));
+    }
+    // Wire schema must be valid JSON-ish: braces balanced overall.
+    const j = try full.buildToolsJson(alloc);
+    defer alloc.free(j);
+    try std.testing.expect(std.mem.indexOf(u8, j, "\"skill_use\"") != null);
+
+    var minimal = try tool_reg.ToolRegistry.init(alloc);
+    defer minimal.deinit();
+    try main_mod.registerExtensionTools(&minimal, .{ .skills = false, .memory = false });
+    try std.testing.expect(!minimal.contains("skill_use"));
+    try std.testing.expect(!minimal.contains("memory_get"));
+    try std.testing.expect(minimal.contains("plan_add"));
 }
 

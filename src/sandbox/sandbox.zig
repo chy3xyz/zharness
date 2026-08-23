@@ -21,8 +21,11 @@
 //!     .process; .off keeps today's direct execution.
 //!   - Result.denied results surface as failed ToolResults with reason.
 //!
-//! Self-contained apart from the shared clib popen helpers; standalone test
-//! via `zig test -lc src/sandbox/sandbox.zig`.
+//! Depends only on std + the shared clib popen helpers. Because of the
+//! `../clib.zig` relative import, this file cannot be compiled as its own
+//! test root (`zig test -lc src/sandbox/sandbox.zig` fails: import outside
+//! module path); run its tests from a src/-level root such as
+//! `src/_t_w1.zig` or `src/tests.zig` instead.
 
 const std = @import("std");
 const clib = @import("../clib.zig");
@@ -117,6 +120,27 @@ pub const Result = struct {
 
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
+/// libc setenv — Zig 0.17's std.c no longer exposes it (used by tests only).
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
+/// libc environ — NULL-terminated `char *[]` of "NAME=value" strings. Needed
+/// for real prefix-family matching (getenv cannot express "ZHARNESS_*").
+extern "c" var environ: [*:null]?[*:0]u8;
+
+const Envar = struct { name: []const u8, value: []const u8 };
+
+/// Return the environ entry at `*index` (advancing past malformed ones), or
+/// null at the end of the array.
+fn environNext(index: *usize) ?Envar {
+    while (true) {
+        const raw = environ[index.*] orelse return null;
+        index.* += 1;
+        const s = std.mem.span(raw);
+        const eq = std.mem.indexOfScalar(u8, s, '=') orelse continue;
+        return .{ .name = s[0..eq], .value = s[eq + 1 ..] };
+    }
+}
+
 /// Execute `command` inside `cwd` under the given policy. Output merges
 /// stdout+stderr and is capped (256KB) like the builtin shell tool.
 pub fn run(
@@ -145,7 +169,13 @@ pub fn run(
     try full.appendSlice(alloc, " && ");
 
     if (policy.level == .process) {
-        // Environment rebuild: env -i + allowlisted assignments.
+        // Environment rebuild + watchdog. The payload runs under a
+        // scrubbed-environment shell:
+        //   cd CWD && env -i ALLOWED... /bin/sh -c 'PAYLOAD'
+        // (env must receive the shell as its command — bare assignments after
+        // env are just its arguments.) The payload backgrounds the user
+        // command and kills it after N seconds; the marker line lets us flag
+        // timeouts.
         try full.appendSlice(alloc, "env -i");
         for (default_env_allowlist) |name_var| {
             const namez = try alloc.dupeSentinel(u8, name_var, 0);
@@ -160,32 +190,36 @@ pub fn run(
             }
         }
         for (policy.env_prefix_allowlist) |prefix| {
-            // Prefix families (ZHARNESS_*) are forwarded when present.
-            const pz = try alloc.dupeSentinel(u8, prefix, 0);
-            defer alloc.free(pz);
-            if (getenv(pz.ptr)) |v| {
-                const val = std.mem.span(v);
-                if (val.len == 0) continue;
+            // Prefix families (ZHARNESS_*) forward every matching environ
+            // entry — getenv cannot express "ZHARNESS_*".
+            var idx: usize = 0;
+            while (environNext(&idx)) |kv| {
+                if (!std.mem.startsWith(u8, kv.name, prefix)) continue;
+                if (kv.value.len == 0) continue;
                 try full.appendSlice(alloc, " ");
-                try full.appendSlice(alloc, prefix);
+                try full.appendSlice(alloc, kv.name);
                 try full.append(alloc, '=');
-                try appendQuoted(alloc, &full, val);
+                try appendQuoted(alloc, &full, kv.value);
             }
         }
-        try full.appendSlice(alloc, " ");
-    }
 
-    if (policy.level == .process) {
-        // Watchdog-wrapped execution. The marker line lets us flag timeouts.
-        try full.appendSlice(alloc, "{ ( ");
-        try full.appendSlice(alloc, command);
-        try full.appendSlice(alloc, " ) 2>&1 & p=$!; ( sleep ");
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(alloc);
+        // Watchdog without orphaned pipe holders: poll the command's liveness
+        // in decisecond steps instead of backgrounding a sleeper (a killed
+        // watcher subshell would leave its `sleep` child holding the popen
+        // pipe, hanging the reader forever). Loop bound = 10 x max_timeout_secs.
+        try payload.appendSlice(alloc, "{ ( ");
+        try payload.appendSlice(alloc, command);
+        try payload.appendSlice(alloc, " ) 2>&1 & p=$!; n=0; limit=");
         var tb: [16]u8 = undefined;
-        const ts = std.fmt.bufPrint(&tb, "{d}", .{policy.max_timeout_secs}) catch "300";
-        try full.appendSlice(alloc, ts);
-        try full.appendSlice(alloc,
-            \\; kill -9 "$p" 2>/dev/null; echo __ZH_SANDBOX_TIMEOUT__ ) & w=$!; wait "$p"; rc=$?; kill "$w" 2>/dev/null; wait "$w" 2>/dev/null; exit $rc; }
+        const ts = std.fmt.bufPrint(&tb, "{d}", .{@as(u64, policy.max_timeout_secs) * 10}) catch "3000";
+        try payload.appendSlice(alloc, ts);
+        try payload.appendSlice(alloc,
+            \\; while [ "$n" -lt "$limit" ] && kill -0 "$p" 2>/dev/null; do sleep 0.1; n=$((n+1)); done; if kill -0 "$p" 2>/dev/null; then kill -9 "$p" 2>/dev/null; echo __ZH_SANDBOX_TIMEOUT__; wait "$p" 2>/dev/null; exit 124; fi; wait "$p"; exit $?; }
         );
+        try full.appendSlice(alloc, " /bin/sh -c ");
+        try appendQuoted(alloc, &full, payload.items);
     } else {
         try full.appendSlice(alloc, "{ ");
         try full.appendSlice(alloc, command);
@@ -299,14 +333,14 @@ test "deny verdict short-circuits without executing" {
 
 test "process level scrubs non-allowlisted environment" {
     const alloc = std.testing.allocator;
-    _ = std.c.setenv("ZHARNESS_SCRATCH_X", "leak-me", 1);
-    _ = std.c.setenv("SANDBOX_CANARY_Z", "secret", 1);
+    _ = setenv("ZHARNESS_SCRATCH_X", "leak-me", 1);
+    _ = setenv("SANDBOX_CANARY_Z", "secret", 1);
 
     // Allowlisted prefix survives.
     var keep = try run(alloc, .{ .level = .process }, "/tmp", "printenv ZHARNESS_SCRATCH_X");
     defer keep.deinit(alloc);
     try std.testing.expect(keep.success);
-    try std.testing.expectEqualStrings("leak-me", keep.output);
+    try std.testing.expectEqualStrings("leak-me", std.mem.trimEnd(u8, keep.output, "\n"));
 
     // Non-allowlisted var does not.
     var drop = try run(alloc, .{ .level = .process }, "/tmp", "printenv SANDBOX_CANARY_Z || echo scrubbed");
@@ -318,12 +352,12 @@ test "process level scrubs non-allowlisted environment" {
     var l0 = try run(alloc, .{ .level = .off }, "/tmp", "printenv SANDBOX_CANARY_Z");
     defer l0.deinit(alloc);
     try std.testing.expect(l0.success);
-    try std.testing.expectEqualStrings("secret", l0.output);
+    try std.testing.expectEqualStrings("secret", std.mem.trimEnd(u8, l0.output, "\n"));
 }
 
 test "watchdog kills hung command" {
     const alloc = std.testing.allocator;
-    var p = Policy{ .level = .process, .max_timeout_secs = 1 };
+    const p = Policy{ .level = .process, .max_timeout_secs = 1 };
     var r = try run(alloc, p, "/tmp", "sleep 30 && echo never");
     defer r.deinit(alloc);
     try std.testing.expect(!r.success);

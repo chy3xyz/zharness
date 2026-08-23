@@ -4,9 +4,22 @@
 //! turn logic is the `AgentLoop`, which drives the model and tools through the
 //! zcordis `Context` — each model request and tool execution is an event so the
 //! runtime stays decoupled from any concrete tool or provider.
+//!
+//! Wiring surface (swarm integration contract):
+//!   - `checkpoints`: optional CheckpointStore (main-owned). The loop saves a
+//!     best-effort transcript snapshot at every turn boundary and after each
+//!     tool batch (dev.md §XVI).
+//!   - `ext`: optional `Extensions` vtable (plain fn pointers). It serves the
+//!     loop-native tools (skills / memory / plan / goal) and re-renders the
+//!     dynamic part of the system prompt (plan checklist, goal, working
+//!     memory, skill index) fresh on every turn.
 
 const std = @import("std");
 const cordis = @import("cordis");
+
+const clib = @import("../clib.zig");
+const config_mod = @import("../config.zig");
+const checkpoint_mod = @import("../session/checkpoint.zig");
 
 const model_mod = @import("../model/model.zig");
 const tool_reg = @import("../tool/registry.zig");
@@ -60,6 +73,27 @@ pub const AgentConfig = struct {
     /// Stream chat completions via SSE when the provider supports it.
     /// Disable for fully buffered turns (`--no-stream`).
     stream: bool = true,
+    /// Shell-tool sandbox level routed into builtin.execute (dev.md §XII).
+    sandbox_mode: config_mod.Config.SandboxMode = .process,
+};
+
+/// Optional extension surface wired by main.zig (plain fn pointers, no
+/// concrete imports — swarm decoupling rule). Lets the loop serve the
+/// loop-native tools (skill_use / memory_* / plan_* / goal_set) from
+/// main-owned state and refresh dynamic system-prompt sections each turn.
+pub const Extensions = struct {
+    ctx: *anyopaque,
+    /// Extra system-prompt text appended after the configured prompt, rendered
+    /// fresh on every turn. Caller frees; "" contributes nothing.
+    renderContext: *const fn (ctx: *anyopaque, alloc: std.mem.Allocator) anyerror![]const u8,
+    /// Try to serve a tool call from extension state. Return `null` when the
+    /// tool name is unknown so the loop falls back to the builtin executors.
+    executeTool: *const fn (
+        ctx: *anyopaque,
+        alloc: std.mem.Allocator,
+        io: std.Io,
+        call: tool_builtin.ToolCall,
+    ) anyerror!?tool_builtin.ToolResult,
 };
 
 /// The driver: a loop that alternates model inference and tool execution.
@@ -72,6 +106,10 @@ pub const AgentLoop = struct {
     cwd: []const u8,
     messages: std.ArrayList(Message),
     on_event: ?*const fn (kind: EventKind, payload: []const u8) void,
+    /// Main-owned checkpoint store; null disables checkpointing.
+    checkpoints: ?*checkpoint_mod.CheckpointStore,
+    /// Loop-native tools + dynamic prompt sections; null when unwired.
+    ext: ?*const Extensions,
 
     pub const EventKind = enum {
         turn_start,
@@ -91,6 +129,8 @@ pub const AgentLoop = struct {
         tools: *tool_reg.ToolRegistry,
         cwd: []const u8,
         on_event: ?*const fn (kind: EventKind, payload: []const u8) void,
+        checkpoints: ?*checkpoint_mod.CheckpointStore,
+        ext: ?*const Extensions,
     ) !AgentLoop {
         return .{
             .alloc = alloc,
@@ -101,6 +141,8 @@ pub const AgentLoop = struct {
             .cwd = cwd,
             .messages = std.ArrayList(Message).empty,
             .on_event = on_event,
+            .checkpoints = checkpoints,
+            .ext = ext,
         };
     }
 
@@ -140,6 +182,27 @@ pub const AgentLoop = struct {
         }
     }
 
+    /// Best-effort transcript snapshot (dev.md §XVI). Filesystem failures are
+    /// swallowed on purpose — checkpointing must never break the agent loop.
+    /// No-op when no store is wired.
+    pub fn saveCheckpoint(self: *AgentLoop, label: []const u8) void {
+        const store = self.checkpoints orelse return;
+        const snap = snapshotMessages(self.alloc, self.messages.items) catch return;
+        defer self.alloc.free(snap);
+        _ = store.save(self.client.io, label, clib.nowTimestamp(), snap) catch {};
+    }
+
+    /// Execute one model-requested tool call: extension-wired tools first
+    /// (skills / memory / plan / goal), then the builtin executors with the
+    /// configured sandbox level.
+    pub fn dispatchTool(self: *AgentLoop, tc: ToolCall) !tool_builtin.ToolResult {
+        const call = tool_builtin.ToolCall{ .name = tc.name, .arguments = tc.arguments };
+        if (self.ext) |e| {
+            if (try e.executeTool(e.ctx, self.alloc, self.client.io, call)) |r| return r;
+        }
+        return tool_builtin.execute(self.alloc, self.client.io, self.cwd, call, self.agent.config.sandbox_mode);
+    }
+
     fn emit(self: *AgentLoop, kind: EventKind, payload: []const u8) void {
         if (self.on_event) |cb| cb(kind, payload);
         // Also surface through the zcordis event bus (dev.md §VIII, §XXXIII).
@@ -167,13 +230,37 @@ pub const AgentLoop = struct {
             turn += 1;
             self.agent.state = .thinking;
             const turn_msg = try std.fmt.allocPrint(self.alloc, "turn {d}", .{turn});
+            defer self.alloc.free(turn_msg);
             self.emit(.turn_start, turn_msg);
-            self.alloc.free(turn_msg);
+
+            // Checkpoint the transcript at the turn boundary (best-effort).
+            self.saveCheckpoint(turn_msg);
+
+            // Effective system prompt = configured base + dynamic sections
+            // (plan checklist, goal, working memory, skill index) rendered
+            // fresh each turn by the wired extensions.
+            var extra_sections: ?[]const u8 = null;
+            defer if (extra_sections) |e| self.alloc.free(e);
+            if (self.ext) |e| {
+                extra_sections = e.renderContext(e.ctx, self.alloc) catch null;
+            }
+            var sys_owned: ?[]const u8 = null;
+            defer if (sys_owned) |s| self.alloc.free(s);
+            if (extra_sections) |extra| {
+                if (extra.len > 0) {
+                    sys_owned = try std.fmt.allocPrint(
+                        self.alloc,
+                        "{s}\n\n{s}",
+                        .{ self.agent.config.system_prompt, extra },
+                    );
+                }
+            }
+            const system_prompt = sys_owned orelse self.agent.config.system_prompt;
 
             const req = model_mod.ChatRequest{
                 .messages = self.messages.items,
                 .tools_json = tools_json,
-                .system_prompt = self.agent.config.system_prompt,
+                .system_prompt = system_prompt,
                 .reasoning_effort = self.agent.config.reasoning_effort orelse null,
                 .stream = self.agent.config.stream,
             };
@@ -226,11 +313,11 @@ pub const AgentLoop = struct {
                 self.emit(.tool_call, tc_msg);
                 self.alloc.free(tc_msg);
 
-                const call = tool_builtin.ToolCall{ .name = tc.name, .arguments = tc.arguments };
-                var result = tool_builtin.execute(self.alloc, self.client.io, self.cwd, call) catch |e| tool_builtin.ToolResult{
+                var result = self.dispatchTool(tc) catch |e| tool_builtin.ToolResult{
                     .success = false,
+                    // freeResult frees both slices; keep them heap-owned.
                     .output = "",
-                    .err_msg = @errorName(e),
+                    .err_msg = try self.alloc.dupe(u8, @errorName(e)),
                 };
                 self.emit(.tool_result, result.output);
                 defer tool_builtin.freeResult(self.alloc, &result);
@@ -243,6 +330,13 @@ pub const AgentLoop = struct {
                 };
                 try self.messages.append(self.alloc, tool_msg);
             }
+
+            // Checkpoint after the tool batch so a crash mid-run never loses
+            // executed work (best-effort).
+            const post_label = try std.fmt.allocPrint(self.alloc, "turn {d} post-tools", .{turn});
+            defer self.alloc.free(post_label);
+            self.saveCheckpoint(post_label);
+
             self.agent.state = .observing;
         }
 
@@ -264,6 +358,26 @@ fn describeModelError(alloc: std.mem.Allocator, client: *const ChatClient, e: an
         error.MalformedResponse => try alloc.dupe(u8, "provider returned a response zharness could not parse"),
         else => try std.fmt.allocPrint(alloc, "model error: {s}", .{@errorName(e)}),
     };
+}
+
+/// Map loop messages into checkpoint snapshots (trivial shape copy; the
+/// Role enums are tag-compatible but kept explicit).
+fn snapshotMessages(alloc: std.mem.Allocator, messages: []const Message) ![]checkpoint_mod.SnapshotMessage {
+    const out = try alloc.alloc(checkpoint_mod.SnapshotMessage, messages.len);
+    for (messages, 0..) |m, i| {
+        out[i] = .{
+            .role = switch (m.role) {
+                .system => .system,
+                .user => .user,
+                .assistant => .assistant,
+                .tool => .tool,
+            },
+            .content = m.content,
+            .tool_call_id = m.tool_call_id,
+            .tool_calls_json = m.tool_calls_json,
+        };
+    }
+    return out;
 }
 
 fn tool_mod_echo(alloc: std.mem.Allocator, resp: ChatResponse) ![]const u8 {

@@ -91,7 +91,16 @@ pub fn createPrivateTemp(alloc: std.mem.Allocator, prefix: []const u8) !?[:0]u8 
         return null;
     }
     _ = close(fd);
-    return path; // ownership of buf's allocation moves to the caller
+    // Copy into an exact-size allocation before returning: `path` above is a
+    // view into buf's over-capacity buffer, and callers free() the returned
+    // slice by its own length — that mismatches the backing allocation and
+    // trips the DebugAllocator ("Invalid free"). An exact-size sentinel alloc
+    // keeps alloc/free symmetric.
+    const out = try alloc.allocSentinel(u8, buf.items.len - 1, 0);
+    errdefer alloc.free(out);
+    @memcpy(out, buf.items[0 .. buf.items.len - 1]);
+    buf.deinit(alloc);
+    return out;
 }
 
 /// Best-effort unlink; errors ignored (file may already be gone).
