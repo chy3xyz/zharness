@@ -16,6 +16,11 @@ const tool_builtin = @import("tool/builtin.zig");
 const agent = @import("agent/agent.zig");
 const session = @import("session/session.zig");
 
+comptime {
+    // Pull in the CLI flag parser so its inline tests join the suite.
+    _ = @import("cli_flags.zig");
+}
+
 test "config load defaults" {
     const alloc = std.testing.allocator;
     var cfg = try config.load(alloc);

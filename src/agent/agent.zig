@@ -57,6 +57,9 @@ pub const AgentConfig = struct {
     system_prompt: []const u8,
     max_turns: usize,
     reasoning_effort: ?[]const u8 = null,
+    /// Stream chat completions via SSE when the provider supports it.
+    /// Disable for fully buffered turns (`--no-stream`).
+    stream: bool = true,
 };
 
 /// The driver: a loop that alternates model inference and tool execution.
@@ -172,22 +175,27 @@ pub const AgentLoop = struct {
                 .tools_json = tools_json,
                 .system_prompt = self.agent.config.system_prompt,
                 .reasoning_effort = self.agent.config.reasoning_effort orelse null,
-                .stream = false,
+                .stream = self.agent.config.stream,
             };
 
             var resp = self.client.chat(req) catch |e| {
                 self.agent.state = .failed;
-                const msg = try std.fmt.allocPrint(self.alloc, "model error: {s}", .{@errorName(e)});
+                const msg = try describeModelError(self.alloc, &self.client, e);
                 self.emit(.err, msg);
                 return msg;
             };
             defer resp.deinit(self.alloc);
 
-            if (resp.reasoning.len > 0) {
+            // When the transport streamed live deltas through a wired sink,
+            // the user already watched this content arrive — don't reprint it.
+            // With no sink wired, fall back to emitting whole messages here so
+            // event consumers never lose output.
+            const streamed_live = req.stream and self.client.stream_sink != null;
+            if (resp.reasoning.len > 0 and !streamed_live) {
                 self.emit(.thinking, resp.reasoning);
             }
 
-            if (resp.content.len > 0) {
+            if (resp.content.len > 0 and !streamed_live) {
                 self.emit(.text, resp.content);
             }
 
@@ -243,6 +251,20 @@ pub const AgentLoop = struct {
         return final_answer;
     }
 };
+
+/// Map a chat failure into a user-facing message. When the client captured a
+/// provider detail (e.g. the envelope's error.message), lead with that instead
+/// of a bare errno-style name.
+fn describeModelError(alloc: std.mem.Allocator, client: *const ChatClient, e: anyerror) ![]const u8 {
+    const detail = client.lastError();
+    if (detail.len > 0) return std.fmt.allocPrint(alloc, "model request failed: {s}", .{detail});
+    return switch (e) {
+        error.HttpError => try alloc.dupe(u8, "model request failed (network/HTTP). Check endpoint, API key and connectivity."),
+        error.BodyTooLarge => try alloc.dupe(u8, "provider response exceeded the size limit"),
+        error.MalformedResponse => try alloc.dupe(u8, "provider returned a response zharness could not parse"),
+        else => try std.fmt.allocPrint(alloc, "model error: {s}", .{@errorName(e)}),
+    };
+}
 
 fn tool_mod_echo(alloc: std.mem.Allocator, resp: ChatResponse) ![]const u8 {
     // Reconstruct the tool_calls array to echo. We need the raw JSON that the

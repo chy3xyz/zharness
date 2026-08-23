@@ -2,6 +2,7 @@ const std = @import("std");
 const clib = @import("clib.zig");
 const cordis = @import("cordis");
 
+const cli_flags = @import("cli_flags.zig");
 const config = @import("config.zig");
 const model = @import("model/model.zig");
 const tool_reg = @import("tool/registry.zig");
@@ -29,6 +30,15 @@ fn onEvent(kind: agent.AgentLoop.EventKind, payload: []const u8) void {
     }
 }
 
+/// Live-delta sink for streamed chat completions: text prints as it arrives;
+/// reasoning prints dimmed so it reads as scaffolding, not the answer.
+fn onStreamDelta(kind: model.StreamKind, delta: []const u8) void {
+    switch (kind) {
+        .text => std.debug.print("{s}", .{delta}),
+        .reasoning => std.debug.print("\x1b[2m{s}\x1b[0m", .{delta}),
+    }
+}
+
 fn printUsage() void {
     std.debug.print(
         \\zharness - a native coding-agent harness
@@ -48,37 +58,6 @@ fn printUsage() void {
     , .{});
 }
 
-fn parseFlags(
-    args: [][:0]u8,
-    start: usize,
-    model_opt: *?[]const u8,
-    provider_opt: *?[]const u8,
-    no_stream: *bool,
-) !?[]const u8 {
-    var i = start;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (std.mem.eql(u8, a, "--model")) {
-            i += 1;
-            if (i >= args.len) return error.MissingModelValue;
-            model_opt.* = args[i];
-        } else if (std.mem.eql(u8, a, "--provider")) {
-            i += 1;
-            if (i >= args.len) return error.MissingProviderValue;
-            provider_opt.* = args[i];
-        } else if (std.mem.eql(u8, a, "--no-stream")) {
-            no_stream.* = true;
-        } else if (std.mem.startsWith(u8, a, "--")) {
-            std.debug.print("unknown flag: {s}\n", .{a});
-            return error.UnknownFlag;
-        } else {
-            // first positional after the subcommand is the prompt
-            return a;
-        }
-    }
-    return null;
-}
-
 fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config) !struct {
     ctx: *cordis.Context,
     tools: *tool_reg.ToolRegistry,
@@ -94,7 +73,10 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config) !struct {
     tools.* = try tool_reg.ToolRegistry.init(alloc);
     try tool_reg.registerBuiltins(tools);
 
-    const client = model.ChatClient.init(alloc, ctx.io(), cfg.endpoint, cfg.model, cfg.api_key);
+    // Streamed deltas print live; wire the sink before the client value is
+    // copied into the agent loop.
+    var client = model.ChatClient.init(alloc, ctx.io(), cfg.endpoint, cfg.model, cfg.api_key);
+    client.stream_sink = onStreamDelta;
 
     // Heap-allocate the config so the pointer `Agent` holds stays valid after
     // buildLoop returns (a stack-local would dangle and corrupt system_prompt).
@@ -104,6 +86,7 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config) !struct {
         .system_prompt = SYSTEM_PROMPT,
         .max_turns = cfg.max_turns,
         .reasoning_effort = cfg.reasoning_effort,
+        .stream = cfg.stream,
     };
     const ag = try agent.Agent.init(alloc, ctx.root, acfg);
 
@@ -276,43 +259,18 @@ pub fn main(init: std.process.Init) !void {
             printUsage();
             std.process.exit(1);
         }
-        // flags may appear before/after the prompt; parse the remainder
-        var model_opt: ?[]const u8 = null;
-        var provider_opt: ?[]const u8 = null;
-        var no_stream = false;
-        var session_id: ?[]const u8 = null;
-
-        var prompt: ?[]const u8 = null;
-        var i: usize = 2;
-        while (i < args.len) : (i += 1) {
-            const a = args[i];
-            if (std.mem.eql(u8, a, "--model")) {
-                i += 1;
-                if (i >= args.len) {
-                    std.debug.print("error: --model requires a value\n", .{});
-                    std.process.exit(1);
-                }
-                model_opt = args[i];
-            } else if (std.mem.eql(u8, a, "--provider")) {
-                i += 1;
-                if (i >= args.len) {
-                    std.debug.print("error: --provider requires a value\n", .{});
-                    std.process.exit(1);
-                }
-                provider_opt = args[i];
-            } else if (std.mem.eql(u8, a, "--no-stream")) {
-                no_stream = true;
-            } else if (std.mem.eql(u8, a, "--session")) {
-                i += 1;
-                if (i >= args.len) {
-                    std.debug.print("error: --session requires a value\n", .{});
-                    std.process.exit(1);
-                }
-                session_id = args[i];
-            } else {
-                prompt = a;
-            }
-        }
+        // flags may appear before/after the prompt; one strict parser for all
+        // subcommands (missing flag values are hard errors everywhere).
+        const flags = cli_flags.parseSubFlags(args[2..], 1) catch |e| {
+            std.debug.print("error: invalid flags ({s}).\n", .{@errorName(e)});
+            printUsage();
+            std.process.exit(1);
+        };
+        const model_opt = flags.model;
+        const provider_opt = flags.provider;
+        const no_stream = flags.no_stream;
+        const session_id = flags.session_id;
+        const prompt: ?[]const u8 = flags.prompt;
 
         if (prompt == null) {
             std.debug.print("error: 'run' requires a prompt argument.\n", .{});
@@ -332,32 +290,24 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
 
-        try runTask(alloc, &cfg, prompt.?, session_id);
+        runTask(alloc, &cfg, prompt.?, session_id) catch |e| {
+            std.debug.print("error: {s}\n", .{@errorName(e)});
+            std.process.exit(1);
+        };
         return;
     }
 
     if (std.mem.eql(u8, sub, "chat")) {
-        // chat honors flags too
-        var model_opt: ?[]const u8 = null;
-        var provider_opt: ?[]const u8 = null;
-        var no_stream = false;
-        var session_id: ?[]const u8 = null;
-        var i: usize = 2;
-        while (i < args.len) : (i += 1) {
-            const a = args[i];
-            if (std.mem.eql(u8, a, "--model")) {
-                i += 1;
-                if (i < args.len) model_opt = args[i];
-            } else if (std.mem.eql(u8, a, "--provider")) {
-                i += 1;
-                if (i < args.len) provider_opt = args[i];
-            } else if (std.mem.eql(u8, a, "--no-stream")) {
-                no_stream = true;
-            } else if (std.mem.eql(u8, a, "--session")) {
-                i += 1;
-                if (i < args.len) session_id = args[i];
-            }
-        }
+        // chat honors the same strict flag set; positionals are not accepted.
+        const flags = cli_flags.parseSubFlags(args[2..], 0) catch |e| {
+            std.debug.print("error: invalid flags ({s}).\n", .{@errorName(e)});
+            printUsage();
+            std.process.exit(1);
+        };
+        const model_opt = flags.model;
+        const provider_opt = flags.provider;
+        const no_stream = flags.no_stream;
+        const session_id = flags.session_id;
 
         var cfg = try config.load(alloc);
         defer cfg.deinit();
@@ -371,7 +321,10 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
 
-        try chatLoop(alloc, &cfg, session_id);
+        chatLoop(alloc, &cfg, session_id) catch |e| {
+            std.debug.print("error: {s}\n", .{@errorName(e)});
+            std.process.exit(1);
+        };
         return;
     }
 

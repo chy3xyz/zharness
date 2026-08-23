@@ -64,3 +64,56 @@ pub fn popenRead(command_z: [*:0]const u8) ?*FILE {
 pub fn pclosePipe(stream: *FILE) c_int {
     return pclose(stream);
 }
+
+// ── private temp files (security hardening) ────────────────────────────────
+
+extern fn mkstemp(template: [*:0]u8) c_int;
+extern fn close(fd: c_int) c_int;
+extern fn unlink(path: [*:0]const u8) c_int;
+
+/// Create a private (mode 0600, mkstemp(3)) temp file under $TMPDIR (or
+/// /tmp). Returns the NUL-terminated path allocated with `alloc`; the caller
+/// owns it and must `unlinkPath` it when done. Returns null when mkstemp
+/// fails (errno-based; callers surface their own error).
+pub fn createPrivateTemp(alloc: std.mem.Allocator, prefix: []const u8) !?[:0]u8 {
+    const td = std.c.getenv("TMPDIR");
+    const tmpdir: []const u8 = if (td) |p| std.mem.span(p) else "/tmp";
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.appendSlice(alloc, tmpdir);
+    if (tmpdir.len == 0 or tmpdir[tmpdir.len - 1] != '/') try buf.append(alloc, '/');
+    try buf.appendSlice(alloc, prefix);
+    try buf.appendSlice(alloc, "XXXXXX");
+    try buf.append(alloc, 0); // sentinel; not part of the template passed below
+    const path: [:0]u8 = buf.items[0 .. buf.items.len - 1 :0];
+    const fd = mkstemp(path.ptr); // mutates the XXXXXX suffix in place
+    if (fd < 0) {
+        buf.deinit(alloc);
+        return null;
+    }
+    _ = close(fd);
+    return path; // ownership of buf's allocation moves to the caller
+}
+
+/// Best-effort unlink; errors ignored (file may already be gone).
+pub fn unlinkPath(path: [:0]const u8) void {
+    _ = unlink(path.ptr);
+}
+
+// ── atomic persistence ──────────────────────────────────────────────────────
+
+extern fn rename(old_path: [*:0]const u8, new_path: [*:0]const u8) c_int;
+
+/// Rename `old_path` to `new_path` (POSIX atomic on same filesystem).
+/// Returns false when the syscall fails.
+pub fn renamePath(old_path: []const u8, new_path: []const u8) bool {
+    var oz: [4096:0]u8 = undefined;
+    var nz: [4096:0]u8 = undefined;
+    if (old_path.len >= oz.len or new_path.len >= nz.len) return false;
+    @memcpy(oz[0..old_path.len], old_path);
+    oz[old_path.len] = 0;
+    @memcpy(nz[0..new_path.len], new_path);
+    nz[new_path.len] = 0;
+    // Explicit-end sentinel slices: validates the NUL we just wrote at len,
+    // not the (undefined) tail of the buffer.
+    return rename(oz[0..old_path.len :0].ptr, nz[0..new_path.len :0].ptr) == 0;
+}

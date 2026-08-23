@@ -147,10 +147,10 @@ pub fn registerBuiltins(reg: *ToolRegistry) !void {
     });
     try reg.register(.{
         .name = "grep",
-        .description = "Search file contents for a regex pattern. Returns matching lines with file paths.",
+        .description = "Search file contents for a text pattern (case-sensitive substring match by default). Returns matching lines with file paths.",
         .category = .search,
         .parameters_json =
-        \\{"type":"object","properties":{"pattern":{"type":"string","description":"Regex pattern"},"path":{"type":"string","description":"Directory or file to search"},"ignore_case":{"type":"boolean","description":"Case-insensitive match"}},"required":["pattern"]}
+        \\{"type":"object","properties":{"pattern":{"type":"string","description":"Text pattern to search for"},"path":{"type":"string","description":"Directory or file to search"},"ignore_case":{"type":"boolean","description":"Case-insensitive match"}},"required":["pattern"]}
         ,
     });
     try reg.register(.{

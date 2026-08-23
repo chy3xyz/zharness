@@ -93,6 +93,17 @@ pub fn load(alloc: std.mem.Allocator) !Config {
         }
     }
 
+    // Endpoint override (testability + self-hosted gateways): applied after
+    // provider defaults so an explicit ZHARNESS_ENDPOINT always wins there.
+    // An explicit --provider later still resets it (documented precedence).
+    if (std.c.getenv("ZHARNESS_ENDPOINT")) |p| {
+        const env_ep = std.mem.span(p);
+        if (env_ep.len > 0) {
+            alloc.free(cfg.endpoint);
+            cfg.endpoint = try alloc.dupe(u8, env_ep);
+        }
+    }
+
     return cfg;
 }
 

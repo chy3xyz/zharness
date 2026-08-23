@@ -41,6 +41,21 @@ fn isInsideWorkspace(resolved: []const u8, cwd: []const u8) bool {
     return false;
 }
 
+/// Append `s` single-quoted for /bin/sh consumption ('\'' escaping). Used for
+/// the `cd <cwd>` prefix and argv words so spaces and quotes in paths or
+/// commit messages cannot break (or inject into) the command line.
+fn appendQuoted(alloc: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+    try out.append(alloc, '\'');
+    for (s) |ch| {
+        if (ch == '\'') {
+            try out.appendSlice(alloc, "'\\''");
+        } else {
+            try out.append(alloc, ch);
+        }
+    }
+    try out.append(alloc, '\'');
+}
+
 /// Decode the simple JSON string escapes (\", \\, \n, \t, \r) found inside
 /// `raw` (a slice without surrounding quotes) into a freshly allocated slice.
 fn unescapeJson(alloc: std.mem.Allocator, raw: []const u8) ![]const u8 {
@@ -428,7 +443,7 @@ fn shell(alloc: std.mem.Allocator, cwd: []const u8, call: ToolCall) !ToolResult 
     var full = try std.ArrayList(u8).initCapacity(alloc, 0);
     defer full.deinit(alloc);
     try full.appendSlice(alloc, "cd ");
-    try full.appendSlice(alloc, cwd);
+    try appendQuoted(alloc, &full, cwd);
     try full.appendSlice(alloc, " && ");
     try full.appendSlice(alloc, cmd);
     try full.appendSlice(alloc, " 2>&1");
@@ -515,13 +530,11 @@ fn runArgv(alloc: std.mem.Allocator, cwd: []const u8, argv: []const []const u8) 
     var cmd = try std.ArrayList(u8).initCapacity(alloc, 0);
     defer cmd.deinit(alloc);
     try cmd.appendSlice(alloc, "cd ");
-    try cmd.appendSlice(alloc, cwd);
+    try appendQuoted(alloc, &cmd, cwd);
     try cmd.appendSlice(alloc, " && ");
     for (argv, 0..) |arg, i| {
         if (i > 0) try cmd.append(alloc, ' ');
-        try cmd.append(alloc, '\'');
-        try cmd.appendSlice(alloc, arg);
-        try cmd.append(alloc, '\'');
+        try appendQuoted(alloc, &cmd, arg);
     }
     try cmd.appendSlice(alloc, " 2>&1");
     const cmd_z = try alloc.dupeSentinel(u8, cmd.items, 0);
@@ -559,6 +572,26 @@ test "shell echo" {
     defer freeResult(alloc, &res);
     try std.testing.expect(res.success);
     try std.testing.expect(std.mem.indexOf(u8, res.output, "hello") != null);
+}
+
+// Regression: `cd <cwd> && cmd` used to interpolate cwd unquoted, so any
+// workspace path containing spaces broke the command (or worse).
+test "shell runs in workspace whose path contains spaces" {
+    const alloc = std.testing.allocator;
+    const dir = "/tmp/zharness space dir";
+    ensureDir(alloc, dir);
+    defer {
+        var dz: [64:0]u8 = undefined;
+        if (dir.len < dz.len) {
+            @memcpy(dz[0..dir.len], dir);
+            dz[dir.len] = 0;
+            _ = std.c.rmdir(&dz);
+        }
+    }
+    var res = try shell(alloc, dir, .{ .name = "shell", .arguments = "{\"command\":\"pwd\"}" });
+    defer freeResult(alloc, &res);
+    try std.testing.expect(res.success);
+    try std.testing.expect(std.mem.indexOf(u8, res.output, dir) != null);
 }
 
 test "glob matches zig files" {

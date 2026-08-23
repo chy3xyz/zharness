@@ -130,7 +130,20 @@ pub const Session = struct {
         const out = try buf.toOwnedSlice(self.alloc);
         defer self.alloc.free(out);
 
-        try std.Io.Dir.writeFile(.cwd(), io, .{ .sub_path = path, .data = out });
+        // Atomic persist: write "<path>.tmp" then rename over the target, so
+        // a crash mid-write can never corrupt an existing transcript.
+        const tmp_path = try std.fmt.allocPrint(self.alloc, "{s}.tmp", .{path});
+        defer self.alloc.free(tmp_path);
+        const tmp_z = try self.alloc.dupeSentinel(u8, tmp_path, 0);
+        defer self.alloc.free(tmp_z);
+        std.Io.Dir.writeFile(.cwd(), io, .{ .sub_path = tmp_path, .data = out }) catch |e| {
+            clib.unlinkPath(tmp_z);
+            return e;
+        };
+        if (!clib.renamePath(tmp_path, path)) {
+            clib.unlinkPath(tmp_z);
+            return error.WriteFailed;
+        }
     }
 
     pub fn load(self: *Session, io: std.Io, path: []const u8) !void {
@@ -144,11 +157,24 @@ pub const Session = struct {
         var it = JsonArrayIter.init(raw);
         while (it.next()) |obj| {
             const role = parseRole(obj.get("role") orelse "") orelse .user;
-            const content = try self.alloc.dupe(u8, obj.getUnescaped("content") orelse "");
-            const tcid_raw = obj.get("tool_call_id");
-            const tcalls_raw = obj.get("tool_calls_json");
-            const tool_call_id = if (tcid_raw) |v| try self.alloc.dupe(u8, try obj.unescape(v)) else null;
-            const tool_calls_json = if (tcalls_raw) |v| try self.alloc.dupe(u8, try obj.unescape(v)) else null;
+            // Decode escapes straight into the session allocator. The old
+            // Obj.unescape allocated with page_allocator and every temp was
+            // leaked on each load of an escaped field.
+            const content: []const u8 = if (obj.get("content")) |v|
+                try unescapeJson(self.alloc, v)
+            else
+                try self.alloc.dupe(u8, "");
+            errdefer self.alloc.free(content);
+            const tool_call_id: ?[]const u8 = if (obj.get("tool_call_id")) |v|
+                try unescapeJson(self.alloc, v)
+            else
+                null;
+            errdefer if (tool_call_id) |t| self.alloc.free(t);
+            const tool_calls_json: ?[]const u8 = if (obj.get("tool_calls_json")) |v|
+                try unescapeJson(self.alloc, v)
+            else
+                null;
+            errdefer if (tool_calls_json) |t| self.alloc.free(t);
             try self.messages.append(self.alloc, model_mod.Message{
                 .role = role,
                 .content = content,
@@ -156,6 +182,30 @@ pub const Session = struct {
                 .tool_calls_json = tool_calls_json,
             });
         }
+    }
+
+    /// Decode the simple JSON string escapes zharness emits (\" \\ \n \r \t)
+    /// into a fresh allocation owned by `alloc`.
+    pub fn unescapeJson(alloc: std.mem.Allocator, input: []const u8) ![]const u8 {
+        var out = try std.ArrayList(u8).initCapacity(alloc, 0);
+        errdefer out.deinit(alloc);
+        var i: usize = 0;
+        while (i < input.len) : (i += 1) {
+            if (input[i] == '\\' and i + 1 < input.len) {
+                i += 1;
+                switch (input[i]) {
+                    '"' => try out.append(alloc, '"'),
+                    '\\' => try out.append(alloc, '\\'),
+                    'n' => try out.append(alloc, '\n'),
+                    'r' => try out.append(alloc, '\r'),
+                    't' => try out.append(alloc, '\t'),
+                    else => try out.append(alloc, input[i]),
+                }
+            } else {
+                try out.append(alloc, input[i]);
+            }
+        }
+        return out.toOwnedSlice(alloc);
     }
 
     // ---- small JSON helpers (no library) -------------------------------
@@ -228,34 +278,6 @@ const Obj = struct {
         }
         return self.text[vs..j];
     }
-
-    fn getUnescaped(self: Obj, field: []const u8) ?[]const u8 {
-        const raw = self.get(field) orelse return null;
-        return self.unescape(raw) catch null;
-    }
-
-    fn unescape(self: Obj, input: []const u8) ![]const u8 {
-        _ = self;
-        var out = try std.ArrayList(u8).initCapacity(std.heap.page_allocator, 0);
-        errdefer out.deinit(std.heap.page_allocator);
-        var i: usize = 0;
-        while (i < input.len) : (i += 1) {
-            if (input[i] == '\\' and i + 1 < input.len) {
-                i += 1;
-                switch (input[i]) {
-                    '"' => try out.append(std.heap.page_allocator, '"'),
-                    '\\' => try out.append(std.heap.page_allocator, '\\'),
-                    'n' => try out.append(std.heap.page_allocator, '\n'),
-                    'r' => try out.append(std.heap.page_allocator, '\r'),
-                    't' => try out.append(std.heap.page_allocator, '\t'),
-                    else => try out.append(std.heap.page_allocator, input[i]),
-                }
-            } else {
-                try out.append(std.heap.page_allocator, input[i]);
-            }
-        }
-        return try out.toOwnedSlice(std.heap.page_allocator);
-    }
 };
 
 fn findMatchingBrace(json: []const u8, start: usize) ?usize {
@@ -308,4 +330,33 @@ test "session add and roundtrip" {
     try std.testing.expectEqual(model_mod.Role.tool, s2.messages.items[2].role);
     try std.testing.expectEqualStrings("1", s2.messages.items[2].tool_call_id.?);
     try std.testing.expectEqualStrings("{\"id\":\"1\",\"name\":\"shell\"}", s2.messages.items[1].tool_calls_json.?);
+}
+
+// Characterization baseline: quotes and newlines in message content must
+// round-trip through save/load unchanged. This pins current observable
+// behavior BEFORE the unescape-allocation refactor so the refactor can be
+// verified behavior-neutral.
+test "session roundtrip preserves quotes and newlines" {
+    const alloc = std.testing.allocator;
+    var ctx = try cordis.Context.init(alloc);
+    defer ctx.deinit();
+    const io = ctx.io();
+    const path = "/tmp/zharness_escape_test.json";
+    defer std.Io.Dir.deleteFile(.cwd(), io, path) catch {};
+
+    var s1 = try Session.init(alloc, "esc");
+    defer s1.deinit();
+    try s1.addUser("line1\nline2 with \"quotes\" and backslash \\ here");
+    try s1.addAssistant("done", null);
+    try s1.save(io, path);
+
+    var s2 = try Session.init(alloc, "esc");
+    defer s2.deinit();
+    try s2.load(io, path);
+
+    try std.testing.expectEqual(@as(usize, 2), s2.count());
+    try std.testing.expectEqualStrings(
+        "line1\nline2 with \"quotes\" and backslash \\ here",
+        s2.messages.items[0].content,
+    );
 }
