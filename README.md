@@ -116,6 +116,27 @@ zharness chat --session notes      # resume / persist a named session
 Reserved per the design spec (dev.md §XXIII). Currently prints a notice and
 exits.
 
+## Web UI (vendored DeepSeek Harness client)
+
+`zharness serve` ships the full **deepseek-harness web GUI** (React,
+vendored under `webui/dsh/` — MIT, see `THIRD-PARTY_NOTICES.md`):
+
+```bash
+zharness serve --port 3080
+open http://127.0.0.1:3080        # dsh GUI: sessions sidebar, streaming chat
+```
+
+The GUI speaks the upstream `/api` RPC protocol (unary POST + two
+WebSocket event streams), implemented natively in Zig by
+`src/server/apiproxy/`. The protocol surface is the minimal chat subset —
+sessions, history, prompt streaming, health; settings/subagents/goals
+degrade gracefully per upstream's own missing-feature rules. A legacy
+minimal JSON API (`POST /run`, `GET /sessions`, `/healthz`, `/events`)
+remains available on the same port for scripts.
+
+Rebuild the frontend: `webui/BUILD.md`. Design-token reuse map:
+`docs/web.md`. Protocol spec: `docs/dsh-reuse-spec.md`.
+
 ## Sessions
 
 Conversations can be persisted and resumed with `--session <id>`. The
