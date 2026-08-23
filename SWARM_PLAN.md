@@ -189,3 +189,89 @@ After all agents report done:
 Remaining ≤5% (explicitly out of scope now): L2 WASM sandbox (needs zcordis
 wasm runtime exposure), production hardening/fuzz, real browser UI (per
 dev.md §XXII UI lives outside zharness; serve API is our contract surface).
+
+---
+
+# Wave 4 — close the final 5% (+ Web UI)
+
+Same ground rules as above. Ownership this round:
+
+| Agent | Owns (exclusive) |
+|-------|------------------|
+| H-wasm | `sandbox/wasm.zig`, `pluginabi/wasm_loader.zig`, `_t_wasm.zig` |
+| I-sse | `server/events.zig`, `server/api.zig`, `obs.zig` (additive only), `_t_sse.zig` |
+| J-fuzz | `fuzz/*.zig`, `_t_fuzz.zig`; bug-fix reports for other files |
+| K-webui | `web/**`, `docs/web.md`, `server/static.zig`, `_t_static.zig` |
+
+Integrator keeps: `main.zig`, `agent/agent.zig`, `tests.zig`, `builtin.zig`,
+`config.zig`, `model/model.zig`.
+
+## Task specs
+
+### H-wasm — L2 WASM sandbox (dev.md §XII)
+Kernel: `../zcordis/src/abi/wasm.zig` (`Module.load`, `Instance` w/
+`step_budget` + `setStepBudget`, `callExport(name, []const i64) !i64`,
+host memory access). Build the WASM twin of pluginabi/capi:
+- `pluginabi/wasm_loader.zig`: load `.wasm` files from
+  `~/.zharness/plugins-wasm` + workspace `plugins-wasm/`. WASM ABI v1
+  (documented in-file): required exports `memory`, `zh_abi_version() -> i64`
+  (== 1), `zh_manifest() -> i64` (packed ptr<<32|len into linear memory,
+  UTF-8 JSON identical shape to the C ABI manifest), `zh_tool_call(name_ptr:
+  i64, name_len: i64, args_ptr: i64, args_len: i64) -> i64` (same packing;
+  result JSON written by the module INTO its own memory before returning).
+  Host reads results through the `memory` export. NULL-equivalent (len==0)
+  means failure.
+- `sandbox/wasm.zig`: hardening wrapper — per-instance step budget
+  (default 10M), memory growth cap, fuel/gas style deadline check, deny
+  imports beyond a minimal allowlist (`env.*` none or whitelisted fns),
+  malformed module -> clean error never crash.
+- Loader projects tools into registry naming `w_<module>_<tool>`.
+- Tests: hand-assembled minimal wasm modules (see zcordis abi tests for
+  byte-level module fixtures you can copy) covering: happy call, bad version,
+  truncated module, budget exhaustion, oversized memory request.
+
+### I-sse — live event feed on /events (dev.md §XXX)
+- `server/events.zig`: broadcast hub — subscribe(handle) -> ring buffer of
+  last N envelopes + live tail; publish(envelope_json); bounded queue,
+  slow-subscriber drop policy (oldest-first), thread-safe if httpd runs
+  threaded_connections, else document single-thread contract.
+- `obs.zig`: ADDITIVE — optional fan-out hook (fn pointer set post-init);
+  existing pub API must not break (main.zig calls emitAt already).
+- `server/api.zig`: replace the /events heartbeat stub: when the hub is
+  installed (module-level install fn), stream real envelopes as SSE `data:`
+  lines; fall back to heartbeats when no hub. Keep ServerDeps unchanged.
+- Contract for integrator: one `events.hub.publish` call inside main's
+  obsEmit path (I will wire it).
+
+### J-fuzz — production hardening (dev.md §XXXIV-adjacent)
+- `fuzz/`: corpus-driven robustness suites over every parser surface:
+  model JSON helpers (findMatchingBrace/escape/unescape), jsonrpc codec,
+  mcp framing, httpd request parsing, workflow parser, skill front-matter,
+  sse parser, checkpoint/session loaders, pluginabi manifest parser,
+  events envelope parser.
+  Method: structured mutators over seed corpora checked into `fuzz/corpus/`;
+  each case must error cleanly or round-trip, NEVER crash/leak/hang (guard
+  with iteration caps). If std.testing.fuzz is available and stable on this
+  toolchain add entry points behind a build option; suite must stay green
+  without fuzzing enabled.
+- Any bug found in another agent's file: MINIMAL fix allowed ONLY in files
+  outside {H,I,K} owned sets this round; otherwise file a report entry.
+
+### K-webui — Web UI reusing deepseek-harness design language
+Recon verdict (integrator-verified): `_ref/deepseek-harness` apps/web is a
+heavy React18/pnpm client (packages/client/**, 252+ tsx). Adopting the
+toolchain contradicts zharness zero-dep ethos. REUSE STRATEGY: extract the
+design language, not the framework.
+- Read `_ref/deepseek-harness/packages/client/ui-theme/src/**` (tokens, css
+  vars) + ui-conversation css modules for spacing/type/color language.
+- Build `web/`: ZERO-BUILD vanilla HTML/CSS/JS chat client (single index.html
+  + app.js + styles.css, no imports map, no CDN) implementing:
+  POST /run (streaming text via polling or /events when available), session
+  picker (GET /sessions), transcript rendering, tool-call badges, composer
+  with stop-less UX, health indicator. Match deepseek theme: dark palette,
+  type scale, radii, spacing rhythm extracted from their tokens.
+- `server/static.zig`: HandlerFn-compatible static file server
+  (GET / -> index.html, /assets/* from `<cwd>/web`, content-type map,
+  path-traversal guard, size cap). Document the one-line api.handle splice
+  needed (integrator applies it).
+- `docs/web.md`: what was reused (token mapping table) vs reimplemented.
