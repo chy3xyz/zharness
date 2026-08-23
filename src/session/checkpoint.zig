@@ -101,7 +101,6 @@ pub const CheckpointStore = struct {
     /// walks downward from it, tolerating arbitrary gaps left by pruning.
     /// If the index is lost, we fall back to a bounded upward probe and heal
     /// the index on the spot.
-
     /// Persist a snapshot atomically; returns its assigned id (always strictly
     /// greater than every earlier id, even across prunes).
     pub fn save(

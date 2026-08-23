@@ -79,8 +79,8 @@ pub const default_denied_patterns = [_]struct { needle: []const u8, why: []const
 };
 
 pub const default_env_allowlist = [_][]const u8{
-    "PATH",     "HOME",         "TMPDIR",   "LANG",   "LC_ALL",
-    "LC_CTYPE", "TERM",         "SHELL",    "USER",   "LOGNAME",
+    "PATH",     "HOME", "TMPDIR", "LANG", "LC_ALL",
+    "LC_CTYPE", "TERM", "SHELL",  "USER", "LOGNAME",
 };
 
 pub const Policy = struct {
