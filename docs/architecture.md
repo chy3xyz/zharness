@@ -31,14 +31,33 @@ per-directory `addModule`; the pattern matches zcordis/zeepseek.
 
 | File / dir | Responsibility |
 |------------|----------------|
-| `main.zig` | CLI entry (`run` / `chat` / `serve`), flag parsing, session wiring |
-| `config.zig` | `Config` (provider, model, key, endpoint, cwd, max_turns). API-key precedence: `ZHARNESS_API_KEY` → `DEEPSEEK_API_KEY` → `~/.zharness/config.toml`. `applyOverrides` applies CLI flags. |
-| `model/model.zig` | The internal **Model IR** (`Role`, `Message`, `ChatRequest`, `ChatResponse`, `ToolCall`) and `ChatClient.chat`, which translates IR ⇄ OpenAI-style JSON. |
-| `tool/registry.zig` | `ToolRegistry` + `ToolDefinition` — single source of truth for capabilities. `buildToolsJson` serializes all definitions for the request. |
-| `tool/builtin.zig` | The executors behind each tool. `execute(alloc, io, cwd, call)` dispatches by name. |
-| `agent/agent.zig` | `Agent` (identity/state) + `AgentLoop` (the driver). Emits events onto the cordis bus. |
-| `session/session.zig` | JSON message store; `save(io, path)` / `load(io, path)`. |
-| `tests.zig` | Test root for `zig build test`. |
+| `main.zig` | CLI entry (`run` / `chat` / `serve` / `workflow` / `plugin`), flag parsing, session wiring, loop extensions, observability setup |
+| `cli_flags.zig` | Strict subcommand flag parser (`--model/--provider/--no-stream/--session/--preset/--sandbox/--port/--mcp`) |
+| `config.zig` | `Config` (provider, model, key, endpoint, cwd, max_turns, sandbox_mode). API-key precedence: `ZHARNESS_API_KEY` → provider env (`DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, …) → `~/.zharness/config.toml`. |
+| `model/provider.zig` | Provider profiles: endpoint/auth/wire-format defaults for deepseek, openai-compat, anthropic, ollama |
+| `model/model.zig` | The internal **Model IR** and `ChatClient.chat` (buffered + SSE via curl), dispatching on wire format |
+| `model/anthropic.zig` | IR ⇄ Anthropic Messages-API translation (tool_use/tool_result blocks) |
+| `tool/registry.zig` | `ToolRegistry` — single source of truth for capabilities; preset filtering removes entries |
+| `tool/builtin.zig` | Built-in executors (fs/grep/glob/shell/git); shell routes through the sandbox in `.process` mode |
+| `tool/webfetch.zig` | `web_fetch` / `web_search` (curl-backed) |
+| `tool/spawn_agent.zig` | `spawn_agent` tool bridging to the SubAgent runner (recursion-guarded) |
+| `tool/mcp_bridge.zig` | Remote MCP tools projected into local naming (`mcp_<srv>_<tool>`) |
+| `agent/agent.zig` | `Agent` + `AgentLoop`: turn loop, checkpoints at boundaries, Extensions vtable (context rendering + tool dispatch), cordis event emission |
+| `agent/subagent.zig` | Isolated child agent runs (turn/output caps, injected transport) |
+| `agent/plan.zig`, `goal.zig` | Plan checklist + goal tracker rendered into per-turn context |
+| `skill/` | SKILL.md discovery + registry (`skill_use` tool) |
+| `memory/` | Working scratchpad + persistent KV store (`memory_get/set` tools) |
+| `session/session.zig` | JSON transcript store; `save` / `load` / resume |
+| `session/checkpoint.zig` | Turn-boundary snapshots (atomic publish, pruning) |
+| `sandbox/sandbox.zig` | Level-1 process sandbox: policy classify, env allowlist, watchdog timeout |
+| `server/httpd.zig` | Minimal HTTP/1.1 server (libc sockets, poll-gated stop) |
+| `server/api.zig` | JSON routes over injected `ServerDeps` (run/chat/sessions/healthz/events) |
+| `workflow/` | JSON workflow parse/validate/cycle-check, topological executor, run reports |
+| `protocol/jsonrpc.zig`, `mcp.zig` | JSON-RPC 2.0 codec + MCP stdio client |
+| `obs.zig` | Event envelopes (trace/span ids) → JSONL log |
+| `presets.zig` | standard/minimal/ptc/creative capability table |
+| `pluginabi/` | dlopen plugin loader: C ABI v1 contract, manifest validation, skip reports |
+| `tests.zig` | Test root for `zig build test` (all modules join the suite) |
 
 ## The Model IR
 
@@ -107,11 +126,16 @@ Tool / result / model slices are allocator-owned; callers must free them:
 exit. Be careful that `unescape` and friends allocate with the same allocator
 used to free.
 
-## Known limitations (MVP-1)
+## Known limitations
 
-- `SandboxMode` exists in config but is not wired into `builtin.zig`; tool
-  approval is stubbed.
-- `serve` (HTTP/WebSocket), the MCP client, skills, and subagents are planned
-  (dev.md §XV/§XIX/§XX/§XXIII) but not implemented.
-- `buildToolsJson` serializes the tools array with no surrounding brackets; the
-  caller wraps it in the request body.
+- Anthropic streaming degrades to buffered requests (SSE is OpenAI-dialect
+  only); `reasoning_effort` is ignored on the Anthropic wire format.
+- The `/events` SSE endpoint emits heartbeats only; wiring live agent events
+  through it is pending (JSONL envelopes already land in
+  `.zharness/logs/events.jsonl`).
+- MCP servers attach per invocation via repeated `--mcp "<cmd>"` flags
+  (space-split argv, max 4, no quote handling).
+- Presets constrain the classic builtin toolset only; harness capabilities
+  (plan/goal/memory/skill/web/mcp/plugin/spawn_agent) always stay available.
+- L2 WASM sandboxing awaits the zcordis wasm runtime; the process sandbox is
+  Level-1 (deny-list + env allowlist + watchdog), not a security boundary.

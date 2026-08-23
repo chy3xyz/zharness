@@ -65,6 +65,18 @@ pub const ToolRegistry = struct {
         return self.tools.contains(name);
     }
 
+    /// Unregister one tool, freeing its owned strings. Returns false when the
+    /// name is unknown. Used by preset filtering (dev.md §XXVIII) to narrow
+    /// the capability surface before the loop starts.
+    pub fn remove(self: *ToolRegistry, name: []const u8) bool {
+        const entry = (self.tools.fetchRemove(name)) orelse return false;
+        self.alloc.free(entry.key);
+        self.alloc.free(entry.value.name);
+        self.alloc.free(entry.value.description);
+        self.alloc.free(entry.value.parameters_json);
+        return true;
+    }
+
     pub fn list(self: *const ToolRegistry) ![][]const u8 {
         var names = try std.ArrayList([]const u8).initCapacity(self.alloc, 0);
         var it = self.tools.keyIterator();

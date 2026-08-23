@@ -19,7 +19,7 @@ getting-started in under five minutes.
 
 ```bash
 zig build            # builds ./zig-out/bin/zharness
-zig build test       # runs the unit test suite (17 tests)
+zig build test       # runs the unit test suite (177 tests)
 ```
 
 ## Configuration
@@ -29,7 +29,7 @@ zharness reads configuration from environment variables and an optional
 
 | Setting    | Default                                  | Notes |
 |------------|------------------------------------------|-------|
-| Provider   | `deepseek`                               | `deepseek`, `openai`, `ollama`, `openrouter` |
+| Provider   | `deepseek`                               | `deepseek`, `openai` / `openai-compat`, `anthropic`, `ollama` (legacy spellings like `openrouter` fall back to OpenAI-compat) |
 | Model      | `deepseek-v4-flash`                      | override with `--model` |
 | Endpoint   | `https://api.deepseek.com/chat/completions` | resolved from provider id |
 | Reasoning effort | `medium`                          | passed through when supported |
@@ -61,7 +61,46 @@ zharness run "refactor src/tool" --model deepseek-v4-flash --provider deepseek
 
 # Disable streaming (useful when piping output)
 zharness run "summarize the git log" --no-stream
+
+# Presets narrow the toolset (standard | minimal | ptc | creative)
+zharness run "quick edit" --preset minimal
+
+# Shell sandboxing (off | process — deny-list + env allowlist + watchdog)
+zharness run "clean the build" --sandbox process
+
+# Attach MCP stdio servers (repeatable; tools appear as mcp_<srv>_<tool>)
+zharness run "use the remote tools" --mcp "npx -y @modelcontextprotocol/server-filesystem /tmp"
 ```
+
+### `serve` — HTTP API
+
+```bash
+zharness serve --port 3080
+curl -sS localhost:3080/healthz
+curl -sS -X POST localhost:3080/run -d '{"prompt":"analyze this repo"}'
+curl -sS localhost:3080/sessions          # list persisted sessions
+curl -sS localhost:3080/events            # SSE stream (heartbeat stub)
+```
+
+### `workflow` — multi-step agent runs
+
+```bash
+cat > wf.json <<'JSON'
+{"name":"triage","steps":[
+  {"id":"recon","prompt":"List the failing tests"},
+  {"id":"fix","prompt":"Fix the failures described below","depends_on":["recon"]}
+]}
+JSON
+zharness workflow wf.json     # topological execution + .zharness/runs report
+```
+
+### `plugin` — native dylib tools (ABI v1)
+
+```bash
+zharness plugin list [--dir X]              # discover ~/.zharness/plugins, ./plugins
+zharness plugin exec p_hello_hello_echo '{"name":"x"}' --dir examples/plugin-hello/build
+```
+See [docs/plugins.md](docs/plugins.md) for the C ABI contract.
 
 ### `chat` — interactive REPL
 

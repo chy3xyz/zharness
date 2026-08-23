@@ -11,6 +11,7 @@ pub const ParseError = error{
     MissingFlagValue,
     UnknownFlag,
     ExtraPositional,
+    TooManyServers,
 };
 
 pub const SubFlags = struct {
@@ -20,7 +21,24 @@ pub const SubFlags = struct {
     provider: ?[]const u8 = null,
     no_stream: bool = false,
     session_id: ?[]const u8 = null,
+    /// Agent preset name (dev.md §XXVIII): standard|minimal|ptc|creative.
+    preset: ?[]const u8 = null,
+    /// Sandbox level override: off | native | process.
+    sandbox: ?[]const u8 = null,
+    /// TCP port for `serve` (--port N).
+    port: ?[]const u8 = null,
+    /// MCP stdio server commands (`--mcp "<argv...>"`), repeatable, capped.
+    mcp_cmds: [max_mcp_servers]?[]const u8 = defaultMcpCmds(),
+    mcp_count: usize = 0,
 };
+
+pub const max_mcp_servers = 4;
+
+fn defaultMcpCmds() [max_mcp_servers]?[]const u8 {
+    var a: [max_mcp_servers]?[]const u8 = undefined;
+    for (&a) |*x| x.* = null;
+    return a;
+}
 
 /// Parse flags from `args` (already sliced past the subcommand).
 /// `max_positionals` caps how many positional args are accepted before
@@ -43,6 +61,24 @@ pub fn parseSubFlags(args: []const []const u8, max_positionals: usize) ParseErro
             i += 1;
             if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingFlagValue;
             out.session_id = args[i];
+        } else if (std.mem.eql(u8, a, "--preset")) {
+            i += 1;
+            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingFlagValue;
+            out.preset = args[i];
+        } else if (std.mem.eql(u8, a, "--sandbox")) {
+            i += 1;
+            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingFlagValue;
+            out.sandbox = args[i];
+        } else if (std.mem.eql(u8, a, "--port")) {
+            i += 1;
+            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingFlagValue;
+            out.port = args[i];
+        } else if (std.mem.eql(u8, a, "--mcp")) {
+            i += 1;
+            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingFlagValue;
+            if (out.mcp_count >= max_mcp_servers) return error.TooManyServers;
+            out.mcp_cmds[out.mcp_count] = args[i];
+            out.mcp_count += 1;
         } else if (std.mem.eql(u8, a, "--no-stream")) {
             out.no_stream = true;
         } else if (std.mem.startsWith(u8, a, "--") and a.len > 2) {
@@ -78,4 +114,20 @@ test "parseSubFlags chat allows no positional" {
     const f = try parseSubFlags(&.{"--no-stream"}, 0);
     try std.testing.expect(f.prompt == null);
     try std.testing.expect(f.no_stream);
+}
+
+test "parseSubFlags preset sandbox and repeatable mcp" {
+    const f = try parseSubFlags(&.{ "--preset", "minimal", "--sandbox", "process", "--mcp", "npx -y a", "--mcp", "uvx b" }, 0);
+    try std.testing.expectEqualStrings("minimal", f.preset.?);
+    try std.testing.expectEqualStrings("process", f.sandbox.?);
+    try std.testing.expectEqual(@as(usize, 2), f.mcp_count);
+    try std.testing.expectEqualStrings("npx -y a", f.mcp_cmds[0].?);
+    try std.testing.expectEqualStrings("uvx b", f.mcp_cmds[1].?);
+}
+
+test "parseSubFlags caps mcp servers" {
+    try std.testing.expectError(
+        error.TooManyServers,
+        parseSubFlags(&.{ "--mcp", "a", "--mcp", "b", "--mcp", "c", "--mcp", "d", "--mcp", "e" }, 0),
+    );
 }

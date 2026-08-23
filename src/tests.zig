@@ -28,6 +28,30 @@ const plan_mod = @import("agent/plan.zig");
 const goal_mod = @import("agent/goal.zig");
 const main_mod = @import("main.zig");
 
+// Swarm wave-2 modules (A/B/C/D/E/F/G) — pulled in via comptime so their
+// inline test blocks join `zig build test` even where nothing references them.
+comptime {
+    _ = @import("model/provider.zig");
+    _ = @import("model/anthropic.zig");
+    _ = @import("model/ollama.zig");
+    _ = @import("server/httpd.zig");
+    _ = @import("server/api.zig");
+    _ = @import("tool/webfetch.zig");
+    _ = @import("agent/subagent.zig");
+    _ = @import("tool/spawn_agent.zig");
+    _ = @import("workflow/workflow.zig");
+    _ = @import("workflow/executor.zig");
+    _ = @import("workflow/run_report.zig");
+    _ = @import("protocol/jsonrpc.zig");
+    _ = @import("protocol/mcp.zig");
+    _ = @import("tool/mcp_bridge.zig");
+    _ = @import("obs.zig");
+    _ = @import("presets.zig");
+    _ = @import("pluginabi/capi.zig");
+    _ = @import("pluginabi/ffi.zig");
+    _ = @import("pluginabi/loader.zig");
+}
+
 comptime {
     // Pull in the CLI flag parser so its inline tests join the suite.
     _ = @import("cli_flags.zig");
@@ -593,6 +617,8 @@ test "loop extensions wiring: plan goal memory skills end to end" {
         .working = &wm,
         .plan_board = &pb,
         .goal_board = &gb,
+        .plugins = null,
+        .cwd = dir,
     };
     const ext = lext.extensions();
 
@@ -755,4 +781,3 @@ test "registerExtensionTools respects availability flags" {
     try std.testing.expect(!minimal.contains("memory_get"));
     try std.testing.expect(minimal.contains("plan_add"));
 }
-
