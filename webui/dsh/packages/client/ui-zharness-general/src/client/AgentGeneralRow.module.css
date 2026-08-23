@@ -1,0 +1,65 @@
+/* Agent settings row: one bordered group matching the General section's
+ * feature-owned item look (tokens only — no literal colors). */
+
+.group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dsw-spacing-2, 8px);
+  padding: var(--dsw-spacing-4, 16px);
+  border: 1px solid var(--dsw-border-secondary, rgba(0, 0, 0, 0.08));
+  border-radius: var(--dsw-radius-lg, 12px);
+}
+
+.title {
+  font-size: var(--dsw-font-size-md, 14px);
+  font-weight: 600;
+  color: var(--dsw-text-primary);
+}
+
+.hint {
+  margin: 0;
+  font-size: var(--dsw-font-size-xs, 12px);
+  color: var(--dsw-text-tertiary);
+}
+
+.fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: var(--dsw-spacing-3, 12px) var(--dsw-spacing-4, 16px);
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dsw-spacing-1, 4px);
+}
+
+.label {
+  font-size: var(--dsw-font-size-xs, 12px);
+  color: var(--dsw-text-secondary);
+}
+
+.input {
+  height: 28px;
+  padding: 0 var(--dsw-spacing-2, 8px);
+  border: 1px solid var(--dsw-border-secondary, rgba(0, 0, 0, 0.08));
+  border-radius: var(--dsw-radius-sm, 6px);
+  background: var(--dsw-background-primary);
+  color: var(--dsw-text-primary);
+  font-size: var(--dsw-font-size-xs, 12px);
+}
+
+.input:focus {
+  outline: none;
+  border-color: var(--dsw-brand-primary);
+}
+
+.select {
+  appearance: auto;
+}
+
+.toggle {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+}
