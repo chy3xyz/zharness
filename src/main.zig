@@ -33,6 +33,9 @@ const wf_report = @import("workflow/run_report.zig");
 const mcp_mod = @import("protocol/mcp.zig");
 const mcp_bridge = @import("tool/mcp_bridge.zig");
 const plugin_loader = @import("pluginabi/loader.zig");
+const wasm_loader = @import("pluginabi/wasm_loader.zig");
+const server_events = @import("server/events.zig");
+const server_static = @import("server/static.zig");
 
 const SYSTEM_PROMPT =
     \\You are zharness, a coding agent running inside a workspace. You help the user by
@@ -195,6 +198,8 @@ pub const LoopExtensions = struct {
     goal_board: *goal_mod.GoalBoard,
     /// Native dylib plugins (null when no plugin dirs had loadable entries).
     plugins: ?*plugin_loader.PluginRegistry = null,
+    /// WASM plugin registry (null when no .wasm tools were discovered).
+    wasm: ?*wasm_loader.WasmRegistry = null,
     /// Workspace cwd for cwd-aware extension tools (web_fetch etc.).
     cwd: []const u8,
 
@@ -266,6 +271,15 @@ pub const LoopExtensions = struct {
                     .success = out.ok,
                     .output = out.output,
                     .err_msg = if (out.ok) null else try alloc.dupe(u8, "plugin tool failed"),
+                };
+            }
+        }
+        if (self.wasm) |w| {
+            if (try w.execute(alloc, call.name, call.arguments)) |out| {
+                return .{
+                    .success = out.ok,
+                    .output = out.output,
+                    .err_msg = if (out.ok) null else try alloc.dupe(u8, "wasm tool failed"),
                 };
             }
         }
@@ -553,7 +567,14 @@ fn serveGetSession(
             .content = try alloc.dupe(u8, m.content),
         };
     }
-    return .{ .id = try alloc.dupe(u8, id), .created_at = 0, .messages = msgs };
+    // created_at: file mtime (best-effort — 0 when stat is unavailable).
+    const created_at: i64 = blk: {
+        const cwd = std.Io.Dir.cwd();
+        const fstat = std.Io.Dir.statFile(cwd, io, p, .{}) catch break :blk 0;
+        // Stat.mtime is an Io.Timestamp; its nanoseconds count real time.
+        break :blk @intCast(@divTrunc(fstat.mtime.nanoseconds, std.time.ns_per_s));
+    };
+    return .{ .id = try alloc.dupe(u8, id), .created_at = created_at, .messages = msgs };
 }
 
 fn cmdServe(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts, port_arg: ?[]const u8) !void {
@@ -586,19 +607,38 @@ fn cmdServe(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts, port_
         .getSession = serveGetSession,
     };
 
+    // Live event feed (dev.md §XXX): agent-loop envelopes fan out to every
+    // /events subscriber. Install BEFORE the accept loop starts; obs.fanout
+    // is a plain var so it must be set before any thread observes it.
+    try server_events.install(alloc);
+    obs_mod.fanout = &server_events.hubPublish;
+
+    // Static Web UI (Option B from docs/web.md): static.handle claims "/" and
+    // "/assets/*", everything else falls through to the JSON API.
+    const static_ctx = try alloc.create(server_static.Ctx);
+    defer alloc.destroy(static_ctx);
+    static_ctx.* = .{ .root = server_static.default_root, .fallback = .{ .ctx = deps, .call = api.handle } };
+
     var server = try httpd.Server.init(alloc, .{
-        .ctx = deps,
-        .call = api.handle,
-    }, .{ .port = port });
+        .ctx = static_ctx,
+        .call = server_static.handle,
+        // Live SSE subscribers need per-connection threads or one open
+        // /events stream starves every other route on the accept thread.
+    }, .{ .port = port, .threaded_connections = true });
     defer server.deinit();
+    defer {
+        obs_mod.fanout = null;
+        server_events.deinstall();
+    }
 
     std.debug.print(
         \\zharness serve listening on http://127.0.0.1:{d}
+        \\  Web UI:      http://127.0.0.1:{d}/          (web/ directory)
         \\  POST /run {{prompt, session?}}   POST /chat (same shape)
-        \\  GET  /sessions  GET /sessions/<id>  GET /healthz  GET /events (SSE)
+        \\  GET  /sessions  GET /sessions/<id>  GET /healthz  GET /events (live)
         \\Ctrl-C to stop.
         \\
-    , .{port});
+    , .{ port, port });
     server.serveBlocking(); // never returns under normal operation
 }
 
@@ -816,6 +856,7 @@ pub const Built = struct {
     /// Live MCP stdio clients (one per --mcp server), torn down last.
     mcp_clients: []*mcp_mod.McpClient = &.{},
     plugins: ?*plugin_loader.PluginRegistry = null,
+    wasm: ?*wasm_loader.WasmRegistry = null,
 
     /// Tear everything down in strict reverse-creation order (the previous
     /// inline defer chain destroyed heap objects before deinitializing them).
@@ -838,6 +879,10 @@ pub const Built = struct {
         }
         if (self.mcp_clients.len > 0) alloc.free(self.mcp_clients);
         mcp_bridge.clearInstances();
+        if (self.wasm) |w| {
+            w.deinit();
+            alloc.destroy(w);
+        }
         if (self.plugins) |p| {
             p.deinit();
             alloc.destroy(p);
@@ -967,6 +1012,8 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
     // Native plugin registry slot — declared before lext (which borrows it);
     // discovery + registration happen further down, after tool schemas.
     var plugins_reg: ?*plugin_loader.PluginRegistry = null;
+    // WASM registry slot — same early-declaration pattern.
+    var wasm_reg: ?*wasm_loader.WasmRegistry = null;
     errdefer if (plugins_reg) |p| {
         p.deinit();
         alloc.destroy(p);
@@ -984,6 +1031,7 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
         .plan_board = plan_board,
         .goal_board = goal_board,
         .plugins = plugins_reg,
+        .wasm = wasm_reg,
         .cwd = cfg.cwd,
     };
     const ext_iface = try alloc.create(agent.Extensions);
@@ -1020,6 +1068,29 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
         } else {
             p.deinit();
             alloc.destroy(p);
+        }
+    }
+
+    // ── WASM plugins (dev.md §XII L2): best-effort discovery ──────────────
+    errdefer if (wasm_reg) |w| {
+        w.deinit();
+        alloc.destroy(w);
+    };
+    {
+        const w = try alloc.create(wasm_loader.WasmRegistry);
+        w.* = wasm_loader.WasmRegistry.init(alloc);
+        w.loadDefaultDirs(ctx.io(), cfg.cwd);
+        if (w.tools.items.len > 0) {
+            const defs = try w.definitions(alloc);
+            defer alloc.free(defs);
+            for (defs) |d| try tools.register(d);
+            for (w.report.items) |r| {
+                std.debug.print("[wasm] skipped {s}: {s}\n", .{ r.path, r.reason });
+            }
+            wasm_reg = w;
+        } else {
+            w.deinit();
+            alloc.destroy(w);
         }
     }
 
@@ -1196,6 +1267,7 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
         .spawn_deps = spawn_deps,
         .mcp_clients = mcp_clients,
         .plugins = plugins_reg,
+        .wasm = wasm_reg,
     };
 }
 

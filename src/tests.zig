@@ -50,6 +50,22 @@ comptime {
     _ = @import("pluginabi/capi.zig");
     _ = @import("pluginabi/ffi.zig");
     _ = @import("pluginabi/loader.zig");
+    _ = @import("pluginabi/wasm_loader.zig");
+    _ = @import("sandbox/wasm.zig");
+    _ = @import("server/events.zig");
+    _ = @import("server/static.zig");
+    // Wave-4 hardening suites (corpus-driven parser robustness).
+    _ = @import("fuzz/mutator.zig");
+    _ = @import("fuzz/json.zig");
+    _ = @import("fuzz/jsonrpc.zig");
+    _ = @import("fuzz/mcp.zig");
+    _ = @import("fuzz/http.zig");
+    _ = @import("fuzz/workflow.zig");
+    _ = @import("fuzz/skill.zig");
+    _ = @import("fuzz/sse.zig");
+    _ = @import("fuzz/checkpoint_session.zig");
+    _ = @import("fuzz/manifest.zig");
+    _ = @import("fuzz/envelope.zig");
 }
 
 comptime {
