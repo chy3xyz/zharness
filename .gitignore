@@ -2,3 +2,5 @@
 zig-out/
 .DS_Store
 .zharness/
+.omo/
+_t_*.zig
