@@ -1,0 +1,45 @@
+---
+name: debugging
+description: Root-cause hunting playbook
+category: engineering
+---
+## Steps
+1. Reproduce
+2. Isolate
+%%%%
+---
+name: unicode-skill
+description: Handles café 你好 🎛 and "quotes" plus trailing backslash \
+category: research
+---
+Body with --- inside a fence:
+
+```
+---not a delimiter at line start? it is!
+```
+%%%%
+---
+name: win-crlf
+description: crlf formatted
+---
+
+windows body
+%%%%
+---
+name: minimal
+description: 
+---
+x
+%%%%
+---
+description: no name here
+---
+body
+%%%%
+no front matter at all
+%%%%
+---
+name: dup
+description: first wins
+---
+one

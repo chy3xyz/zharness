@@ -268,7 +268,14 @@ fn ownedQuoted(alloc: std.mem.Allocator, value_span: []const u8) !?[]u8 {
                             continue;
                         };
                         var utf8_buf: [4]u8 = undefined;
-                        const n = std.unicode.utf8Encode(cp, &utf8_buf) catch 1;
+                        // Invalid scalars (surrogate halves) encode as an
+                        // explicit U+FFFD replacement; the old `catch 1`
+                        // appended one byte of UNINITIALIZED buffer.
+                        const n = std.unicode.utf8Encode(cp, &utf8_buf) catch blk: {
+                            const repl = "\u{FFFD}";
+                            @memcpy(utf8_buf[0..repl.len], repl);
+                            break :blk repl.len;
+                        };
                         try out.appendSlice(alloc, utf8_buf[0..n]);
                         i += 4;
                     } else {

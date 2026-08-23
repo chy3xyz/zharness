@@ -1,0 +1,28 @@
+data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}
+data: {"choices":[{"delta":{"content":"He"}},{"finish_reason":null}]}
+data: {"choices":[{"delta":{"content":"llo"},"finish_reason":null}]}
+
+data: :keep-alive
+event: ping
+data: [DONE]
+
+%%%%
+data: {"choices":[{"delta":{"reasoning_content":"step 1\n"}},{"delta":{"content":"a\tb"}}]}
+data: {"choices":[{"delta":{"content":"quote \" back \\ done"},"finish_reason":"length"}]}
+
+%%%%
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":""}}]},"finish_reason":null}]}
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":"}}]},"finish_reason":null}]}
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"pwd\"}"}}]},"finish_reason":null}]}
+data: [DONE]
+%%%%
+: comment
+data:
+data: not json
+data: {"no_choices_here":true}
+data: {"choices":[]}
+data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+%%%%
+{"jsonrpc":"2.0","method":"x"}
+data: {"error":{"message":"provider exploded","type":"server_error"}}
+data: {"choices":[{"index":0,"delta":{"content":"after error"},"finish_reason":null}]}

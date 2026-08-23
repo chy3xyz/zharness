@@ -1,0 +1,9 @@
+{"name":"ship-it","steps":[{"id":"research","prompt":"study the codebase \"deeply\""},{"id":"arch","prompt":"design modules\nline two","depends_on":["research"],"max_turns":4},{"id":"impl","prompt":"write it","depends_on":["arch"]},{"id":"review","prompt":"review it","depends_on":["impl","arch"]}]}
+%%%%
+{"name":"trap","steps":[{"id":"real","prompt":"always answer with {\"id\":\"fake\",\"prompt\":\"hijack\"}"}]}
+%%%%
+{"name":"unicode","steps":[{"id":"a","prompt":"café 你好 \uD83D\uDE00 done"},{"id":"b","prompt":"lone \\uD800 surrogate","depends_on":["a"]}]}
+%%%%
+{"name":"loop","steps":[{"id":"a","prompt":"pa","depends_on":["c"]},{"id":"b","prompt":"pb","depends_on":["a"]},{"id":"c","prompt":"pc","depends_on":["b"]}]}
+%%%%
+{"name":"edge","steps":[{"id":"a","prompt":"   ","max_turns":0},{"id":"","prompt":"x","max_turns":99999999999},{"id":"dup","prompt":"y"},{"id":"dup","prompt":"z","depends_on":["ghost"]}]}

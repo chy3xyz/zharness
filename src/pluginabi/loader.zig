@@ -287,12 +287,15 @@ const MemberIter = struct {
 
     /// Next member with its value position, or null at '}' / end.
     fn nextMember(self: *MemberIter, alloc: std.mem.Allocator) ParseError!?Member {
-        skipWs(self.src, &self.i);
-        if (self.i >= self.end or self.src[self.i] == '}') return null;
-        if (self.src[self.i] == ',') {
-            // tolerate trailing/multiple commas
+        // Separator runs are consumed ITERATIVELY. The previous recursive
+        // form spent one stack frame per ',' and crashed the process on a
+        // hostile manifest containing a long comma run (found by src/fuzz;
+        // regression case in fuzz/manifest.zig).
+        while (true) {
+            skipWs(self.src, &self.i);
+            if (self.i >= self.end or self.src[self.i] == '}') return null;
+            if (self.src[self.i] != ',') break;
             self.i += 1;
-            return self.nextMember(alloc);
         }
         const key = try parseJsonString(alloc, self.src, &self.i);
         errdefer alloc.free(key);

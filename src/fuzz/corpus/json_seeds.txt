@@ -1,0 +1,13 @@
+{"choices":[{"message":{"role":"assistant","content":"she said \"hi\"","reasoning_content":"hmm"},"finish_reason":"stop"}],"usage":{"total_tokens":7}}
+%%%%
+{"error":{"message":"Incorrect API key provided: sk-***","type":"authentication_error","param":null,"code":"invalid_api_key"}}
+%%%%
+{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"a\nb\tc\\d\"e"},"finish_reason":null}]}
+%%%%
+{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"shell","arguments":"{\"command\":\"pwd\"}"}}],"decoys":{"tool_calls":[],"nested":{"brackets":"}]}"}}}
+%%%%
+{"a":{"b":[1,2,{"c":"}]}"}]},"deep":{"x":"\"q\""},"esc":"\\u0041\\ud83d\\ude00 tail"}
+%%%%
+prose body mentioning error but not JSON
+%%%%
+{"truncated":

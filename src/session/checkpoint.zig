@@ -191,7 +191,17 @@ pub const CheckpointStore = struct {
 
         const arr = sliceArrayField(raw, "messages") orelse return error.MalformedCheckpoint;
         var msgs: std.ArrayList(SnapshotMessage) = .empty;
-        errdefer msgs.deinit(alloc);
+        errdefer {
+            // Free the CONTENTS of every appended message, not just the list
+            // storage — otherwise a malformed element after position 0 leaks
+            // all prior messages' strings (found by src/fuzz).
+            for (msgs.items) |*m| {
+                alloc.free(m.content);
+                if (m.tool_call_id) |t| alloc.free(t);
+                if (m.tool_calls_json) |t| alloc.free(t);
+            }
+            msgs.deinit(alloc);
+        }
         var i: usize = 1; // skip '['
         while (i < arr.len - 1) {
             if (arr[i] != '{') {
@@ -204,9 +214,12 @@ pub const CheckpointStore = struct {
             const content = (try extractOwnedString(alloc, obj, "content")) orelse try alloc.dupe(u8, "");
             errdefer alloc.free(content);
             const tcid = try extractOwnedString(alloc, obj, "tool_call_id");
+            errdefer if (tcid) |t| alloc.free(t);
             const tcj = try extractOwnedString(alloc, obj, "tool_calls_json");
+            errdefer if (tcj) |t| alloc.free(t);
+            const role = Role.fromStr(role_s) orelse return error.MalformedCheckpoint;
             try msgs.append(alloc, .{
-                .role = Role.fromStr(role_s) orelse return error.MalformedCheckpoint,
+                .role = role,
                 .content = content,
                 .tool_call_id = tcid,
                 .tool_calls_json = tcj,

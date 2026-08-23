@@ -1,0 +1,26 @@
+POST /run?debug=1 HTTP/1.1
+Host: localhost
+Content-Type: application/json
+Content-Length: 26
+
+{"prompt":"hello","x":1}
+%%%%
+GET /sessions?page=2&limit=10 HTTP/1.1
+Accept: */*
+
+%%%%
+POST /chat HTTP/1.1
+content-length: 15
+Transfer-Encoding: identity
+
+{"msg":"hi there"}
+%%%%
+GET /a?q=%20plus%2Fslash%zz%2 HTTP/1.1
+X-Multi: a
+X-Multi: b
+
+%%%%
+DELETE /sessions/abc-123?force=1 HTTP/1.1
+Authorization: Bearer tok"en
+
+

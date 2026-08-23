@@ -1,0 +1,13 @@
+{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info"}}
+%%%%
+{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}
+%%%%
+{"jsonrpc":"2.0","id":99999999999999999999,"result":{"ghost":true}}
+%%%%
+{"jsonrpc":"2.0","id":3,"method":"server/wants/reply","params":{"x":[1,{"deep":"}]}"}]}}
+%%%%
+total garbage not json
+%%%%
+{"jsonrpc":"1.0","id":1,"method":"wrong-version"}
+%%%%
+{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","inputSchema":{"type":"object"}}]}}

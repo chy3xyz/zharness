@@ -1,0 +1,9 @@
+{"name":"tool.shell","version":"0.1.0","kind":"tool","dependencies":["cordis","zharness"],"tools":[{"name":"shell_run","description":"Run \"safe\" commands.","schema":{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]}}]}
+%%%%
+{"name":"p","version":"1","kind":"tool","tools":[{"name":"t","description":"d","schema":"{\"type\":\"object\"}"},{"name":"u2","description":"café \uD83D\uDE00","schema":{}}],"extra":{"nested":[1,2,{"deep":"}]}"}]}}
+%%%%
+{"version":"2","kind":"daemon","tools":[]}
+%%%%
+{"name":"x","tools":[{"description":"no name"},{"name":"ok","description":"d"}],"kind":"tool","version":"9"}
+%%%%
+{"name":"weird","version":"","kind":"tool","tools":[{"name":"bad.tool","description":"d","schema":{"a":[1,{"b":"}]"}]}}],"trailing":true}

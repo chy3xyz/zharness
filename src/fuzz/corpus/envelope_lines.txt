@@ -1,0 +1,9 @@
+{"timestamp_unix_ms":1755900000123,"trace_id":"0123456789abcdef","span_id":"a1b2c3d4","session_id":"sess \"quoted\"\nline","agent_id":"main-agent","event_type":"tool.completed","payload":{"tool":"shell","exit":{"code":0},"note":"ok \\ end"}}
+%%%%
+{"timestamp_unix_ms":42,"trace_id":"ffffffffffffffff","span_id":"00000001","session_id":"s","agent_id":"a","event_type":"model.chunk","payload":{   "k": "v",    "n": 7 }}
+%%%%
+{"timestamp_unix_ms":-7,"trace_id":"0000000000000000","span_id":"ffffffff","session_id":"","agent_id":"","event_type":"","payload":null}
+%%%%
+{"timestamp_unix_ms":1,"trace_id":"0123456789abcdef","span_id":"a1b2c3d4","session_id":"decoy\",\"payload\":{\"fake\":1}","agent_id":"a","event_type":"e","payload":{"real":[1,2,{"x":"}]}"}]}}
+%%%%
+{"timestamp_unix_ms":9223372036854775807,"trace_id":"deadbeefdeadbeef","span_id":"12345678","session_id":"overflow-edge","agent_id":"a","event_type":"e","payload":"string payload"}

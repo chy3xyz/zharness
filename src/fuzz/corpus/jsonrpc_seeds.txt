@@ -1,0 +1,13 @@
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"zharness","version":"0.1.0"}}}
+%%%%
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+%%%%
+{"jsonrpc":"2.0","id":7,"result":{"tools":[{"name":"echo","description":"Echo \"input\".","inputSchema":{"type":"object"}},{"name":"nodesc"}]}}
+%%%%
+{"jsonrpc":"2.0","id":"req-17","error":{"code":-32000,"message":"boom","data":{"hint":"try later","arr":["}]}"]}}}
+%%%%
+{"jsonrpc":"2.0","id":null,"result":null}
+%%%%
+{ "jsonrpc" : "2.0" , "id" : 9 , "method" : "tools/call" , "params" : { "name" : "echo" } }
+%%%%
+{"params":{"a":{"b\":[1,{"c":"}]}\"]},\"deep\":{\"x\":\"\\\"q\\\"\"}}},"jsonrpc":"2.0","id":3,"method":"m"}

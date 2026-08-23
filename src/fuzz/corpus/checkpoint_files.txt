@@ -1,0 +1,9 @@
+{"id":1,"label":"turn 1 pre-tool","created_at":1700000000,"messages":[{"role":"user","content":"line1\nline2 \"quoted\""},{"role":"assistant","content":"calling","tool_calls_json":"[{\"id\":\"c1\",\"name\":\"shell\",\"arguments\":\"{}\"}]"},{"role":"tool","content":"result","tool_call_id":"c1"}]}
+%%%%
+{"id":2,"label":"","created_at":0,"messages":[]}
+%%%%
+{"id":3,"label":"unicode café 你好 🎛","created_at":-42,"messages":[{"role":"system","content":"sys \\ end","tool_call_id":null,"tool_calls_json":null}]}
+%%%%
+{"id":4,"label":"deep args","created_at":7,"messages":[{"role":"assistant","content":"","tool_calls_json":"[{\"id\":\"c\",\"function\":{\"arguments\":\"{\\\"a\\\":[1,{\\\"b\\\":\\\"}]\\\"}]}\"}]}]}
+%%%%
+{"id":5,"label":"whitespace   padded  ","created_at":1234567890123,"messages":[{"role":"tool","content":"tab\there","tool_call_id":"x-y_z.9"},{"role":"user","content":"crlf\r\nline"}]}
