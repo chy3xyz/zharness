@@ -8,6 +8,16 @@
 const std = @import("std");
 const clib = @import("../clib.zig");
 
+// Provider matrix (dev.md §VI). The import cycle with anthropic.zig is
+// intentional and lazily analyzed: it uses the IR types below, while
+// ChatClient.chatAnthropic calls its translate functions.
+pub const providers = @import("provider.zig");
+const anthropic_wire = @import("anthropic.zig");
+pub const Provider = providers.Provider;
+pub const ProviderProfile = providers.ProviderProfile;
+pub const AuthStyle = providers.AuthStyle;
+pub const WireFormat = providers.WireFormat;
+
 pub const Role = enum {
     system,
     user,
@@ -90,6 +100,12 @@ pub const ChatClient = struct {
     model: []const u8,
     api_key: []const u8,
 
+    /// Credential-header dialect (default: the historical Bearer behaviour).
+    auth_style: AuthStyle = .bearer,
+    /// Wire dialect; `.anthropic_messages` routes chat() through the
+    /// Messages-API translator (non-streaming; stream=true degrades).
+    wire_format: WireFormat = .openai_chat,
+
     /// Optional live-delta sink for streamed requests. Set before the client
     /// value is copied into the agent loop; invoked per content/reasoning
     /// delta while a stream is in flight.
@@ -111,6 +127,30 @@ pub const ChatClient = struct {
         };
     }
 
+    /// Provider-aware constructor (dev.md §VI): fills endpoint/auth/wire
+    /// dialects from a resolved profile. `model_name` overrides the profile's
+    /// default model when non-empty; `api_key` may be empty for keyless
+    /// providers (`.none` auth). Endpoint/model/key slices are borrowed —
+    /// keep them alive as long as the client (same contract as init()).
+    pub fn initProvider(alloc: std.mem.Allocator, io: std.Io, prof: ProviderProfile, model_name: []const u8, api_key: []const u8) ChatClient {
+        var self = ChatClient.init(alloc, io, prof.endpoint, if (model_name.len > 0) model_name else prof.default_model, api_key);
+        self.auth_style = prof.auth;
+        self.wire_format = prof.wire;
+        return self;
+    }
+
+    /// Switch an existing client to another provider in place: replaces the
+    /// endpoint/model/key plus both dialects. Optional arguments win over the
+    /// profile defaults when non-null — this is the one-liner a caller needs
+    /// to re-point a running loop at a different backend.
+    pub fn useProvider(self: *ChatClient, prof: ProviderProfile, model_name: ?[]const u8, api_key: ?[]const u8) void {
+        self.endpoint = prof.endpoint;
+        self.model = model_name orelse prof.default_model;
+        if (api_key) |k| self.api_key = k;
+        self.auth_style = prof.auth;
+        self.wire_format = prof.wire;
+    }
+
     /// Detail text for the most recent failed request ("" when none).
     pub fn lastError(self: *const ChatClient) []const u8 {
         return self.last_err_buf[0..self.last_err_len];
@@ -130,6 +170,14 @@ pub const ChatClient = struct {
 
     pub fn chat(self: *ChatClient, req: ChatRequest) !ChatResponse {
         self.last_err_len = 0;
+
+        // Anthropic dialect: non-streaming translator only (streaming is
+        // deferred); a stream request degrades to a buffered call.
+        if (self.wire_format == .anthropic_messages) {
+            var buffered = req;
+            buffered.stream = false;
+            return self.chatAnthropic(buffered);
+        }
 
         if (req.stream) return self.chatStreaming(req);
 
@@ -262,13 +310,87 @@ pub const ChatClient = struct {
         try out.appendSlice(self.alloc, std.fmt.comptimePrint("{d}", .{ConnectTimeoutSeconds}));
         try out.appendSlice(self.alloc, "\nurl = ");
         try out.appendSlice(self.alloc, self.endpoint);
-        try out.appendSlice(self.alloc, "\nheader = \"Content-Type: application/json\"\nheader = \"Authorization: Bearer ");
-        for (self.api_key) |ch| {
-            if (ch == '"' or ch == '\\') try out.append(self.alloc, '\\');
-            try out.append(self.alloc, ch);
+        try out.appendSlice(self.alloc, "\nheader = \"Content-Type: application/json\"\n");
+        switch (self.auth_style) {
+            .bearer => {
+                try out.appendSlice(self.alloc, "header = \"Authorization: Bearer ");
+                for (self.api_key) |ch| {
+                    if (ch == '"' or ch == '\\') try out.append(self.alloc, '\\');
+                    try out.append(self.alloc, ch);
+                }
+                try out.appendSlice(self.alloc, "\"\n");
+            },
+            .x_api_key => {
+                try out.appendSlice(self.alloc, "header = \"x-api-key: ");
+                for (self.api_key) |ch| {
+                    if (ch == '"' or ch == '\\') try out.append(self.alloc, '\\');
+                    try out.append(self.alloc, ch);
+                }
+                try out.appendSlice(self.alloc, "\"\nheader = \"anthropic-version: " ++ providers.anthropic_version ++ "\"\n");
+            },
+            // Local servers (Ollama) need no credential header at all.
+            .none => {},
         }
-        try out.appendSlice(self.alloc, "\"\n");
         return out.toOwnedSlice(self.alloc);
+    }
+
+    /// Anthropic Messages-API transport (non-streaming). Same security
+    /// posture as the buffered OpenAI path — mkstemp body + curl config
+    /// carrying the credential — with the wire translation swapped for the
+    /// anthropic.zig translator.
+    fn chatAnthropic(self: *ChatClient, req: ChatRequest) !ChatResponse {
+        const body = try anthropic_wire.buildRequestBody(self.alloc, self.model, req);
+        defer self.alloc.free(body);
+
+        const body_path = (try clib.createPrivateTemp(self.alloc, "zharness_req_")) orelse return error.HttpError;
+        defer self.alloc.free(body_path);
+        defer clib.unlinkPath(body_path);
+        if (!writePrivateFile(body_path, body)) return error.HttpError;
+
+        const cfg_path = (try clib.createPrivateTemp(self.alloc, "zharness_curl_")) orelse return error.HttpError;
+        defer self.alloc.free(cfg_path);
+        defer clib.unlinkPath(cfg_path);
+        const curl_cfg = try self.buildCurlConfig(false);
+        defer self.alloc.free(curl_cfg);
+        if (!writePrivateFile(cfg_path, curl_cfg)) return error.HttpError;
+
+        var cmd: std.ArrayList(u8) = .empty;
+        defer cmd.deinit(self.alloc);
+        try cmd.appendSlice(self.alloc, "curl --silent --show-error --config ");
+        try appendShellQuoted(self.alloc, &cmd, cfg_path);
+
+        const cmd_z = try self.alloc.dupeSentinel(u8, cmd.items, 0);
+        defer self.alloc.free(cmd_z);
+
+        const fp = clib.popenRead(cmd_z.ptr) orelse return error.HttpError;
+        var out = try std.ArrayList(u8).initCapacity(self.alloc, 0);
+        errdefer out.deinit(self.alloc);
+        var buf: [8192]u8 = undefined;
+        while (true) {
+            const n = std.c.fread(&buf, 1, buf.len, fp);
+            if (n == 0) break;
+            try out.appendSlice(self.alloc, buf[0..n]);
+        }
+        _ = clib.pclosePipe(fp);
+
+        const resp_body = try out.toOwnedSlice(self.alloc);
+        defer self.alloc.free(resp_body);
+
+        if (resp_body.len == 0 or resp_body[0] != '{') {
+            self.setLastError("provider returned an empty or non-JSON body");
+            return error.HttpError;
+        }
+        if (anthropic_wire.isErrorEnvelope(resp_body)) {
+            if (anthropic_wire.errorMessage(self.alloc, resp_body)) |msg| {
+                self.setLastError(msg);
+                self.alloc.free(msg);
+            } else {
+                self.setLastError("provider rejected the request");
+            }
+            return error.HttpError;
+        }
+
+        return anthropic_wire.parseResponse(self.alloc, resp_body);
     }
 
     fn buildBody(self: *ChatClient, req: ChatRequest) ![]const u8 {
@@ -381,7 +503,7 @@ pub const ChatClient = struct {
             const arr_start = pos + 14;
             // Arrays use brackets, so match with the bracket matcher.
             const bracket_end = findMatchingBracket(json, arr_start) orelse break;
-            const arr = json[arr_start..bracket_end + 1];
+            const arr = json[arr_start .. bracket_end + 1];
             var i: usize = 1; // skip '['
             while (i < arr.len) : (i += 1) {
                 if (arr[i] == '{') {
@@ -410,7 +532,7 @@ pub const ChatClient = struct {
     }
 };
 
-fn extractField(obj: []const u8, field: []const u8) ?[]const u8 {
+pub fn extractField(obj: []const u8, field: []const u8) ?[]const u8 {
     var buf: [128]u8 = undefined;
     const needle = std.fmt.bufPrint(&buf, "\"{s}\":", .{field}) catch return null;
     const pos = std.mem.indexOf(u8, obj, needle) orelse return null;
@@ -431,7 +553,7 @@ fn extractField(obj: []const u8, field: []const u8) ?[]const u8 {
     return null;
 }
 
-fn extractNestedField(obj: []const u8, outer: []const u8, inner: []const u8) ?[]const u8 {
+pub fn extractNestedField(obj: []const u8, outer: []const u8, inner: []const u8) ?[]const u8 {
     var buf: [128]u8 = undefined;
     const needle = std.fmt.bufPrint(&buf, "\"{s}\":", .{outer}) catch return null;
     const pos = std.mem.indexOf(u8, obj, needle) orelse return null;
@@ -443,7 +565,7 @@ fn extractNestedField(obj: []const u8, outer: []const u8, inner: []const u8) ?[]
     return extractField(obj[brace..obj_end], inner);
 }
 
-fn escape(alloc: std.mem.Allocator, input: []const u8, out: *std.ArrayList(u8)) !void {
+pub fn escape(alloc: std.mem.Allocator, input: []const u8, out: *std.ArrayList(u8)) !void {
     for (input) |c| {
         switch (c) {
             '"' => try out.appendSlice(alloc, "\\\""),
@@ -456,7 +578,7 @@ fn escape(alloc: std.mem.Allocator, input: []const u8, out: *std.ArrayList(u8)) 
     }
 }
 
-fn unescape(alloc: std.mem.Allocator, input: []const u8) ![]const u8 {
+pub fn unescape(alloc: std.mem.Allocator, input: []const u8) ![]const u8 {
     // Lightweight unescape for content/reasoning (backslash escapes only).
     // Must allocate with the caller's allocator so deinit can free it.
     var out = try std.ArrayList(u8).initCapacity(alloc, 0);
@@ -480,7 +602,7 @@ fn unescape(alloc: std.mem.Allocator, input: []const u8) ![]const u8 {
     return out.toOwnedSlice(alloc);
 }
 
-fn findMatchingBrace(json: []const u8, start: usize) ?usize {
+pub fn findMatchingBrace(json: []const u8, start: usize) ?usize {
     if (start >= json.len or json[start] != '{') return null;
     var count: i32 = 1;
     var i = start + 1;
@@ -560,7 +682,7 @@ pub fn errorMessage(alloc: std.mem.Allocator, body: []const u8) ?[]const u8 {
 /// Escape-aware string field extractor: finds `"key":"…"`, scans to the real
 /// closing quote (skipping backslash escape pairs), returns the DECODED value.
 /// Null when the key is absent or its value is not a plain string.
-fn extractStringField(alloc: std.mem.Allocator, obj: []const u8, key: []const u8) !?[]const u8 {
+pub fn extractStringField(alloc: std.mem.Allocator, obj: []const u8, key: []const u8) !?[]const u8 {
     var buf: [128]u8 = undefined;
     const needle = std.fmt.bufPrint(&buf, "\"{s}\":", .{key}) catch return null;
     const pos = std.mem.indexOf(u8, obj, needle) orelse return null;
