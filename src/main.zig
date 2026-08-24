@@ -477,7 +477,7 @@ pub const LoopExtensions = struct {
         if (std.mem.eql(u8, call.name, skill_mod.skill_use_name)) return try self.skillUse(alloc, call);
         if (std.mem.eql(u8, call.name, "memory_get")) return try self.memoryGet(alloc, call);
         if (std.mem.eql(u8, call.name, "memory_set")) return try self.memorySet(alloc, io, call);
-        if (std.mem.eql(u8, call.name, "ask_user")) {
+        if (ask_user.isAskUserTool(call.name)) {
             const r = try ask_user.execute(alloc, .{ .name = call.name, .arguments = call.arguments });
             return .{ .success = r.success, .output = r.output, .err_msg = r.err_msg };
         }
@@ -1850,6 +1850,11 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
     // is wired right after the chat client exists below.
     try tools.register(spawn_agent.definition);
     try tools.register(ask_user.definition);
+    // Upstream alias — canonical is ask_user_question (advertise both,
+    // document canonical). Keep alias for backward compatibility.
+    if (!tools.contains(ask_user.canonical_definition.name)) {
+        try tools.register(ask_user.canonical_definition);
+    }
     try tool_attachments.registerAttachments(tools);
     g_ask_storage = .{ .publish = publishAskFrame, .store = questions.sharedStore() catch null };
     ask_user.setAskCtx(&g_ask_storage);

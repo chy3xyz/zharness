@@ -93,10 +93,27 @@ pub const AskCtx = struct {
     store: ?*questions.Store = null,
     timeout_ms: u64 = default_timeout_ms,
     poll_ms: u64 = 250,
+    /// When true the caller is a live subagent owned by another agent. The
+    /// upstream contract (dsh-user-approval / tool-ask-user) requires a
+    /// fail-fast DELEGATED_CALLER error instead of parking for a human
+    /// answer that can never arrive.
+    is_subagent: bool = false,
 };
 
-// ── registry-facing definition ──────────────────────────────────────────────
+/// Stable DELEGATED_CALLER guidance — mirrors upstream dsh-tool-ask-user's
+/// error so the model can correct without context loss.
+pub const delegated_caller_msg = "human interaction is unavailable while the calling agent is owned by another live agent; include the unresolved question or decision in the child agent's final result";
 
+/// Canonical upstream name — the model-visible schema source is
+/// dsh-tool-ask-user (questions array). `ask_user` is retained as an alias
+/// for backward compatibility; documentation advertises the canonical name.
+pub const canonical_name = "ask_user_question";
+pub const alias_name = "ask_user";
+
+// ── registry-facing definitions ────────────────────────────────────────────
+
+/// Legacy alias: `ask_user` with a flat question+options schema. Kept for
+/// backward compatibility; new prompts should use `ask_user_question`.
 pub const definition = tool_reg.ToolDefinition{
     .name = "ask_user",
     .description =
@@ -112,6 +129,42 @@ pub const definition = tool_reg.ToolDefinition{
     \\{"type":"object","properties":{"question":{"type":"string","description":"The question to show the user, self-contained and specific"},"options":{"type":"array","items":{"type":"string"},"maxItems":4,"description":"Optional 2-4 short choice labels; omit for free-text answers"}},"required":["question"]}
     ,
 };
+
+/// Canonical upstream definition: `ask_user_question` with the questions-array
+/// schema (dsh-tool-ask-user). Both definitions dispatch through the same
+/// executor so a model using either name gets identical behaviour.
+pub const canonical_definition = tool_reg.ToolDefinition{
+    .name = "ask_user_question",
+    .description =
+    \\Ask the user one or more concise questions when you need confirmation, a choice, or missing information before proceeding. Each question needs a stable id echoed in the answer; optionally include header, options with label/description, and multi_select.
+    ,
+    .category = .general,
+    .parameters_json =
+    \\{"type":"object","properties":{"questions":{"type":"array","description":"Questions to ask the user before continuing.","items":{"type":"object","properties":{"id":{"type":"string","description":"Stable id for this question; echoed in the answer."},"question":{"type":"string","description":"The specific question to ask the user."},"header":{"type":"string","description":"Optional short heading for the question"},"options":{"type":"array","description":"Optional choices to show the user.","items":{"type":"object","properties":{"label":{"type":"string","description":"Short user-facing option label."},"description":{"type":"string","description":"One sentence explaining the tradeoff."}},"required":["label"]}},"multi_select":{"type":"boolean","description":"Whether the user may select more than one option. Defaults to false."}},"required":["id","question"]}}},"required":["questions"]}
+    ,
+};
+
+/// Whether `name` is the canonical upstream tool name.
+pub fn isCanonicalName(name: []const u8) bool {
+    return std.mem.eql(u8, name, canonical_name);
+}
+
+/// Whether `name` matches either advertised tool name.
+pub fn isAskUserTool(name: []const u8) bool {
+    return std.mem.eql(u8, name, canonical_name) or std.mem.eql(u8, name, alias_name);
+}
+
+/// Register both tool definitions at once. The canonical definition is
+/// documented; the alias is kept for compatibility. Interactive adapters call
+/// this; CLI-only runs register only what they need.
+pub fn registerAll(reg: *tool_reg.ToolRegistry) !void {
+    if (!reg.contains(definition.name)) {
+        try reg.register(definition);
+    }
+    if (!reg.contains(canonical_definition.name)) {
+        try reg.register(canonical_definition);
+    }
+}
 
 // ── executor ────────────────────────────────────────────────────────────────
 
@@ -267,31 +320,52 @@ fn buildQuestionsJson(alloc: std.mem.Allocator, args: *const Args) ![]u8 {
     return try out.toOwnedSlice(alloc);
 }
 
-/// Dispatch an ask_user call. Blocks until answered/cancelled/timeout (see
-/// header: holds the run slot by design). Allocations use `alloc`; the caller
-/// frees via freeResult.
+/// Dispatch an ask_user / ask_user_question call. Blocks until
+/// answered/cancelled/timeout (see header: holds the run slot by design).
+/// Allocations use `alloc`; the caller frees via freeResult.
 pub fn execute(alloc: std.mem.Allocator, call: ToolCall) !ToolResult {
+    if (!isAskUserTool(call.name)) {
+        return fail(alloc, "ask_user tool called with unknown name");
+    }
     const wiring = g_ask_ctx orelse return fail(
         alloc,
         "ask_user is not wired: the host must call ask_user.setAskCtx(&AskCtx{...}) at startup",
     );
+    // Subagent exclusion — fail fast, never park.
+    if (wiring.is_subagent) return fail(alloc, delegated_caller_msg);
     const store = wiring.store orelse return fail(alloc, "ask_user is not wired: missing questions store");
     const publish = wiring.publish orelse return fail(alloc, "ask_user is not wired: missing mux publisher");
     if (wiring.session_id.len == 0) return fail(alloc, "ask_user is not wired: missing session id");
 
-    var args = parseArgs(alloc, call.arguments) catch |e| switch (e) {
-        error.MissingQuestion => return fail(alloc, "missing question"),
-        error.BadQuestion => return fail(alloc, "question must be a string"),
-        error.BadOption => return fail(alloc, "options must be an array of strings"),
-        error.OutOfMemory => return error.OutOfMemory,
-    };
-    defer args.deinit(alloc);
-    if (args.question.len == 0) return fail(alloc, "question must be a non-empty string");
-    if (args.options.len > max_options)
-        return fail(alloc, "options supports at most 4 entries");
+    // Dual schema: upstream canonical `{"questions":[...]}` vs legacy flat
+    // `{"question": "...", "options": [...]}`. Canonical wins when present.
+    var questions_json: []const u8 = undefined;
+    var owned_questions: ?[]u8 = null;
+    defer if (owned_questions) |q| alloc.free(q);
 
-    const questions_json = try buildQuestionsJson(alloc, &args);
-    defer alloc.free(questions_json);
+    if (jsonx.getRaw(call.arguments, "questions")) |questions_raw| {
+        const trimmed = jsonx.trimWs(questions_raw);
+        if (trimmed.len < 2 or trimmed[0] != '[') return fail(alloc, "questions must be a non-empty array");
+        // Validate at least one element by scanning.
+        var scan = ElemScanner.init(trimmed);
+        if (scan.next() == null) return fail(alloc, "questions must be a non-empty array");
+        // Keep raw array verbatim — questions.zig validates ids/labels on respond.
+        owned_questions = try alloc.dupe(u8, trimmed);
+        questions_json = owned_questions.?;
+    } else {
+        var args = parseArgs(alloc, call.arguments) catch |e| switch (e) {
+            error.MissingQuestion => return fail(alloc, "missing question"),
+            error.BadQuestion => return fail(alloc, "question must be a string"),
+            error.BadOption => return fail(alloc, "options must be an array of strings"),
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        defer args.deinit(alloc);
+        if (args.question.len == 0) return fail(alloc, "question must be a non-empty string");
+        if (args.options.len > max_options)
+            return fail(alloc, "options supports at most 4 entries");
+        owned_questions = try buildQuestionsJson(alloc, &args);
+        questions_json = owned_questions.?;
+    }
 
     // Register FIRST (mints the questionRpcId), then publish with that id —
     // an ultra-early respond between register and publish settles cleanly

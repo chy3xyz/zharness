@@ -40,6 +40,75 @@ pub const Level = enum {
     }
 };
 
+// ── permission presets → sandbox + approval mapping ───────────────────────
+//
+// Upstream dsh-permission-presets bundles sandboxMode + approvalPolicy:
+//
+//   read-only           read-only              native confinement + ask
+//   workspace-write     workspace-write        process (L1) + ask   ← default
+//   danger-full-access  danger-full-access     none (L0) + never
+//
+// zharness Level.off ≙ none (native trusted), Level.process ≙ workspace-write.
+// The approval half lives in questions.zig's ApprovalPolicy (ask|never). This
+// module owns the preset↔︎(sandbox,approval) translation so callers in cli_flags
+// or config can apply one knob change atomically.
+
+pub const PresetId = enum {
+    read_only,
+    workspace_write,
+    danger_full_access,
+    custom,
+
+    pub fn asStr(self: PresetId) []const u8 {
+        return switch (self) {
+            .read_only => "read-only",
+            .workspace_write => "workspace-write",
+            .danger_full_access => "danger-full-access",
+            .custom => "custom",
+        };
+    }
+    pub fn fromString(s: []const u8) ?PresetId {
+        if (std.mem.eql(u8, s, "read-only")) return .read_only;
+        if (std.mem.eql(u8, s, "workspace-write")) return .workspace_write;
+        if (std.mem.eql(u8, s, "danger-full-access")) return .danger_full_access;
+        if (std.mem.eql(u8, s, "custom")) return .custom;
+        return null;
+    }
+};
+
+pub const PresetMapping = struct {
+    preset: PresetId,
+    /// Native sandbox Level (off = L0 trusted, process = L1).
+    level: Level,
+    /// Approval policy string ("ask" | "never") — string to avoid circular
+    /// import of questions.zig; callers compare against ApprovalPolicy.asStr().
+    approval: []const u8,
+};
+
+pub const preset_table = [_]PresetMapping{
+    .{ .preset = .read_only, .level = .off, .approval = "ask" },
+    .{ .preset = .workspace_write, .level = .process, .approval = "ask" },
+    .{ .preset = .danger_full_access, .level = .off, .approval = "never" },
+};
+
+/// Preset for a (level, approval) pair. Unknown combos → .custom.
+pub fn presetForConfig(level: Level, approval: []const u8) PresetId {
+    for (&preset_table) |row| {
+        if (row.level == level and std.mem.eql(u8, row.approval, approval)) return row.preset;
+    }
+    return .custom;
+}
+
+/// (level, approval) for a preset id. Unknown ids → null (caller rejects).
+pub fn configForPreset(preset: []const u8) ?PresetMapping {
+    const id = PresetId.fromString(preset) orelse return null;
+    if (id == .custom) return null;
+    for (&preset_table) |row| {
+        if (row.preset == id) return row;
+    }
+    return null;
+}
+
 pub const Verdict = union(enum) {
     allow,
     deny: []const u8, // static reason text

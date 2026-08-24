@@ -25,6 +25,11 @@ pub const SubFlags = struct {
     preset: ?[]const u8 = null,
     /// Sandbox level override: off | native | process.
     sandbox: ?[]const u8 = null,
+    /// Approval policy override: ask | never (fail-closed).
+    approval: ?[]const u8 = null,
+    /// Permission preset override (read-only|workspace-write|danger-full-access).
+    /// Maps to sandbox + approval atomically; wins over individual overrides.
+    permission_preset: ?[]const u8 = null,
     /// TCP port for `serve` (--port N).
     port: ?[]const u8 = null,
     /// MCP stdio server commands (`--mcp "<argv...>"`), repeatable, capped.
@@ -69,6 +74,14 @@ pub fn parseSubFlags(args: []const []const u8, max_positionals: usize) ParseErro
             i += 1;
             if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingFlagValue;
             out.sandbox = args[i];
+        } else if (std.mem.eql(u8, a, "--approval")) {
+            i += 1;
+            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingFlagValue;
+            out.approval = args[i];
+        } else if (std.mem.eql(u8, a, "--permission-preset")) {
+            i += 1;
+            if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingFlagValue;
+            out.permission_preset = args[i];
         } else if (std.mem.eql(u8, a, "--port")) {
             i += 1;
             if (i >= args.len or std.mem.startsWith(u8, args[i], "--")) return error.MissingFlagValue;

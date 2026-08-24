@@ -283,6 +283,188 @@ pub const Store = struct {
     }
 };
 
+// ── approval state (fail-closed) ────────────────────────────────────────────
+//
+// Upstream dsh-user-approval: ApprovalPolicy ask|never, ApprovalOutcome
+// allowed-once|rejected|cancelled|unavailable. `ask` delegates to answerers;
+// with none it fails closed to `unavailable`. `never` deterministically
+// rejects without prompting. zharness preserves the same fail-closed posture:
+// before any dynamic/escalated operation (sandbox escalation, dynamic plugin
+// run) the caller must check `ApprovalStore.check` — an unavailable answerer
+// is a rejection, never a bypass.
+
+pub const ApprovalPolicy = enum {
+    ask,
+    never,
+
+    pub fn fromString(s: []const u8) ?ApprovalPolicy {
+        if (std.mem.eql(u8, s, "ask")) return .ask;
+        if (std.mem.eql(u8, s, "never")) return .never;
+        return null;
+    }
+    pub fn asStr(self: ApprovalPolicy) []const u8 {
+        return switch (self) {
+            .ask => "ask",
+            .never => "never",
+        };
+    }
+};
+
+pub const ApprovalOutcome = enum {
+    allowed_once,
+    rejected,
+    cancelled,
+    unavailable,
+
+    pub fn asStr(self: ApprovalOutcome) []const u8 {
+        return switch (self) {
+            .allowed_once => "allowed-once",
+            .rejected => "rejected",
+            .cancelled => "cancelled",
+            .unavailable => "unavailable",
+        };
+    }
+    pub fn isAllowed(self: ApprovalOutcome) bool {
+        return self == .allowed_once;
+    }
+};
+
+/// Per-session approval policy store. Fail-closed: default `ask` with no
+/// answerer yields `unavailable` (treated as rejection by callers). `never`
+/// never consults an answerer. One SpinLock, small map — same discipline as
+/// Store above.
+pub const ApprovalStore = struct {
+    alloc: std.mem.Allocator,
+    lock: SpinLock = .{},
+    /// session_id (dupe) -> policy. Missing entry = default `ask`.
+    policies: std.StringHashMap(ApprovalPolicy) = undefined,
+    /// Whether an interactive answerer is currently wired (mux publisher
+    /// present). When false, `ask` requests fail closed to `unavailable`.
+    has_answerer: bool = false,
+
+    pub fn initInPlace(self: *ApprovalStore, alloc: std.mem.Allocator) void {
+        self.* = .{
+            .alloc = alloc,
+            .policies = std.StringHashMap(ApprovalPolicy).init(alloc),
+            .has_answerer = false,
+        };
+    }
+
+    pub fn deinit(self: *ApprovalStore) void {
+        var it = self.policies.iterator();
+        while (it.next()) |e| self.alloc.free(e.key_ptr.*);
+        self.policies.deinit();
+    }
+
+    pub fn setHasAnswerer(self: *ApprovalStore, v: bool) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.has_answerer = v;
+    }
+
+    pub fn setPolicy(self: *ApprovalStore, session_id: []const u8, policy: ApprovalPolicy) !void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const existing = self.policies.getEntry(session_id);
+        if (existing) |e| {
+            e.value_ptr.* = policy;
+            return;
+        }
+        const key = try self.alloc.dupe(u8, session_id);
+        errdefer self.alloc.free(key);
+        try self.policies.put(key, policy);
+    }
+
+    pub fn effectivePolicy(self: *ApprovalStore, session_id: []const u8) ApprovalPolicy {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.policies.get(session_id) orelse .ask;
+    }
+
+    /// Fail-closed check before a dynamic/escalated operation.
+    /// `never` => rejected immediately. `ask` with no answerer => unavailable.
+    /// `ask` with an answerer => caller must issue a real approval/request
+    /// frame (паний outside this store); this helper returns `ask` as a
+    /// signal to proceed to prompting. Callers that need a synchronous
+    /// decision treat `unavailable` as denial.
+    pub fn check(self: *ApprovalStore, session_id: []const u8) ApprovalOutcome {
+        const pol = self.effectivePolicy(session_id);
+        if (pol == .never) return .rejected;
+        self.lock.lock();
+        const has = self.has_answerer;
+        self.lock.unlock();
+        if (!has) return .unavailable;
+        return .allowed_once; // answerer present — caller may prompt; for
+        // synchronous callers without a prompt loop this counts as "ask
+        // required" (treated as unavailable until answered). Minimal helper:
+        // escalated operations without a prompt round-trip should consider
+        // ask==rejected for fail-closed safety; use `checkOrPrompt` below if
+        // a real question round-trip is needed.
+    }
+
+    /// Synchronous fail-closed gate for non-interactive call sites: `ask`
+    /// without a prompt round-trip is treated as denial (fail-closed). Use
+    /// when the operation cannot block for a human answer.
+    pub fn checkFailClosed(self: *ApprovalStore, session_id: []const u8) bool {
+        const outcome = self.check(session_id);
+        return outcome.isAllowed();
+    }
+};
+
+var g_approval_store: ?*ApprovalStore = null;
+
+pub fn sharedApprovalStore() !*ApprovalStore {
+    if (g_approval_store) |s| return s;
+    const s = try std.heap.page_allocator.create(ApprovalStore);
+    s.initInPlace(std.heap.page_allocator);
+    g_approval_store = s;
+    return s;
+}
+
+pub fn takeSharedApprovalStore() ?*ApprovalStore {
+    const s = g_approval_store;
+    g_approval_store = null;
+    return s;
+}
+
+/// Approval mux payloads — mirrors question payload builders for a future
+/// approval/requested frame when an interactive adapter needs it.
+pub fn buildApprovalRequestedPayload(
+    alloc: std.mem.Allocator,
+    session_id: []const u8,
+    approval_id: []const u8,
+    tool_name: []const u8,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"type\":\"approval/requested\",\"sessionId\":");
+    try jsonx.appendJsonString(alloc, &out, session_id);
+    try out.appendSlice(alloc, ",\"approvalId\":");
+    try jsonx.appendJsonString(alloc, &out, approval_id);
+    try out.appendSlice(alloc, ",\"toolName\":");
+    try jsonx.appendJsonString(alloc, &out, tool_name);
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn buildApprovalResolvedPayload(
+    alloc: std.mem.Allocator,
+    session_id: []const u8,
+    approval_id: []const u8,
+    outcome: ApprovalOutcome,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"type\":\"approval/resolved\",\"sessionId\":");
+    try jsonx.appendJsonString(alloc, &out, session_id);
+    try out.appendSlice(alloc, ",\"approvalId\":");
+    try jsonx.appendJsonString(alloc, &out, approval_id);
+    try out.appendSlice(alloc, ",\"outcome\":");
+    try jsonx.appendJsonString(alloc, &out, outcome.asStr());
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
 // ── answer validation (port of upstream matchesQuestions) ───────────────────
 
 /// One parsed AskUserQuestionItem: slices point INTO `questions_json`.

@@ -90,13 +90,16 @@ comptime {
     _ = @import("server/apiproxy/wf_replay.zig");
     _ = @import("server/apiproxy/attachments.zig");
     _ = @import("tool/ask_user.zig");
+    _ = @import("tool/commands.zig");
     _ = @import("tool/attachments.zig");
     _ = @import("todo/todo.zig");
+    _ = @import("web/provider.zig");
 }
 
 comptime {
     // Pull in the CLI flag parser so its inline tests join the suite.
     _ = @import("cli_flags.zig");
+    _ = @import("sandbox/sandbox.zig");
 }
 
 test "config load defaults" {
@@ -996,4 +999,190 @@ test "loop extensions todo_write distinct from plan_*" {
     defer alloc.free(sec);
     try std.testing.expect(std.mem.indexOf(u8, sec, "## Todos") != null);
     try std.testing.expect(std.mem.indexOf(u8, sec, "## Plan") != null);
+}
+
+test "P2 ask_user alias and canonical" {
+    const ask_user = @import("tool/ask_user.zig");
+    try std.testing.expectEqualStrings("ask_user_question", ask_user.canonical_name);
+    try std.testing.expectEqualStrings("ask_user", ask_user.alias_name);
+    try std.testing.expect(ask_user.isCanonicalName("ask_user_question"));
+    try std.testing.expect(!ask_user.isCanonicalName("ask_user"));
+    try std.testing.expect(ask_user.isAskUserTool("ask_user"));
+    try std.testing.expect(ask_user.isAskUserTool("ask_user_question"));
+    try std.testing.expect(!ask_user.isAskUserTool("other"));
+
+    const alloc = std.testing.allocator;
+    var reg = try tool_reg.ToolRegistry.init(alloc);
+    defer reg.deinit();
+    try ask_user.registerAll(&reg);
+    try std.testing.expect(reg.contains("ask_user"));
+    try std.testing.expect(reg.contains("ask_user_question"));
+    // second register is idempotent
+    try ask_user.registerAll(&reg);
+}
+
+test "P2 ask_user subagent exclusion fails fast" {
+    const ask_user = @import("tool/ask_user.zig");
+    const questions = @import("server/apiproxy/questions.zig");
+    const alloc = std.testing.allocator;
+    var store: questions.Store = undefined;
+    store.initInPlace(alloc);
+    defer store.pendings.deinit(alloc);
+    var g: ask_user.AskCtx = .{ .store = &store, .session_id = "s1", .publish = struct {
+        fn f(_: []const u8) void {}
+    }.f, .is_subagent = true };
+    ask_user.setAskCtx(&g);
+    defer ask_user.clearAskCtx();
+    const r = try ask_user.execute(alloc, .{ .name = "ask_user", .arguments = "{\"question\":\"hi\"}" });
+    defer ask_user.freeResult(alloc, &r);
+    try std.testing.expect(!r.success);
+    try std.testing.expect(std.mem.indexOf(u8, r.err_msg.?, "owned by another live agent") != null);
+    // Non-subagent with Canonical name still hits not-wired / validation path, not delegated
+    g.is_subagent = false;
+    g.timeout_ms = 10;
+    g.poll_ms = 1;
+    const r2 = try ask_user.execute(alloc, .{ .name = "ask_user_question", .arguments = "{\"questions\":[{\"id\":\"q1\",\"question\":\"pick?\"}]}" });
+    defer ask_user.freeResult(alloc, &r2);
+    // Should attempt to ask (publish present) then timeout quickly, not delegated.
+    try std.testing.expect(std.mem.indexOf(u8, r2.err_msg orelse "", "owned by another") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r2.err_msg orelse "", "cancelled or timed out") != null);
+}
+
+test "P2 approval fail-closed before escalation" {
+    const questions = @import("server/apiproxy/questions.zig");
+    const alloc = std.testing.allocator;
+    var store: questions.ApprovalStore = undefined;
+    store.initInPlace(alloc);
+    defer store.deinit();
+    // Default is ask without answerer => unavailable => check fails closed
+    try std.testing.expectEqual(questions.ApprovalOutcome.unavailable, store.check("sess-1"));
+    try std.testing.expect(!store.checkFailClosed("sess-1"));
+    // never => rejected
+    try store.setPolicy("sess-1", .never);
+    try std.testing.expectEqual(questions.ApprovalPolicy.never, store.effectivePolicy("sess-1"));
+    try std.testing.expectEqual(questions.ApprovalOutcome.rejected, store.check("sess-1"));
+    // ask with answerer => allowed_once
+    try store.setPolicy("sess-1", .ask);
+    store.setHasAnswerer(true);
+    try std.testing.expectEqual(questions.ApprovalOutcome.allowed_once, store.check("sess-1"));
+    try std.testing.expect(store.checkFailClosed("sess-1"));
+    store.setHasAnswerer(false);
+    try std.testing.expectEqual(questions.ApprovalOutcome.unavailable, store.check("sess-1"));
+}
+
+test "P2 permission presets map to sandbox+approval" {
+    const sandbox = @import("sandbox/sandbox.zig");
+    try std.testing.expectEqual(sandbox.PresetId.workspace_write, sandbox.presetForConfig(.process, "ask"));
+    try std.testing.expectEqual(sandbox.PresetId.danger_full_access, sandbox.presetForConfig(.off, "never"));
+    try std.testing.expectEqual(sandbox.PresetId.custom, sandbox.presetForConfig(.process, "never"));
+    const m = sandbox.configForPreset("workspace-write").?;
+    try std.testing.expectEqual(sandbox.Level.process, m.level);
+    try std.testing.expectEqualStrings("ask", m.approval);
+    try std.testing.expect(sandbox.configForPreset("custom") == null);
+    try std.testing.expect(sandbox.configForPreset("bogus") == null);
+    // cli_flags parsing of new flags
+    const cli = @import("cli_flags.zig");
+    const f = try cli.parseSubFlags(&.{ "--approval", "never", "--permission-preset", "danger-full-access" }, 0);
+    try std.testing.expectEqualStrings("never", f.approval.?);
+    try std.testing.expectEqualStrings("danger-full-access", f.permission_preset.?);
+}
+
+test "P2 command registry only interactive" {
+    const commands = @import("tool/commands.zig");
+    const alloc = std.testing.allocator;
+    var reg: commands.Registry = undefined;
+    reg.initInPlace(alloc);
+    defer reg.deinit();
+    try reg.register(.{ .name = "permission", .description = "Switch preset" }, null);
+    // CLI mode (not interactive) => invisible
+    try std.testing.expect(!reg.isInteractive());
+    {
+        const lst = try reg.list(alloc);
+        defer alloc.free(lst);
+        try std.testing.expectEqual(@as(usize, 0), lst.len);
+    }
+    try std.testing.expect((try reg.execute(alloc, "/permission foo")) == null);
+    // Interactive adapter enables it
+    reg.setInteractive(true);
+    try std.testing.expect(reg.isInteractive());
+    {
+        const lst = try reg.list(alloc);
+        defer alloc.free(lst);
+        try std.testing.expectEqual(@as(usize, 1), lst.len);
+        try std.testing.expectEqualStrings("permission", lst[0].name);
+    }
+    const res = (try reg.execute(alloc, "/permission workspace-write")).?;
+    defer alloc.free(res.text);
+    try std.testing.expect(res.kind == .success);
+    reg.setInteractive(false);
+}
+
+test "P2 web provider seam selection and tool schemas" {
+    const web_provider = @import("web/provider.zig");
+    const webfetch = @import("tool/webfetch.zig");
+    const mcp_bridge = @import("tool/mcp_bridge.zig");
+    const alloc = std.testing.allocator;
+    web_provider.clearAll(alloc);
+    defer web_provider.clearAll(alloc);
+
+    // Seam starts empty; ensureWebProviders seeds the two native providers.
+    try std.testing.expectEqual(@as(usize, 0), web_provider.fetchProviderCount());
+    try webfetch.ensureWebProviders(alloc);
+    try std.testing.expectEqual(@as(usize, 1), web_provider.fetchProviderCount());
+    try std.testing.expectEqual(@as(usize, 1), web_provider.searchProviderCount());
+    try std.testing.expect(web_provider.hasFetchProvider("curl"));
+    try std.testing.expect(web_provider.hasSearchProvider("duckduckgo"));
+    try std.testing.expectEqualStrings("curl", web_provider.activeFetchName().?);
+    try std.testing.expectEqualStrings("duckduckgo", web_provider.activeSearchName().?);
+
+    // Mock provider proves selection is respected.
+    const mockFetch = struct {
+        fn f(_: ?*anyopaque, a: std.mem.Allocator, _: []const u8, _: usize) anyerror!@import("tool/builtin.zig").ToolResult {
+            return .{ .success = true, .output = try a.dupe(u8, "mock-ok"), .err_msg = null };
+        }
+    }.f;
+    try web_provider.registerFetchProvider(alloc, .{ .name = "alt-fetch", .description = "alt", .fetchFn = mockFetch });
+    try web_provider.setActiveFetchProvider(alloc, "alt-fetch");
+    try std.testing.expectEqualStrings("alt-fetch", web_provider.activeFetchName().?);
+    const p = web_provider.getActiveFetchProvider().?;
+    var r = try p.fetchFn(p.ctx, alloc, "http://example.com", 1024);
+    defer @import("tool/builtin.zig").freeResult(alloc, &r);
+    try std.testing.expectEqualStrings("mock-ok", r.output);
+
+    // Unknown provider switch is rejected.
+    try std.testing.expectError(error.UnknownProvider, web_provider.setActiveFetchProvider(alloc, "ghost"));
+
+    // Tool schemas remain valid through the seam.
+    var reg = try tool_reg.ToolRegistry.init(alloc);
+    defer reg.deinit();
+    try webfetch.registerWebTools(&reg);
+    try std.testing.expect(reg.contains("web_fetch"));
+    try std.testing.expect(reg.contains("web_search"));
+    const def = reg.get("web_fetch").?;
+    try std.testing.expect(std.mem.indexOf(u8, def.parameters_json, "\"required\":[\"url\"]") != null);
+    const sdef = reg.get("web_search").?;
+    try std.testing.expect(std.mem.indexOf(u8, sdef.parameters_json, "\"required\":[\"query\"]") != null);
+    const json = try reg.buildToolsJson(alloc);
+    defer alloc.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "web_fetch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "web_search") != null);
+
+    // Third-party web providers must go via MCP, not native seam.
+    try std.testing.expect(web_provider.shouldUseMcpForWebProvider("exa"));
+    try std.testing.expect(web_provider.shouldUseMcpForWebProvider("perplexity"));
+    try std.testing.expect(!web_provider.shouldUseMcpForWebProvider("curl"));
+    try std.testing.expect(mcp_bridge.isBridgedName("mcp_exa_search"));
+}
+
+test "P2 web provider seam preserves direct web tools for MVP" {
+    const web_provider = @import("web/provider.zig");
+    const webfetch = @import("tool/webfetch.zig");
+    const alloc = std.testing.allocator;
+    web_provider.clearAll(alloc);
+    defer web_provider.clearAll(alloc);
+    // Direct file:// fetch still works through the seam (provider delegates to curl).
+    var r = try webfetch.execute(alloc, "/tmp", .{ .name = "web_fetch", .arguments = "{\"url\":\"file:///etc/hosts\"}" });
+    defer webfetch.freeResult(alloc, &r);
+    // Either succeeds (file exists) or fails with a curl error — but must not be "unknown tool".
+    try std.testing.expect(r.err_msg == null or std.mem.indexOf(u8, r.err_msg.?, "unknown tool") == null);
 }

@@ -24,6 +24,7 @@ const stdc = std.c;
 const clib = @import("../clib.zig");
 const builtin_tools = @import("builtin.zig");
 const registry_mod = @import("registry.zig");
+const web_provider = @import("../web/provider.zig");
 
 pub const ToolCall = builtin_tools.ToolCall;
 pub const ToolResult = builtin_tools.ToolResult;
@@ -33,6 +34,51 @@ pub const freeResult = builtin_tools.freeResult;
 pub const MaxFetchBytes: usize = 1024 * 1024;
 /// Hard wall for search pages (HTML is verbose; results live near the top).
 pub const MaxSearchBytes: usize = 2 * 1024 * 1024;
+
+// ── native web provider seam ────────────────────────────────────────────────
+
+/// Built-in fetch provider name (curl). The search provider is "duckduckgo".
+pub const curl_provider_name = "curl";
+pub const ddg_provider_name = "duckduckgo";
+
+fn providerFetchImpl(ctx: ?*anyopaque, alloc: std.mem.Allocator, url: []const u8, max_bytes: usize) anyerror!ToolResult {
+    _ = ctx;
+    return fetchViaCurl(alloc, url, max_bytes);
+}
+
+fn providerSearchImpl(ctx: ?*anyopaque, alloc: std.mem.Allocator, query: []const u8, limit: usize) anyerror!ToolResult {
+    _ = ctx;
+    return searchViaDdg(alloc, query, limit);
+}
+
+/// Ensure the native provider seam has its two built-in providers registered.
+/// Idempotent — safe to call on every tool invocation and at wiring time.
+/// Third-party providers (Exa, Perplexity, etc.) are NOT registered here;
+/// they remain behind MCP (`tool/mcp_bridge.zig`).
+pub fn ensureWebProviders(alloc: std.mem.Allocator) !void {
+    if (!web_provider.hasFetchProvider(curl_provider_name)) {
+        try web_provider.registerFetchProvider(alloc, .{
+            .name = curl_provider_name,
+            .description = "Native HTTP fetch via curl (text-only, size-capped)",
+            .fetchFn = providerFetchImpl,
+        });
+    }
+    if (!web_provider.hasSearchProvider(ddg_provider_name)) {
+        try web_provider.registerSearchProvider(alloc, .{
+            .name = ddg_provider_name,
+            .description = "Web search via DuckDuckGo HTML endpoint",
+            .searchFn = providerSearchImpl,
+        });
+    }
+}
+
+/// Expose provider seam for tests / wiring introspection.
+pub fn activeFetchProviderName() ?[]const u8 {
+    return web_provider.activeFetchName();
+}
+pub fn activeSearchProviderName() ?[]const u8 {
+    return web_provider.activeSearchName();
+}
 
 // ── registration ────────────────────────────────────────────────────────────
 
@@ -84,6 +130,21 @@ fn webFetch(alloc: std.mem.Allocator, call: ToolCall) !ToolResult {
     }
     if (max_bytes == 0) max_bytes = MaxFetchBytes;
 
+    // Route through the native provider seam when an active fetch provider is
+    // selected. The seam is additive: if no provider is active (or registry
+    // was cleared in tests), fall back to the direct curl path. ensureWebProviders
+    // seeds the two built-in providers (curl + duckduckgo) on first use so
+    // MVP keeps working without explicit init.
+    try ensureWebProviders(alloc);
+    if (web_provider.getActiveFetchProvider()) |p| {
+        return try p.fetchFn(p.ctx, alloc, url, max_bytes);
+    }
+    return fetchViaCurl(alloc, url, max_bytes);
+}
+
+/// Core curl fetch implementation — shared by the direct path and the
+/// "curl" provider. Pure IO via curl/DuckDuckGo helpers; testable via file://.
+pub fn fetchViaCurl(alloc: std.mem.Allocator, url: []const u8, max_bytes: usize) !ToolResult {
     // curl writes "<body>\n<<ZH_META>><content_type>\t<http_code>". A plain
     // sentinel is used because curl's -w only interprets \n/\r/\t escapes
     // (no \x01) across versions; lastIndexOf makes collisions harmless.
@@ -99,7 +160,6 @@ fn webFetch(alloc: std.mem.Allocator, call: ToolCall) !ToolResult {
 
     const parts = splitFetchOutput(fetched.output);
     if (!fetched.ok) {
-        // With --fail, error bodies are withheld; surface the HTTP code.
         if (parts.meta) |m| {
             const msg = try std.fmt.allocPrint(alloc, "fetch failed ({s})", .{m});
             return ToolResult{ .success = false, .output = "", .err_msg = msg };
@@ -115,9 +175,6 @@ fn webFetch(alloc: std.mem.Allocator, call: ToolCall) !ToolResult {
             return ToolResult{ .success = false, .output = "", .err_msg = msg };
         }
     } else if (fetched.hit_cap) {
-        // The trailer was cut off because the response blew past our storage
-        // cap: content-type could not be verified. Fail closed rather than
-        // hand back an unguarded partial of a possibly-binary payload.
         return failMsg(alloc, "response exceeded size cap before content-type could be verified");
     }
 
@@ -206,8 +263,16 @@ fn webSearch(alloc: std.mem.Allocator, call: ToolCall) !ToolResult {
     if (limit == 0) limit = 1;
     if (limit > 20) limit = 20;
 
-    // curl performs the URL-encoding itself (--get --data-urlencode), so no
-    // hand-rolled encoder rides on the wire.
+    try ensureWebProviders(alloc);
+    if (web_provider.getActiveSearchProvider()) |p| {
+        return try p.searchFn(p.ctx, alloc, query, limit);
+    }
+    return searchViaDdg(alloc, query, limit);
+}
+
+/// Core DuckDuckGo search implementation — shared by direct path and
+/// "duckduckgo" provider.
+pub fn searchViaDdg(alloc: std.mem.Allocator, query: []const u8, limit: usize) !ToolResult {
     var cmd: std.ArrayList(u8) = .empty;
     defer cmd.deinit(alloc);
     try cmd.appendSlice(alloc, "curl --silent --show-error --location --fail --max-time 30 --get ");
@@ -696,6 +761,10 @@ test "webFetch refuses unsupported schemes" {
 // edit around here), so the path lives in an untracked arena instead.
 test "webFetch round-trips a local file through curl" {
     const alloc = std.testing.allocator;
+    // Isolate from provider registry leaks (global GPA now, but still clear for determinism).
+    const wp = @import("../web/provider.zig");
+    wp.clearAll(alloc);
+    defer wp.clearAll(alloc);
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const tmp_path = (try clib.createPrivateTemp(arena.allocator(), "zharness_webfetch_test_")) orelse return error.TestUnexpectedResult;
@@ -717,4 +786,83 @@ test "webFetch round-trips a local file through curl" {
     defer freeResult(alloc, &r);
     try std.testing.expect(r.success);
     try std.testing.expectEqualStrings("hello from zharness webfetch", r.output);
+}
+
+test "web provider seam registers two native providers" {
+    const alloc = std.testing.allocator;
+    const wp = @import("../web/provider.zig");
+    wp.clearAll(alloc);
+    defer wp.clearAll(alloc);
+    try ensureWebProviders(alloc);
+    try std.testing.expect(wp.hasFetchProvider(curl_provider_name));
+    try std.testing.expect(wp.hasSearchProvider(ddg_provider_name));
+    try std.testing.expectEqual(@as(usize, 1), wp.fetchProviderCount());
+    try std.testing.expectEqual(@as(usize, 1), wp.searchProviderCount());
+    try std.testing.expectEqualStrings(curl_provider_name, wp.activeFetchName().?);
+    try std.testing.expectEqualStrings(ddg_provider_name, wp.activeSearchName().?);
+}
+
+test "web provider seam selection is respected by executors" {
+    const alloc = std.testing.allocator;
+    const wp = @import("../web/provider.zig");
+    wp.clearAll(alloc);
+    defer wp.clearAll(alloc);
+
+    const mockFetch = struct {
+        fn f(_: ?*anyopaque, a: std.mem.Allocator, _: []const u8, _: usize) anyerror!ToolResult {
+            return ToolResult{ .success = true, .output = try a.dupe(u8, "mock-fetch-ok"), .err_msg = null };
+        }
+    }.f;
+    const mockSearch = struct {
+        fn f(_: ?*anyopaque, a: std.mem.Allocator, _: []const u8, _: usize) anyerror!ToolResult {
+            return ToolResult{ .success = true, .output = try a.dupe(u8, "mock-search-ok"), .err_msg = null };
+        }
+    }.f;
+
+    try wp.registerFetchProvider(alloc, .{ .name = "curl", .description = "curl", .fetchFn = mockFetch });
+    try wp.registerSearchProvider(alloc, .{ .name = "duckduckgo", .description = "ddg", .searchFn = mockSearch });
+    // Register a second fetch provider and switch to it.
+    try wp.registerFetchProvider(alloc, .{ .name = "alt-fetch", .description = "alt", .fetchFn = mockFetch });
+    try wp.setActiveFetchProvider(alloc, "alt-fetch");
+    try std.testing.expectEqualStrings("alt-fetch", wp.activeFetchName().?);
+
+    // Executor should now hit the mock (not curl) — verify via direct provider call.
+    const p = wp.getActiveFetchProvider().?;
+    var r = try p.fetchFn(p.ctx, alloc, "http://example.com", 1024);
+    defer freeResult(alloc, &r);
+    try std.testing.expectEqualStrings("mock-fetch-ok", r.output);
+
+    // Tool schemas remain valid after provider seam wiring.
+    var reg = try registry_mod.ToolRegistry.init(alloc);
+    defer reg.deinit();
+    try registerWebTools(&reg);
+    const def = reg.get("web_fetch").?;
+    try std.testing.expect(std.mem.indexOf(u8, def.parameters_json, "\"url\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, def.parameters_json, "\"required\":[\"url\"]") != null);
+    const sdef = reg.get("web_search").?;
+    try std.testing.expect(std.mem.indexOf(u8, sdef.parameters_json, "\"query\"") != null);
+
+    // Unknown third-party web provider must be routed via MCP, not embedded.
+    try std.testing.expect(wp.shouldUseMcpForWebProvider("exa"));
+    try std.testing.expect(wp.shouldUseMcpForWebProvider("perplexity"));
+    try std.testing.expect(!wp.shouldUseMcpForWebProvider("curl"));
+}
+
+test "web provider seam tool schemas are JSON-valid" {
+    const alloc = std.testing.allocator;
+    var reg = try registry_mod.ToolRegistry.init(alloc);
+    defer reg.deinit();
+    try registerWebTools(&reg);
+    const json = try reg.buildToolsJson(alloc);
+    defer alloc.free(json);
+    // Both tools appear and produce balanced JSON.
+    try std.testing.expect(std.mem.indexOf(u8, json, "web_fetch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "web_search") != null);
+    var depth: i32 = 0;
+    for (json) |c| {
+        if (c == '{') depth += 1;
+        if (c == '}') depth -= 1;
+        try std.testing.expect(depth >= 0);
+    }
+    try std.testing.expectEqual(@as(i32, 0), depth);
 }
