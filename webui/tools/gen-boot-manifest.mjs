@@ -46,6 +46,8 @@ const ROSTER = [
   '@deepseek-ai/dsh-client-ui-settings',
   '@deepseek-ai/dsh-client-ui-settings-general',
   '@deepseek-ai/dsh-client-ui-settings-models',
+  '@deepseek-ai/dsh-client-ui-settings-plugins',
+  '@deepseek-ai/dsh-client-ui-settings-plugin-inventory',
   '@deepseek-ai/dsh-client-ui-zharness-general',
   '@deepseek-ai/dsh-client-ui-conversation',
   '@deepseek-ai/dsh-client-ui-tool',

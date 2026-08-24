@@ -38,6 +38,7 @@ const server_events = @import("server/events.zig");
 const server_static = @import("server/static.zig");
 const apiproxy = @import("server/apiproxy/router.zig");
 const apix_sessions = @import("server/apiproxy/sessions.zig");
+const apix_inventory = @import("server/apiproxy/inventory.zig");
 const events_ws = @import("server/apiproxy/events_ws.zig");
 
 const SYSTEM_PROMPT =
@@ -353,6 +354,17 @@ fn optsFromFlags(alloc: std.mem.Allocator, flags: *const cli_flags.SubFlags) !Lo
     return lopts;
 }
 
+/// Hot-reload primitive: fresh Config from disk for ONE run, with the
+/// serve-time CLI overrides re-applied (env > flags > file precedence kept).
+fn loadRunConfig(alloc: std.mem.Allocator, base: *config.Config, ov: ServeOverrides) !config.Config {
+    _ = base;
+    var cfg = try config.load(alloc);
+    errdefer cfg.deinit();
+    try cfg.applyOverrides(ov.model, ov.provider, ov.no_stream);
+    applySandboxOverride(&cfg, ov.sandbox);
+    return cfg;
+}
+
 /// Apply the --sandbox flag directly onto the loaded config.
 fn applySandboxOverride(cfg: *config.Config, flag: ?[]const u8) void {
     const v = flag orelse return;
@@ -659,10 +671,26 @@ pub fn registerExtensionTools(reg: *tool_reg.ToolRegistry, opts: struct { skills
 // ── serve (dev.md §XXIII): HTTP API over the agent loop ─────────────────────
 
 /// Shared state for the HTTP dependency callbacks.
+/// Serve-time CLI overrides, re-applied on every per-run config reload so
+/// boot-flag precedence (env > flags > file) is preserved across reloads.
+pub const ServeOverrides = struct {
+    model: ?[]const u8 = null,
+    provider: ?[]const u8 = null,
+    no_stream: bool = false,
+    sandbox: ?[]const u8 = null,
+};
+
 const ServeState = struct {
     alloc: std.mem.Allocator,
     cfg: *config.Config,
     opts: LoopOpts,
+    ov: ServeOverrides = .{},
+
+    /// Fresh Config for ONE run: re-reads ~/.zharness/config.toml so settings
+    /// edits apply to the next message without a server restart.
+    fn reloadConfig(st: *ServeState, alloc: std.mem.Allocator) !config.Config {
+        return loadRunConfig(alloc, st.cfg, st.ov);
+    }
 };
 
 fn serveRunTask(
@@ -672,9 +700,13 @@ fn serveRunTask(
     session_id: ?[]const u8,
 ) anyerror![]const u8 {
     const st: *ServeState = @ptrCast(@alignCast(@constCast(ctx.?)));
+    // Hot config: re-read config.toml for THIS run (settings-page edits apply
+    // to the next message). Runs are serialized by the caller's contract.
+    var run_cfg = try st.reloadConfig(st.alloc);
+    defer run_cfg.deinit();
     // Run on the server's long-lived allocator, then re-home the answer into
     // the request arena the API layer frees from.
-    const answer = try agentRunOnce(st.alloc, st.cfg, st.opts, prompt, session_id);
+    const answer = try agentRunOnce(st.alloc, &run_cfg, st.opts, prompt, session_id);
     defer st.alloc.free(answer);
     return try alloc.dupe(u8, answer);
 }
@@ -780,7 +812,7 @@ fn fanoutBoth(line: []const u8) void {
     events_ws.publishObsEnvelope(line);
 }
 
-fn cmdServe(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts, port_arg: ?[]const u8) !void {
+fn cmdServe(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts, port_arg: ?[]const u8, ov: ServeOverrides) !void {
     var port: u16 = 3080;
     if (port_arg) |pa| {
         port = std.fmt.parseInt(u16, pa, 10) catch {
@@ -797,7 +829,7 @@ fn cmdServe(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts, port_
 
     const st = try alloc.create(ServeState);
     defer alloc.destroy(st);
-    st.* = .{ .alloc = alloc, .cfg = cfg, .opts = opts };
+    st.* = .{ .alloc = alloc, .cfg = cfg, .opts = opts, .ov = ov };
 
     // api.handle casts its ctx straight to *ServerDeps — the state pointer
     // rides inside deps.ctx.
@@ -814,7 +846,7 @@ fn cmdServe(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts, port_
     g_gpa = alloc;
     const apx_state = try alloc.create(ApxState);
     defer alloc.destroy(apx_state);
-    apx_state.* = .{ .alloc = alloc, .cfg = cfg, .opts = opts };
+    apx_state.* = .{ .alloc = alloc, .cfg = cfg, .opts = opts, .ov = ov };
     g_apx_state = apx_state;
 
     // dsh apiproxy surface (spec §4): unary RPC + WS event streams.
@@ -832,6 +864,7 @@ fn cmdServe(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts, port_
         .promptSession = apxPromptSession,
         .cancelSession = apxCancelSession,
         .renameSession = apxRenameSession,
+        .pluginInventoryList = apxPluginInventoryList,
     };
 
     // Live event feed: agent-loop envelopes fan out to BOTH consumers —
@@ -890,6 +923,7 @@ const ApxState = struct {
     alloc: std.mem.Allocator,
     cfg: *config.Config,
     opts: LoopOpts,
+    ov: ServeOverrides = .{},
 };
 
 fn apxState(ctx: ?*anyopaque) *ApxState {
@@ -1125,7 +1159,7 @@ fn apxPromptSession(ctx: ?*anyopaque, alloc: std.mem.Allocator, req: apiproxy.Pr
     // connection arena while the detached run is still emitting frames.
     const sid_copy: []const u8 = st.alloc.dupe(u8, req.session_id) catch return error.OutOfMemory;
 
-    const th = try std.Thread.spawn(.{}, runDetachedForGui, .{ st.alloc, st.cfg, st.opts, sid_copy, prompt_copy });
+    const th = try std.Thread.spawn(.{}, runDetachedForGui, .{ st.alloc, st.cfg, st.ov, st.opts, sid_copy, prompt_copy });
     th.detach();
     return .{};
 }
@@ -1134,11 +1168,17 @@ fn apxPromptSession(ctx: ?*anyopaque, alloc: std.mem.Allocator, req: apiproxy.Pr
 /// user/message before the loop and assistant/turn-end after (success or
 /// failure). The session id parks BEFORE the first frame — muxPublish drops
 /// everything while no run session is parked.
-fn runDetachedForGui(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts, session_id: []const u8, prompt: []const u8) void {
-    // ServeState outlives every detached run (serveBlocking never returns),
-    // so cfg is borrowed by pointer — no copy, no deinit here.
+fn runDetachedForGui(alloc: std.mem.Allocator, base_cfg: *config.Config, ov: ServeOverrides, opts: LoopOpts, session_id: []const u8, prompt: []const u8) void {
+    // ServeState outlives every detached run (serveBlocking never returns).
     g_run_mutex.lock();
     defer g_run_mutex.unlock();
+
+    // Hot config: re-read config.toml for THIS run (settings edits hot-apply).
+    var run_cfg = loadRunConfig(alloc, base_cfg, ov) catch {
+        muxPublishEvent("turn/end", false, "{\"turn\":1,\"reason\":{\"kind\":\"error\",\"error\":{\"message\":\"config reload failed\"}}}");
+        return;
+    };
+    defer run_cfg.deinit();
 
     // Route this run's loop events to the mux fold (parked before any frame).
     const sid_dup = gpaAlloc().dupe(u8, session_id) catch return;
@@ -1165,7 +1205,7 @@ fn runDetachedForGui(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOp
     }
 
     hostPublishFmtSession(session_id, true);
-    _ = agentRunOnce(alloc, cfg, opts, prompt, session_id) catch {
+    _ = agentRunOnce(alloc, &run_cfg, opts, prompt, session_id) catch {
         if (g_mux_run_error == null) g_mux_run_error = gpaAlloc().dupe(u8, "run failed") catch null;
         muxPublishEvent("turn/end", false, "{{\"turn\":1,\"reason\":{{\"kind\":\"error\",\"error\":{{\"message\":\"run failed\"}}}}}}");
         if (jsonEsc(gpaAlloc(), session_id)) |sid| {
@@ -1285,6 +1325,16 @@ fn apxMuxOpen(conn: *httpd.WsConn) void {
         frame.appendSlice(alloc, "}") catch continue;
         conn.writeText(frame.items) catch {};
     }
+}
+
+/// pluginInventory/list → fresh scan of BOTH plugin registries over the
+/// serve cwd (apiproxy/inventory.zig). Per-request dlopen is accepted; the
+/// scan never mutates the running tool surface.
+fn apxPluginInventoryList(ctx: ?*anyopaque, alloc: std.mem.Allocator) anyerror![]u8 {
+    const st = apxState(ctx);
+    const io = g_io orelse return error.IoUnavailable;
+    const home = homeDir() orelse "";
+    return apix_inventory.listValue(alloc, io, st.cfg.cwd, home);
 }
 
 // ── workflow (dev.md §XIX): JSON-defined multi-step agent runs ──────────────
@@ -2172,7 +2222,13 @@ pub fn main(init: std.process.Init) !void {
         applySandboxOverride(&cfg, flags.sandbox);
         const lopts = try optsFromFlags(alloc, &flags);
         applySandboxOverride(&cfg, flags.sandbox);
-        cmdServe(alloc, &cfg, lopts, flags.port) catch |e| {
+        const ov = ServeOverrides{
+            .model = flags.model,
+            .provider = flags.provider,
+            .no_stream = flags.no_stream,
+            .sandbox = flags.sandbox,
+        };
+        cmdServe(alloc, &cfg, lopts, flags.port, ov) catch |e| {
             std.debug.print("error: {s}\n", .{@errorName(e)});
             std.process.exit(1);
         };

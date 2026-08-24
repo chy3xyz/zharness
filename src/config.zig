@@ -187,6 +187,9 @@ pub const EnvSnapshot = struct {
     ollama_host: ?[]const u8 = null,
     endpoint: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
+    /// Contents of ~/.zharness/config.toml (the file layer, applied after
+    /// defaults and BEFORE the env overrides above — env beats file).
+    config_toml: ?[]const u8 = null,
 };
 
 fn optSpan(p: ?[*:0]const u8) ?[]const u8 {
@@ -200,7 +203,46 @@ fn optSpan(p: ?[*:0]const u8) ?[]const u8 {
 ///   2. ~/.zharness/config.toml [model] api_key (not read yet)
 /// Per-provider keys land in dedicated fields and are swapped in by
 /// applyOverrides when their provider is selected.
+extern "c" fn fopen(path: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
+extern "c" fn fread(buf: [*]u8, size: usize, n: usize, f: *anyopaque) usize;
+extern "c" fn fseek(f: *anyopaque, off: c_long, whence: c_int) c_int;
+extern "c" fn ftell(f: *anyopaque) c_long;
+extern "c" fn fclose(f: *anyopaque) c_int;
+
+/// Read a whole file via libc (no std.Io needed at config-load time).
+/// Returns null on any failure — the file layer is strictly best-effort.
+fn readFileLibc(alloc: std.mem.Allocator, path: []const u8) ?[]u8 {
+    const path_z = alloc.allocSentinel(u8, path.len, 0) catch return null;
+    @memcpy(path_z, path);
+    defer alloc.free(path_z);
+    const f = fopen(path_z.ptr, "rb") orelse return null;
+    defer _ = fclose(f);
+    if (fseek(f, 0, 2) != 0) return null; // SEEK_END
+    const size = ftell(f);
+    if (size < 0 or size > 4 * 1024 * 1024) return null;
+    if (fseek(f, 0, 0) != 0) return null; // SEEK_SET
+    const buf = alloc.alloc(u8, @intCast(size)) catch return null;
+    errdefer alloc.free(buf);
+    const got = fread(buf.ptr, 1, @intCast(size), f);
+    if (got != @as(usize, @intCast(size))) return null;
+    return buf;
+}
+
 pub fn load(alloc: std.mem.Allocator) !Config {
+    // File layer: ~/.zharness/config.toml (best-effort — absent/corrupt
+    // documents yield the defaults instead of failing the boot). Read via
+    // libc directly: load() runs before any std.Io exists in CLI paths.
+    var toml_text: ?[]const u8 = null;
+    const home = optSpan(std.c.getenv("HOME"));
+    if (home) |h| {
+        const path = std.fmt.allocPrint(alloc, "{s}/.zharness/config.toml", .{h}) catch null;
+        if (path) |pth| {
+            defer alloc.free(pth);
+            toml_text = readFileLibc(alloc, pth);
+        }
+    }
+    defer if (toml_text) |t| alloc.free(t);
+
     return loadFromSnapshot(alloc, .{
         .zharness_api_key = optSpan(std.c.getenv("ZHARNESS_API_KEY")),
         .deepseek_api_key = optSpan(std.c.getenv("DEEPSEEK_API_KEY")),
@@ -208,6 +250,7 @@ pub fn load(alloc: std.mem.Allocator) !Config {
         .ollama_host = optSpan(std.c.getenv("OLLAMA_HOST")),
         .endpoint = optSpan(std.c.getenv("ZHARNESS_ENDPOINT")),
         .cwd = optSpan(std.c.getenv("ZHARNESS_CWD")),
+        .config_toml = toml_text,
     });
 }
 
@@ -247,6 +290,61 @@ pub fn loadFromSnapshot(alloc: std.mem.Allocator, env: EnvSnapshot) !Config {
     if (env.endpoint) |ep| {
         alloc.free(cfg.endpoint);
         cfg.endpoint = try alloc.dupe(u8, ep);
+    }
+
+
+    // ── File layer: ~/.zharness/config.toml (env beats file per key) ──────
+    if (env.config_toml) |doc| {
+        const entries = (parseTomlFlat(alloc, doc) catch null) orelse
+            (parseTomlFlat(alloc, doc) catch null);
+        if (entries) |es| {
+            defer alloc.free(es);
+            const env_key = env.zharness_api_key != null or env.deepseek_api_key != null;
+            const env_endpoint = env.endpoint != null;
+            for (es) |e| {
+                defer if (e.val == .str) alloc.free(e.val.str);
+                const in_model = std.mem.eql(u8, e.section, "model");
+                const in_agent = std.mem.eql(u8, e.section, "agent");
+                const in_general = std.mem.eql(u8, e.section, "general");
+                // NOTE: e.val.str is freed at the top of the next iteration
+                // (defer above), so every string consumer dupes BEFORE any
+                // early continue.
+                if (in_model and std.mem.eql(u8, e.key, "provider")) {
+                    const v = try alloc.dupe(u8, e.val.str);
+                    alloc.free(cfg.provider);
+                    cfg.provider = v;
+                } else if (in_model and std.mem.eql(u8, e.key, "model")) {
+                    const v = try alloc.dupe(u8, e.val.str);
+                    alloc.free(cfg.model);
+                    cfg.model = v;
+                } else if (in_model and std.mem.eql(u8, e.key, "api_key")) {
+                    if (!env_key) {
+                        const v = try alloc.dupe(u8, e.val.str);
+                        alloc.free(cfg.api_key);
+                        cfg.api_key = v;
+                        cfg.api_key_is_global = false;
+                    }
+                } else if (in_model and std.mem.eql(u8, e.key, "endpoint")) {
+                    if (!env_endpoint) {
+                        const v = try alloc.dupe(u8, e.val.str);
+                        alloc.free(cfg.endpoint);
+                        cfg.endpoint = v;
+                    }
+                } else if (in_agent and std.mem.eql(u8, e.key, "max_turns")) {
+                    if (e.val.int > 0) cfg.max_turns = @intCast(e.val.int);
+                } else if (in_agent and std.mem.eql(u8, e.key, "reasoning_effort")) {
+                    const v = try alloc.dupe(u8, e.val.str);
+                    alloc.free(cfg.reasoning_effort);
+                    cfg.reasoning_effort = v;
+                } else if (in_agent and std.mem.eql(u8, e.key, "stream")) {
+                    cfg.stream = e.val.boolean;
+                } else if (in_general and std.mem.eql(u8, e.key, "sandbox_mode")) {
+                    if (e.val == .str) cfg.sandbox_mode = Config.SandboxMode.fromString(e.val.str);
+                }
+                // [preferences] * and unknown keys: owned by the settings
+                // store / deliberately ignored by the runtime.
+            }
+        }
     }
 
     return cfg;

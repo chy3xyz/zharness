@@ -534,6 +534,21 @@ pub const WasmRegistry = struct {
         return copy;
     }
 
+    /// Non-destructive manifest read for an ALREADY-REGISTERED plugin: call
+    /// its zh_manifest export, copy the JSON out, and return it (owned).
+    /// Never deinits the VM (the registry still owns it) and never writes
+    /// skip reports; null simply means "unreadable" and callers fall back to
+    /// a derived name. Used by apiproxy/inventory.zig.
+    pub fn peekManifest(self: *WasmRegistry, plugin_idx: usize) ?[]u8 {
+        const p = self.plugins.items[plugin_idx];
+        const ret = p.vm.call(EXP_MANIFEST, &.{}) catch return null;
+        const pl = unpackPtrLen(ret);
+        if (pl.len == 0 or pl.len > default_max_result_bytes) return null;
+        const mem = p.vm.memory();
+        if (@as(usize, pl.ptr) + pl.len > mem.len) return null;
+        return self.alloc.dupe(u8, mem[pl.ptr..][0..pl.len]) catch null;
+    }
+
     fn freeToolRow(self: *WasmRegistry, t: LoadedTool) void {
         self.alloc.free(t.host_name);
         self.alloc.free(t.tool_name);

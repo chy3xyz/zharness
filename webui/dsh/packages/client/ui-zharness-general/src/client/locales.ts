@@ -19,7 +19,7 @@ export type ZharnessGeneralKey = keyof typeof zh
 /** English dictionary, checked complete against the zh key set. */
 export const en: Record<ZharnessGeneralKey, string> = {
   'agent.title': 'Agent runtime',
-  'agent.restartHint': 'Persisted to ~/.zharness/config.toml; takes effect after restarting zharness.',
+  'agent.restartHint': 'Persisted to ~/.zharness/config.toml; applies to your next message (hot reload).',
   'agent.unavailable': 'Settings service unavailable (cannot read the document).',
   'agent.provider': 'Provider',
   'agent.model': 'Model',

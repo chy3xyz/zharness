@@ -1,6 +1,6 @@
 {
   "graph": {
-    "rev": "3da9b578ae8f",
+    "rev": "8133078fe8c4",
     "entries": [
       {
         "id": "@deepseek-ai/dsh-client-modules",
@@ -138,6 +138,29 @@
         ]
       },
       {
+        "id": "@deepseek-ai/dsh-client-ui-settings-plugins",
+        "url": "/plugins/@deepseek-ai/dsh-client-ui-settings-plugins/client.js?rev=827bb49e9592",
+        "rev": "827bb49e9592",
+        "inject": [
+          "@deepseek-ai/dsh-client-connection",
+          "@deepseek-ai/dsh-client-locale",
+          "@deepseek-ai/dsh-client-runtime",
+          "@deepseek-ai/dsh-client-ui-settings",
+          "@deepseek-ai/dsh-api-remotes"
+        ]
+      },
+      {
+        "id": "@deepseek-ai/dsh-client-ui-settings-plugin-inventory",
+        "url": "/plugins/@deepseek-ai/dsh-client-ui-settings-plugin-inventory/client.js?rev=ad2a3ed98212",
+        "rev": "ad2a3ed98212",
+        "inject": [
+          "@deepseek-ai/dsh-api-remotes",
+          "@deepseek-ai/dsh-client-runtime",
+          "@deepseek-ai/dsh-client-ui-settings",
+          "@deepseek-ai/dsh-client-locale"
+        ]
+      },
+      {
         "id": "@deepseek-ai/dsh-client-ui-zharness-general",
         "url": "/plugins/@deepseek-ai/dsh-client-ui-zharness-general/client.js?rev=6be85e1438c3",
         "rev": "6be85e1438c3",
@@ -215,7 +238,7 @@
       "kind": "global",
       "name": "__DSH_BOOT__",
       "value": {
-        "rev": "3da9b578ae8f",
+        "rev": "8133078fe8c4",
         "entries": [
           {
             "id": "@deepseek-ai/dsh-client-modules",
@@ -353,6 +376,29 @@
             ]
           },
           {
+            "id": "@deepseek-ai/dsh-client-ui-settings-plugins",
+            "url": "/plugins/@deepseek-ai/dsh-client-ui-settings-plugins/client.js?rev=827bb49e9592",
+            "rev": "827bb49e9592",
+            "inject": [
+              "@deepseek-ai/dsh-client-connection",
+              "@deepseek-ai/dsh-client-locale",
+              "@deepseek-ai/dsh-client-runtime",
+              "@deepseek-ai/dsh-client-ui-settings",
+              "@deepseek-ai/dsh-api-remotes"
+            ]
+          },
+          {
+            "id": "@deepseek-ai/dsh-client-ui-settings-plugin-inventory",
+            "url": "/plugins/@deepseek-ai/dsh-client-ui-settings-plugin-inventory/client.js?rev=ad2a3ed98212",
+            "rev": "ad2a3ed98212",
+            "inject": [
+              "@deepseek-ai/dsh-api-remotes",
+              "@deepseek-ai/dsh-client-runtime",
+              "@deepseek-ai/dsh-client-ui-settings",
+              "@deepseek-ai/dsh-client-locale"
+            ]
+          },
+          {
             "id": "@deepseek-ai/dsh-client-ui-zharness-general",
             "url": "/plugins/@deepseek-ai/dsh-client-ui-zharness-general/client.js?rev=6be85e1438c3",
             "rev": "6be85e1438c3",
@@ -427,6 +473,8 @@
     "@deepseek-ai/dsh-client-ui-settings",
     "@deepseek-ai/dsh-client-ui-settings-general",
     "@deepseek-ai/dsh-client-ui-settings-models",
+    "@deepseek-ai/dsh-client-ui-settings-plugins",
+    "@deepseek-ai/dsh-client-ui-settings-plugin-inventory",
     "@deepseek-ai/dsh-client-ui-zharness-general",
     "@deepseek-ai/dsh-client-ui-conversation",
     "@deepseek-ai/dsh-client-ui-tool",

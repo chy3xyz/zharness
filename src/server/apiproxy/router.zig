@@ -245,6 +245,9 @@ pub const CredentialsWriteFn = *const fn (
     alloc: std.mem.Allocator,
     payload: []const u8,
 ) anyerror!void;
+/// pluginInventory/list VALUE builder (vendored GUI Plugins-settings
+/// inventory tab) — fresh scan of both plugin registries; see inventory.zig.
+pub const PluginInventoryFn = *const fn (ctx: ?*anyopaque, alloc: std.mem.Allocator) anyerror![]u8;
 
 /// Function-pointer registry the integrator fills in. Required members are
 /// the conversation/session lifecycle only main.zig can know; every other
@@ -285,6 +288,7 @@ pub const ApiProxyDeps = struct {
     credentialsDescribe: ?CredentialsDescribeFn = null,
     credentialsSet: ?CredentialsWriteFn = null,
     credentialsUnset: ?CredentialsWriteFn = null,
+    pluginInventoryList: ?PluginInventoryFn = null,
 };
 
 // ── response rendering ──────────────────────────────────────────────────────
@@ -1426,6 +1430,20 @@ fn hSettingsOpenDocument(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, rp
 }
 
 
+// ── plugin inventory domain (vendored GUI Plugins-settings inventory tab) ───
+
+const apx_inventory = @import("inventory.zig");
+
+/// pluginInventory/list → fresh scan of BOTH plugin registries (native dylib
+/// + wasm) rendered into the upstream PluginInventorySnapshot shape. Payload
+/// is {} per the upstream descriptor (no parameters).
+fn hPluginInventoryList(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8) !UnaryResponse {
+    _ = payload;
+    const f = deps.pluginInventoryList orelse
+        return internalError(alloc, rpc_id, "pluginInventory is not implemented on this host");
+    return okValue(alloc, rpc_id, try f(deps.ctx, alloc));
+}
+
 // ── dispatch ────────────────────────────────────────────────────────────────
 
 pub const DispatchError = error{OutOfMemory};
@@ -1509,6 +1527,10 @@ pub fn dispatch(
     // llm domain (provider directory for the Models join; discovery is a
     // pi-ai/custom-route feature zharness does not offer)
     if (std.mem.eql(u8, m, "llm.providers")) return run(alloc, env, hLlmProviders(deps, alloc, env.rpc_id, p));
+
+    // plugin inventory (Plugins-settings inventory tab; upstream wire method
+    // keeps its slash form — the typert gateway composes namespace/method)
+    if (std.mem.eql(u8, m, "pluginInventory/list")) return run(alloc, env, hPluginInventoryList(deps, alloc, env.rpc_id, p));
 
     return badRequest(alloc, env.rpc_id, "unknown method");
 }

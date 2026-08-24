@@ -71,6 +71,7 @@ comptime {
     _ = @import("server/apiproxy/router.zig");
     _ = @import("server/apiproxy/events_ws.zig");
     _ = @import("server/apiproxy/sessions.zig");
+    _ = @import("server/apiproxy/inventory.zig");
     _ = @import("server/sse_run.zig");
 }
 
@@ -81,10 +82,50 @@ comptime {
 
 test "config load defaults" {
     const alloc = std.testing.allocator;
-    var cfg = try config.load(alloc);
+    // Pure defaults: no env, no file layer (load() would read the real
+    // ~/.zharness/config.toml — tests must not depend on the host machine).
+    var cfg = try config.loadFromSnapshot(alloc, .{});
     defer cfg.deinit();
     try std.testing.expectEqualSlices(u8, "deepseek-v4-flash", cfg.model);
     try std.testing.expectEqualSlices(u8, "deepseek", cfg.provider);
+}
+
+test "config file layer applies and env beats file" {
+    const alloc = std.testing.allocator;
+    const doc =
+        \\[model]
+        \\provider = "ollama"
+        \\model = "file-model"
+        \\api_key = "file-key"
+        \\endpoint = "http://file-endpoint"
+        \\
+        \\[agent]
+        \\max_turns = 32
+        \\stream = false
+        \\
+        \\[general]
+        \\sandbox_mode = "none"
+    ;
+    // File only:
+    var cfg = try config.loadFromSnapshot(alloc, .{ .config_toml = doc });
+    defer cfg.deinit();
+    try std.testing.expectEqualSlices(u8, "ollama", cfg.provider);
+    try std.testing.expectEqualSlices(u8, "file-model", cfg.model);
+    try std.testing.expectEqualSlices(u8, "file-key", cfg.api_key);
+    try std.testing.expectEqual(@as(usize, 32), cfg.max_turns);
+    try std.testing.expect(!cfg.stream);
+    try std.testing.expect(cfg.sandbox_mode == .none);
+    // Env beats file per key:
+    var cfg2 = try config.loadFromSnapshot(alloc, .{
+        .deepseek_api_key = "env-key",
+        .endpoint = "http://env-endpoint",
+        .config_toml = doc,
+    });
+    defer cfg2.deinit();
+    try std.testing.expectEqualSlices(u8, "env-key", cfg2.api_key);
+    try std.testing.expectEqualSlices(u8, "http://env-endpoint", cfg2.endpoint);
+    // ...while file-only keys still apply:
+    try std.testing.expectEqualSlices(u8, "file-model", cfg2.model);
 }
 
 test "tool registry builds json" {

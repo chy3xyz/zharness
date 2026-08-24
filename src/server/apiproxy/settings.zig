@@ -14,9 +14,9 @@
 //! Namespace ↔ config.toml mapping (v1):
 //!
 //!   agent        {provider,model,maxTurns,reasoningEffort,stream,sandboxMode}
-//!                ⇄ defaults ⊕ [model] provider/model ⊕ [agent] *   (restart)
+//!                ⇄ defaults ⊕ [model] provider/model ⊕ [agent] *   (per-run hot reload)
 //!   llm-deepseek {baseURL,apiKeyEnv?,models?}
-//!                ⇄ [model] endpoint/api_key/models                  (restart)
+//!                ⇄ [model] endpoint/api_key/models                  (per-run hot reload)
 //!   ui-theme     {preference} ⇄ [preferences] theme                 (live*)
 //!   locale       {preference?} ⇄ [preferences] locale               (live*)
 //!
@@ -298,10 +298,10 @@ pub fn appendNamespaceView(
         Store.ns_onboarding => null,
         else => unreachable,
     };
-    const applies: []const u8 = if (ns_id == Store.ns_theme or ns_id == Store.ns_locale or ns_id == Store.ns_onboarding)
-        "live"
-    else
-        "restart";
+    // Hot semantics: the server re-reads config.toml before every run, so
+    // agent/llm edits apply to the NEXT message without a restart. Theme/
+    // locale/onboarding are applied live by the owning client plugin.
+    const applies: []const u8 = "live";
 
     try out.appendSlice(alloc, "{\"ns\":");
     try jsonx.appendJsonString(alloc, out, ns_name);

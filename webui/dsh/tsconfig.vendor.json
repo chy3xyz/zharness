@@ -23,6 +23,10 @@
     // zharness: settings section plugins (sidebar.settings shell + Models page)
     { "path": "./packages/client/ui-settings-general" },
     { "path": "./packages/client/ui-settings-models" },
+    // zharness: Plugins settings section (section shell + configurable tab) and
+    // the read-only plugin-inventory tab (pluginInventory/list consumer)
+    { "path": "./packages/client/ui-settings-plugins" },
+    { "path": "./packages/client/ui-settings-plugin-inventory" },
     // zharness: General-page rows over the agent namespace (config.toml knobs)
     { "path": "./packages/client/ui-zharness-general" },
     { "path": "./packages/client/ui-sidebar" },
