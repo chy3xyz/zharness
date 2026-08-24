@@ -66,6 +66,15 @@ pub const ProviderProfile = struct {
     default_model: []const u8,
     auth: AuthStyle,
     wire: WireFormat,
+    /// Whether image content parts may be sent on the wire for this
+    /// provider's DEFAULT model family (wave 6 H-image). DeepSeek's chat
+    /// API is text-only (upstream llm-deepseek serializes images into
+    /// stable text placeholders), and local Ollama models vary too much to
+    /// promise vision; anthropic and OpenAI-compatible gateways accept
+    /// base64/data-URL images for their vision models. Callers pinning a
+    /// specific non-vision model through a vision-capable PROFILE should
+    /// clear this flag themselves.
+    vision: bool = false,
 };
 
 /// Anthropic requires a version tag on every request.
@@ -87,6 +96,7 @@ pub fn profile(p: Provider) ProviderProfile {
             .default_model = "gpt-4o-mini",
             .auth = .bearer,
             .wire = .openai_chat,
+            .vision = true,
         },
         .anthropic => .{
             .provider = .anthropic,
@@ -94,6 +104,7 @@ pub fn profile(p: Provider) ProviderProfile {
             .default_model = "claude-sonnet-4-20250514",
             .auth = .x_api_key,
             .wire = .anthropic_messages,
+            .vision = true,
         },
         .ollama => .{
             .provider = .ollama,

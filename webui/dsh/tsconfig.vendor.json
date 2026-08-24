@@ -34,6 +34,23 @@
     { "path": "./packages/client/ui-theme" },
     { "path": "./packages/client/ui-tool" },
     { "path": "./packages/client/ui-workspace" },
+    // zharness: wave-6 feature plugins (goal/skill/model-selection/agent-preset/
+    // permission-presets/subagent/plan/trajectory/user-questions/jobs/
+    // workflow-run/commands/message-feedback/reference)
+    { "path": "./packages/client/ui-agent-preset" },
+    { "path": "./packages/client/ui-commands" },
+    { "path": "./packages/client/ui-goal" },
+    { "path": "./packages/client/ui-jobs" },
+    { "path": "./packages/client/ui-message-feedback" },
+    { "path": "./packages/client/ui-model-selection" },
+    { "path": "./packages/client/ui-permission-presets" },
+    { "path": "./packages/client/ui-plan" },
+    { "path": "./packages/client/ui-reference" },
+    { "path": "./packages/client/ui-skill" },
+    { "path": "./packages/client/ui-subagent" },
+    { "path": "./packages/client/ui-trajectory" },
+    { "path": "./packages/client/ui-user-questions" },
+    { "path": "./packages/client/ui-workflow-run" },
     { "path": "./packages/client/web" },
     { "path": "./packages/code-runtime/code-runtime" },
     { "path": "./packages/compaction/compaction" },
@@ -108,6 +125,9 @@
     { "path": "./packages/util/output-retention" },
     { "path": "./packages/util/timeout" },
     { "path": "./packages/workspace/workspace" },
+    // zharness: workflow type contracts (consumed by ui-workflow-run)
+    { "path": "./packages/workflow/tool-workflow" },
+    { "path": "./packages/workflow/workflow" },
     { "path": "./vendor/cordis" },
     { "path": "./vendor/cosmokit" },
     { "path": "./vendor/schemastery" },

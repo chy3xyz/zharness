@@ -73,6 +73,23 @@ comptime {
     _ = @import("server/apiproxy/sessions.zig");
     _ = @import("server/apiproxy/inventory.zig");
     _ = @import("server/sse_run.zig");
+    // Wave-6 feature domains.
+    _ = @import("server/apiproxy/goals_rpc.zig");
+    _ = @import("server/apiproxy/skills_rpc.zig");
+    _ = @import("server/apiproxy/models_rpc.zig");
+    _ = @import("server/apiproxy/presets_rpc.zig");
+    _ = @import("server/apiproxy/perms_rpc.zig");
+    _ = @import("server/apiproxy/search_rpc.zig");
+    _ = @import("server/apiproxy/export_rpc.zig");
+    _ = @import("server/apiproxy/subagents_rpc.zig");
+    _ = @import("server/apiproxy/questions.zig");
+    _ = @import("server/apiproxy/plan_frames.zig");
+    _ = @import("server/apiproxy/jobs_rpc.zig");
+    _ = @import("server/apiproxy/trajectory.zig");
+    _ = @import("server/apiproxy/wf_replay.zig");
+    _ = @import("server/apiproxy/attachments.zig");
+    _ = @import("tool/ask_user.zig");
+    _ = @import("tool/attachments.zig");
 }
 
 comptime {

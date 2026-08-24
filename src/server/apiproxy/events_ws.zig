@@ -98,7 +98,6 @@ pub const FrameHub = struct {
     /// Wrap `payload_json` into the full form and send to all subscribers.
     /// Failures (write errors) drop the dead subscriber; they never surface.
     pub fn publish(self: *FrameHub, method: []const u8, payload_json: []const u8) void {
-        std.debug.print("[host-hub] {s} {s}\n", .{ method, payload_json });
         const frame = self.wrapServerRequest(method, payload_json) catch return;
         defer self.alloc.free(frame);
 
@@ -117,6 +116,24 @@ pub const FrameHub = struct {
             i += 1;
         }
         self.push_counter += 1;
+    }
+
+    /// Write a PRE-BUILT full frame (already ServerRequest-shaped). Used for
+    /// question/requested frames whose rpcId IS the respond correlation id —
+    /// re-wrapping would mint a fresh id and break that contract.
+    pub fn publishFrame(self: *FrameHub, frame_json: []const u8) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        var i: usize = 0;
+        while (i < self.subs.items.len) {
+            const sub = self.subs.items[i];
+            sub.conn.writeText(frame_json) catch {
+                _ = self.subs.swapRemove(i);
+                self.dropped += 1;
+                continue;
+            };
+            i += 1;
+        }
     }
 
     /// ServerRequest full form around a payload (fresh minted rpcId).
@@ -248,7 +265,6 @@ pub fn takeSharedHubs() ?*Hubs {
 /// Integrator hook: invoked right after a mux subscriber attaches, BEFORE the
 /// pump loop. Use it to write per-session baseline frames (session/subscribed)
 /// directly to the connection. Failures are ignored (peer may vanish mid-write).
-
 /// Integrator hook: invoked right after a mux subscriber attaches, BEFORE the
 /// pump loop. Use it to write per-session baseline frames (session/subscribed)
 /// directly to the connection. Failures are ignored (peer may vanish mid-write).

@@ -795,7 +795,7 @@ test "parseRunRequest extracts all fields and frees cleanly" {
     const alloc = testing.allocator;
     var req = (try parseRunRequest(alloc,
         \\{"prompt":"do it","session":"s1","preset":"ptc","sandbox":"process"}
-    )) ;
+    ));
     defer freeRunRequest(alloc, &req);
     try testing.expectEqualStrings("do it", req.prompt);
     try testing.expectEqualStrings("s1", req.session.?);

@@ -40,6 +40,7 @@
 const std = @import("std");
 const model_mod = @import("../model/model.zig");
 const builtin = @import("builtin.zig");
+const subagents_rpc = @import("../server/apiproxy/subagents_rpc.zig");
 const tool_reg = @import("registry.zig");
 const subagent = @import("../agent/subagent.zig");
 
@@ -71,6 +72,8 @@ pub const SpawnDeps = struct {
     default_max_turns: usize = subagent.default_max_turns,
     /// Output byte cap for the child's accumulated answer.
     default_output_cap: usize = subagent.default_output_cap,
+    /// Parent session for optional GUI subagent inventory tracking.
+    parent_session_id: []const u8 = "",
 };
 
 /// Production environment for the ready-made thunks: point SpawnDeps.deps.ctx
@@ -81,6 +84,7 @@ pub const SpawnEnv = struct {
     cwd: []const u8,
     /// Parent's sandbox policy, forwarded to builtin.execute (see W1 wiring).
     sandbox_mode: @import("../config.zig").Config.SandboxMode = .native,
+    parent_session_id: []const u8 = "",
 };
 
 /// Ready-made SubAgentDeps.chat_fn: ctx = *SpawnEnv.
@@ -198,9 +202,22 @@ pub fn execute(alloc: std.mem.Allocator, call: ToolCall) !ToolResult {
         if (parsed) |mt| spec.max_turns = @min(@max(mt, 1), hard_max_turns);
     }
 
-    var outcome = subagent.runSubagent(alloc, &wiring.deps, spec, task) catch |e|
+    const child_id = if (wiring.parent_session_id.len > 0)
+        subagents_rpc.beginRun(alloc, wiring.parent_session_id, spec.name, task) catch null
+    else
+        null;
+    var outcome = subagent.runSubagent(alloc, &wiring.deps, spec, task) catch |e| {
+        if (child_id) |id| {
+            subagents_rpc.endRun(id, false, null);
+            alloc.free(id);
+        }
         return fail(alloc, @errorName(e));
+    };
     defer outcome.deinit(alloc);
+    if (child_id) |id| {
+        subagents_rpc.endRun(id, true, outcome.text);
+        alloc.free(id);
+    }
 
     // Final text plus a small footer so the parent can see the cost.
     var out: std.ArrayList(u8) = .empty;

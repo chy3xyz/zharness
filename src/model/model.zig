@@ -34,6 +34,22 @@ pub const Role = enum {
     }
 };
 
+/// One image attached to a message (wave 6 H-image). Pure data: the base64
+/// payload is borrowed from wherever it was parsed (prompt content_json or a
+/// stored attachment), so no deinit is needed — slices must outlive the
+/// Message. Only vision-capable provider profiles (`ProviderProfile.vision`)
+/// put these on the wire; text-only providers degrade to a path note in the
+/// prompt text instead (see server/apiproxy/attachments.zig).
+pub const ImagePart = struct {
+    /// Canonical IANA media type: "image/png" | "image/jpeg" | "image/webp"
+    /// | "image/gif" (the same union upstream's prompt wire accepts).
+    media_type: []const u8,
+    /// Standard-alphabet base64 payload WITHOUT the data-URL prefix.
+    data_b64: []const u8,
+    /// Optional client-supplied display name.
+    name: ?[]const u8 = null,
+};
+
 pub const Message = struct {
     role: Role,
     content: []const u8,
@@ -42,6 +58,9 @@ pub const Message = struct {
     /// For assistant messages that requested tools: the raw tool_calls JSON
     /// echoed back to the provider on the next request so it accepts results.
     tool_calls_json: ?[]const u8 = null,
+    /// Optional image parts riding this message (user turns today). Default
+    /// empty: every existing text-only path stays byte-identical.
+    images: []const ImagePart = &.{},
 };
 
 pub const ToolCall = struct {
@@ -106,6 +125,14 @@ pub const ChatClient = struct {
     /// Messages-API translator (non-streaming; stream=true degrades).
     wire_format: WireFormat = .openai_chat,
 
+    /// Whether image parts on messages may be rendered onto the wire
+    /// (wave 6 H-image). Mirrors `ProviderProfile.vision` via initProvider /
+    /// useProvider; when false, image parts are dropped defensively and only
+    /// the message text is sent (the prompt-rewrite layer already replaced
+    /// them with path notes for text-only providers — this is a second gate,
+    /// so a mis-set profile can never produce a rejected multimodal body).
+    vision: bool = false,
+
     /// Optional live-delta sink for streamed requests. Set before the client
     /// value is copied into the agent loop; invoked per content/reasoning
     /// delta while a stream is in flight.
@@ -136,6 +163,7 @@ pub const ChatClient = struct {
         var self = ChatClient.init(alloc, io, prof.endpoint, if (model_name.len > 0) model_name else prof.default_model, api_key);
         self.auth_style = prof.auth;
         self.wire_format = prof.wire;
+        self.vision = prof.vision;
         return self;
     }
 
@@ -149,6 +177,7 @@ pub const ChatClient = struct {
         if (api_key) |k| self.api_key = k;
         self.auth_style = prof.auth;
         self.wire_format = prof.wire;
+        self.vision = prof.vision;
     }
 
     /// Detail text for the most recent failed request ("" when none).
@@ -393,7 +422,9 @@ pub const ChatClient = struct {
         return anthropic_wire.parseResponse(self.alloc, resp_body);
     }
 
-    fn buildBody(self: *ChatClient, req: ChatRequest) ![]const u8 {
+    /// Render the OpenAI-compatible request body for `req`. Public so test
+    /// roots can assert byte-level wire shapes without spawning curl.
+    pub fn buildBody(self: *ChatClient, req: ChatRequest) ![]const u8 {
         var body = try std.ArrayList(u8).initCapacity(self.alloc, 0);
         errdefer body.deinit(self.alloc);
         try body.appendSlice(self.alloc, "{\"model\":\"");
@@ -426,6 +457,26 @@ pub const ChatClient = struct {
             } else if (m.tool_calls_json != null) {
                 try body.appendSlice(self.alloc, "\",\"content\":null,\"tool_calls\":");
                 try body.appendSlice(self.alloc, m.tool_calls_json.?);
+                try body.appendSlice(self.alloc, "}");
+            } else if (m.images.len > 0 and self.vision) {
+                // OpenAI multimodal shape: content becomes a typed part
+                // array — one text part plus one data-URL image_url part per
+                // attached image. Only reached when the profile is
+                // vision-capable; otherwise the plain-string path below
+                // keeps text-only bodies byte-identical.
+                try body.appendSlice(self.alloc, "\",\"content\":[{\"type\":\"text\",\"text\":\"");
+                try escape(self.alloc, m.content, &body);
+                try body.appendSlice(self.alloc, "\"}");
+                for (m.images) |img| {
+                    try body.appendSlice(self.alloc, ",{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:");
+                    try escape(self.alloc, img.media_type, &body);
+                    try body.appendSlice(self.alloc, ";base64,");
+                    // Base64 alphabet carries no quote/backslash bytes, so a
+                    // raw append is safe and avoids a full payload copy.
+                    try body.appendSlice(self.alloc, img.data_b64);
+                    try body.appendSlice(self.alloc, "\"}}");
+                }
+                try body.appendSlice(self.alloc, "]");
                 try body.appendSlice(self.alloc, "}");
             } else {
                 try body.appendSlice(self.alloc, "\",\"content\":\"");

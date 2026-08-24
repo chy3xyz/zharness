@@ -102,8 +102,8 @@ pub fn formatMintedSessionId(buf: []u8, now_secs: i64) []const u8 {
     const minute = @divFloor(secs_of_day, 60);
     const sec = secs_of_day - minute * 60;
     return std.fmt.bufPrint(buf, "web-{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}", .{
-        @as(u64, @intCast(civ.year)), civ.month, civ.day,
-        @as(u32, @intCast(hour)),      @as(u32, @intCast(minute)), @as(u32, @intCast(sec)),
+        @as(u64, @intCast(civ.year)), civ.month,                  civ.day,
+        @as(u32, @intCast(hour)),     @as(u32, @intCast(minute)), @as(u32, @intCast(sec)),
     }) catch "web-session"; // unreachable with a sane buf; degrade gracefully
 }
 

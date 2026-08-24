@@ -40,6 +40,15 @@ const apiproxy = @import("server/apiproxy/router.zig");
 const apix_sessions = @import("server/apiproxy/sessions.zig");
 const apix_inventory = @import("server/apiproxy/inventory.zig");
 const events_ws = @import("server/apiproxy/events_ws.zig");
+const questions = @import("server/apiproxy/questions.zig");
+const ask_user = @import("tool/ask_user.zig");
+const attachments = @import("server/apiproxy/attachments.zig");
+const tool_attachments = @import("tool/attachments.zig");
+const goals_rpc = @import("server/apiproxy/goals_rpc.zig");
+const plan_frames = @import("server/apiproxy/plan_frames.zig");
+const jobs_rpc = @import("server/apiproxy/jobs_rpc.zig");
+const subagents_rpc = @import("server/apiproxy/subagents_rpc.zig");
+const search_rpc = @import("server/apiproxy/search_rpc.zig");
 
 const SYSTEM_PROMPT =
     \\You are zharness, a coding agent running inside a workspace. You help the user by
@@ -209,6 +218,11 @@ const RunLock = struct {
 
 var g_run_mutex: RunLock = .{};
 var g_apx_state: ?*ApxState = null;
+var g_ask_storage: ask_user.AskCtx = .{};
+
+fn publishAskFrame(frame_json: []const u8) void {
+    if (events_ws.sharedHubs()) |hubs| hubs.mux.publishFrame(frame_json) else |_| {}
+}
 
 /// Publish one SessionEventMap payload onto the mux hub, wrapped in the
 /// wire envelope {type:'session/event', sessionId, event} (spec §4).
@@ -390,6 +404,8 @@ pub const LoopExtensions = struct {
     wasm: ?*wasm_loader.WasmRegistry = null,
     /// Workspace cwd for cwd-aware extension tools (web_fetch etc.).
     cwd: []const u8,
+    /// Current session id for GUI projection publishers; empty for CLI runs.
+    session_id: []const u8 = "",
 
     pub fn extensions(self: *LoopExtensions) agent.Extensions {
         return .{ .ctx = self, .renderContext = renderContext, .executeTool = execTool };
@@ -440,6 +456,14 @@ pub const LoopExtensions = struct {
         if (std.mem.eql(u8, call.name, skill_mod.skill_use_name)) return try self.skillUse(alloc, call);
         if (std.mem.eql(u8, call.name, "memory_get")) return try self.memoryGet(alloc, call);
         if (std.mem.eql(u8, call.name, "memory_set")) return try self.memorySet(alloc, io, call);
+        if (std.mem.eql(u8, call.name, "ask_user")) {
+            const r = try ask_user.execute(alloc, .{ .name = call.name, .arguments = call.arguments });
+            return .{ .success = r.success, .output = r.output, .err_msg = r.err_msg };
+        }
+        if (std.mem.eql(u8, call.name, "attachment_list") or std.mem.eql(u8, call.name, "attachment_read")) {
+            const r = try tool_attachments.execute(alloc, io, self.cwd, .{ .name = call.name, .arguments = call.arguments });
+            return .{ .success = r.success, .output = r.output, .err_msg = r.err_msg };
+        }
         // ── swarm wave-2 tool surfaces ────────────────────────────────────
         if (std.mem.eql(u8, call.name, "spawn_agent")) {
             const r = try spawn_agent.execute(alloc, .{ .name = call.name, .arguments = call.arguments });
@@ -490,6 +514,7 @@ pub const LoopExtensions = struct {
             error.UnknownTool => return fail(alloc, "unknown plan tool"),
             error.OutOfMemory => return error.OutOfMemory,
         };
+        if (self.session_id.len > 0) plan_frames.publishPlanState(self.session_id, 1, self.plan_board);
         // msg is allocated with `alloc`; ToolResult.output has the same
         // ownership contract (freed via tool_builtin.freeResult).
         return .{ .success = true, .output = msg, .err_msg = null };
@@ -533,6 +558,7 @@ pub const LoopExtensions = struct {
             added += 1;
         }
         const msg = try std.fmt.allocPrint(alloc, "plan replaced with {d} task(s)", .{added});
+        if (self.session_id.len > 0) plan_frames.publishPlanState(self.session_id, 1, self.plan_board);
         return .{ .success = true, .output = msg, .err_msg = null };
     }
 
@@ -542,6 +568,7 @@ pub const LoopExtensions = struct {
         if (map.get("text")) |text| {
             if (text.len == 0) return fail(alloc, "goal text must not be empty");
             try self.goal_board.set(text);
+            if (self.session_id.len > 0) goals_rpc.agentObjective(self.session_id, text);
             if (self.working) |wm| wm.set("goal", text) catch {};
             return ok(alloc, "goal set");
         }
@@ -848,6 +875,7 @@ fn cmdServe(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts, port_
     defer alloc.destroy(apx_state);
     apx_state.* = .{ .alloc = alloc, .cfg = cfg, .opts = opts, .ov = ov };
     g_apx_state = apx_state;
+    _ = search_rpc.installDefault(cfg.cwd) catch {};
 
     // dsh apiproxy surface (spec §4): unary RPC + WS event streams.
     const apx_deps = try alloc.create(apiproxy.ApiProxyDeps);
@@ -865,6 +893,7 @@ fn cmdServe(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts, port_
         .cancelSession = apxCancelSession,
         .renameSession = apxRenameSession,
         .pluginInventoryList = apxPluginInventoryList,
+        .searchSessions = search_rpc.searchSessionsFn,
     };
 
     // Live event feed: agent-loop envelopes fan out to BOTH consumers —
@@ -1047,19 +1076,16 @@ fn apxCreateSession(
         const cwd_json = jsonEsc(gpaAlloc(), st.cfg.cwd) orelse null;
         defer if (cwd_json) |cj| gpaAlloc().free(cj);
         const line = if (cwd_json) |cj|
-            std.fmt.allocPrint(gpaAlloc(),
-                "{{\"sessionId\":{s},\"blank\":true,\"cwd\":{s}}}", .{ sid, cj }) catch null
+            std.fmt.allocPrint(gpaAlloc(), "{{\"sessionId\":{s},\"blank\":true,\"cwd\":{s}}}", .{ sid, cj }) catch null
         else
-            std.fmt.allocPrint(gpaAlloc(),
-                "{{\"sessionId\":{s},\"blank\":true}}", .{sid}) catch null;
+            std.fmt.allocPrint(gpaAlloc(), "{{\"sessionId\":{s},\"blank\":true}}", .{sid}) catch null;
         if (line) |l| {
             defer gpaAlloc().free(l);
             hostPublish("host/session-added", l);
         }
         // Mux baseline for the newborn session: the client's open() settles
         // on this frame (upstream pushes it on session/created).
-        const sub = std.fmt.allocPrint(gpaAlloc(),
-            "{{\"type\":\"session/subscribed\",\"sessionId\":{s},\"lastSeq\":0}}", .{sid}) catch null;
+        const sub = std.fmt.allocPrint(gpaAlloc(), "{{\"type\":\"session/subscribed\",\"sessionId\":{s},\"lastSeq\":0}}", .{sid}) catch null;
         if (sub) |sl| {
             defer gpaAlloc().free(sl);
             if (events_ws.sharedHubs()) |hubs| {
@@ -1105,8 +1131,7 @@ fn apxCreateSession(
                 ) catch {};
                 if (view.items.len > 0) {
                     // The wrapper owns the quotes around the view value.
-                    const wrapped = std.fmt.allocPrint(gpaAlloc(),
-                        "{{\"workspace\":{s}}}", .{view.items}) catch null;
+                    const wrapped = std.fmt.allocPrint(gpaAlloc(), "{{\"workspace\":{s}}}", .{view.items}) catch null;
                     if (wrapped) |w| {
                         defer gpaAlloc().free(w);
                         hostPublish("host/workspace-changed", w);
@@ -1126,40 +1151,33 @@ fn apxPromptSession(ctx: ?*anyopaque, alloc: std.mem.Allocator, req: apiproxy.Pr
     const st = apxState(ctx);
     if (req.mode == .steer) return error.SteerUnavailable;
 
-    // content_json is the client's message-parts ARRAY (already the raw
-    // value slice from the payload); v1 accepts the FIRST {"type":"text"}
-    // member as the prompt (spec §7 drops image parts). Parts are scanned
-    // structurally (brace matcher per element): a naive substring search
-    // would hit the "text" VALUE of {"type":"text"} before the text KEY and
-    // yield an empty prompt.
-    const jsonx = @import("server/apiproxy/jsonx.zig");
-    const prompt_text: ?[]const u8 = blk: {
-        const raw_arr = req.content_json;
-        if (raw_arr.len < 2 or raw_arr[0] != '[' or raw_arr[raw_arr.len - 1] != ']') break :blk null;
-        const inner = raw_arr[1 .. raw_arr.len - 1];
-        var i: usize = 0;
-        while (i < inner.len) {
-            while (i < inner.len and (inner[i] == ',' or inner[i] == ' ' or inner[i] == '\n' or inner[i] == '\t' or inner[i] == '\r')) : (i += 1) {}
-            if (i >= inner.len) break;
-            if (inner[i] != '{') break;
-            const end = jsonx.matchBraceFrom(inner, i) orelse break;
-            const part = inner[i..end];
-            i = end;
-            const t = jsonx.getRaw(part, "type") orelse continue;
-            if (!std.mem.eql(u8, t, "\"text\"")) continue;
-            break :blk (jsonx.getStringAlloc(st.alloc, part, "text") catch null) orelse "";
-        }
-        break :blk null;
-    };
-    const prompt_copy: []const u8 = if (prompt_text) |t|
-        t // ownership passes to the detached run
-    else
-        st.alloc.dupe(u8, "") catch return error.OutOfMemory;
+    // Persist and normalize text/image parts before handing ownership to the
+    // detached run. The image pipeline is vision-aware and degrades to a path
+    // note for text-only providers.
+    const io = g_io orelse return error.IoUnavailable;
+    const vision = if (st.cfg.resolvedProfile()) |p| p.vision else false;
+    // This object crosses the request boundary into the detached run, so it
+    // must live on the serve allocator rather than the connection arena.
+    const pi = try st.alloc.create(attachments.PromptImages);
+    errdefer st.alloc.destroy(pi);
+    pi.* = attachments.processPromptContent(
+        st.alloc,
+        io,
+        ".zharness/attachments",
+        req.session_id,
+        req.content_json,
+        vision,
+    ) catch |e| return e;
+    errdefer pi.deinit(st.alloc);
+    const prompt_copy = pi.prompt_text;
     // The session id must outlive the REQUEST: req slices die with the
     // connection arena while the detached run is still emitting frames.
     const sid_copy: []const u8 = st.alloc.dupe(u8, req.session_id) catch return error.OutOfMemory;
 
-    const th = try std.Thread.spawn(.{}, runDetachedForGui, .{ st.alloc, st.cfg, st.ov, st.opts, sid_copy, prompt_copy });
+    const th = std.Thread.spawn(.{}, runDetachedForGui, .{ st.alloc, st.cfg, st.ov, st.opts, sid_copy, prompt_copy, pi }) catch |e| {
+        st.alloc.free(sid_copy);
+        return e;
+    };
     th.detach();
     return .{};
 }
@@ -1168,7 +1186,7 @@ fn apxPromptSession(ctx: ?*anyopaque, alloc: std.mem.Allocator, req: apiproxy.Pr
 /// user/message before the loop and assistant/turn-end after (success or
 /// failure). The session id parks BEFORE the first frame — muxPublish drops
 /// everything while no run session is parked.
-fn runDetachedForGui(alloc: std.mem.Allocator, base_cfg: *config.Config, ov: ServeOverrides, opts: LoopOpts, session_id: []const u8, prompt: []const u8) void {
+fn runDetachedForGui(alloc: std.mem.Allocator, base_cfg: *config.Config, ov: ServeOverrides, opts: LoopOpts, session_id: []const u8, prompt: []const u8, pi: *attachments.PromptImages) void {
     // ServeState outlives every detached run (serveBlocking never returns).
     g_run_mutex.lock();
     defer g_run_mutex.unlock();
@@ -1176,13 +1194,28 @@ fn runDetachedForGui(alloc: std.mem.Allocator, base_cfg: *config.Config, ov: Ser
     // Hot config: re-read config.toml for THIS run (settings edits hot-apply).
     var run_cfg = loadRunConfig(alloc, base_cfg, ov) catch {
         muxPublishEvent("turn/end", false, "{\"turn\":1,\"reason\":{\"kind\":\"error\",\"error\":{\"message\":\"config reload failed\"}}}");
+        pi.deinit(alloc);
+        alloc.destroy(pi);
         return;
     };
     defer run_cfg.deinit();
+    const job_reg = jobs_rpc.sharedRegistry() catch null;
+    const job_id = if (job_reg) |jr| jr.register("agent", prompt) else null;
+    defer if (job_id) |jid| if (job_reg) |jr| {
+        _ = jr.settle(jid, if (g_mux_run_error == null) .completed else .failed, g_mux_run_error);
+    };
+    defer {
+        pi.deinit(alloc);
+        alloc.destroy(pi);
+    }
 
     // Route this run's loop events to the mux fold (parked before any frame).
     const sid_dup = gpaAlloc().dupe(u8, session_id) catch return;
     g_mux_run_session = sid_dup;
+    g_ask_storage.session_id = sid_dup;
+    var run_opts = opts;
+    run_opts.session_id = sid_dup;
+    run_opts.images = pi.image_parts;
     defer {
         g_mux_run_session = null;
         gpaAlloc().free(sid_dup);
@@ -1205,13 +1238,12 @@ fn runDetachedForGui(alloc: std.mem.Allocator, base_cfg: *config.Config, ov: Ser
     }
 
     hostPublishFmtSession(session_id, true);
-    _ = agentRunOnce(alloc, &run_cfg, opts, prompt, session_id) catch {
+    _ = agentRunOnce(alloc, &run_cfg, run_opts, prompt, session_id) catch {
         if (g_mux_run_error == null) g_mux_run_error = gpaAlloc().dupe(u8, "run failed") catch null;
         muxPublishEvent("turn/end", false, "{{\"turn\":1,\"reason\":{{\"kind\":\"error\",\"error\":{{\"message\":\"run failed\"}}}}}}");
         if (jsonEsc(gpaAlloc(), session_id)) |sid| {
             defer gpaAlloc().free(sid);
-            const line = std.fmt.allocPrint(gpaAlloc(),
-                "{{\"sessionId\":{s},\"message\":\"run failed\"}}", .{sid}) catch null;
+            const line = std.fmt.allocPrint(gpaAlloc(), "{{\"sessionId\":{s},\"message\":\"run failed\"}}", .{sid}) catch null;
             if (line) |l| {
                 defer gpaAlloc().free(l);
                 hostPublish("host/agent-error", l);
@@ -1230,16 +1262,14 @@ fn runDetachedForGui(alloc: std.mem.Allocator, base_cfg: *config.Config, ov: Ser
         const msg_json = jsonEsc(gpaAlloc(), msg) orelse "";
         defer if (msg_json.len > 0) gpaAlloc().free(msg_json);
         if (msg_json.len > 0) {
-            const data = std.fmt.allocPrint(gpaAlloc(),
-                "{{\"turn\":1,\"reason\":{{\"kind\":\"error\",\"error\":{{\"message\":{s}}}}}}}", .{msg_json}) catch null;
+            const data = std.fmt.allocPrint(gpaAlloc(), "{{\"turn\":1,\"reason\":{{\"kind\":\"error\",\"error\":{{\"message\":{s}}}}}}}", .{msg_json}) catch null;
             if (data) |d| {
                 defer gpaAlloc().free(d);
                 muxPublishEvent("turn/end", false, d);
             }
             if (jsonEsc(gpaAlloc(), session_id)) |sid| {
                 defer gpaAlloc().free(sid);
-                const line = std.fmt.allocPrint(gpaAlloc(),
-                    "{{\"sessionId\":{s},\"message\":{s}}}", .{ sid, msg_json }) catch null;
+                const line = std.fmt.allocPrint(gpaAlloc(), "{{\"sessionId\":{s},\"message\":{s}}}", .{ sid, msg_json }) catch null;
                 if (line) |l| {
                     defer gpaAlloc().free(l);
                     hostPublish("host/agent-error", l);
@@ -1250,6 +1280,11 @@ fn runDetachedForGui(alloc: std.mem.Allocator, base_cfg: *config.Config, ov: Ser
         muxPublishEvent("turn/end", false, "{\"turn\":1,\"reason\":{\"kind\":\"completed\"}}");
     }
     hostPublishFmtSession(session_id, false);
+    if (job_reg != null) {
+        if (events_ws.sharedHubs()) |hubs| {
+            jobs_rpc.publishJobsOn(&hubs.mux, g_io orelse return, session_id, base_cfg.cwd);
+        } else |_| {}
+    }
 }
 
 /// session.cancel → best-effort no-op in v1: runs are not interruptible
@@ -1257,7 +1292,9 @@ fn runDetachedForGui(alloc: std.mem.Allocator, base_cfg: *config.Config, ov: Ser
 fn apxCancelSession(ctx: ?*anyopaque, alloc: std.mem.Allocator, session_id: []const u8) anyerror!void {
     _ = ctx;
     _ = alloc;
-    _ = session_id;
+    if (questions.sharedStore()) |store| {
+        _ = store.cancelAllForSession(session_id);
+    } else |_| {}
 }
 
 /// session.rename → rename the transcript file (title == new id semantics).
@@ -1568,6 +1605,7 @@ pub const Built = struct {
             alloc.destroy(c);
         }
         spawn_agent.clearSpawnCtx();
+        ask_user.clearAskCtx();
         for (self.mcp_clients) |c| {
             c.deinit();
             alloc.destroy(c);
@@ -1620,6 +1658,9 @@ pub const LoopOpts = struct {
     /// MCP stdio servers: each entry is a raw command line, split on spaces.
     mcp_cmds: []const []const u8 = &.{},
     preset: ?presets_mod.Kind = null,
+    /// Image parts owned by the caller for the first user message.
+    images: []const model.ImagePart = &.{},
+    session_id: []const u8 = "",
 };
 
 fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Built {
@@ -1728,6 +1769,7 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
         .plugins = plugins_reg,
         .wasm = wasm_reg,
         .cwd = cfg.cwd,
+        .session_id = opts.session_id,
     };
     const ext_iface = try alloc.create(agent.Extensions);
     errdefer alloc.destroy(ext_iface);
@@ -1746,6 +1788,10 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
     // spawn_agent (dev.md §XVIII) — schema registered now; the executor slot
     // is wired right after the chat client exists below.
     try tools.register(spawn_agent.definition);
+    try tools.register(ask_user.definition);
+    try tool_attachments.registerAttachments(tools);
+    g_ask_storage = .{ .publish = publishAskFrame, .store = questions.sharedStore() catch null };
+    ask_user.setAskCtx(&g_ask_storage);
 
     // ── native plugins (dev.md §XXV–XXVI): best-effort discovery ──────────
     {
@@ -1942,6 +1988,7 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
     const loop = try alloc.create(agent.AgentLoop);
     errdefer alloc.destroy(loop);
     loop.* = try agent.AgentLoop.init(alloc, ctx, ag, client, tools, cfg.cwd, onEvent, checkpoints, ext_iface);
+    loop.first_user_images = opts.images;
 
     return .{
         .ctx = ctx,
@@ -1979,6 +2026,8 @@ fn agentRunOnce(
 ) ![]const u8 {
     var built = try buildLoop(alloc, cfg, opts);
     defer built.deinit(alloc);
+    if (built.spawn_env) |env| env.parent_session_id = session_id orelse "";
+    if (built.spawn_deps) |deps| deps.parent_session_id = session_id orelse "";
     const io = built.ctx.io();
 
     // Task scratchpad: the current prompt is visible in context sections.

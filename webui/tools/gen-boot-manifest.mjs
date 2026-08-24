@@ -52,6 +52,25 @@ const ROSTER = [
   '@deepseek-ai/dsh-client-ui-conversation',
   '@deepseek-ai/dsh-client-ui-tool',
   '@deepseek-ai/dsh-client-ui-workspace',
+  // zharness: composer input-trigger plugin — previously dropped as a §7
+  // non-goal, but the wave-6 feature plugins (ui-skill/ui-commands/
+  // ui-reference/ui-subagent) inject it, so it is load-bearing again.
+  '@deepseek-ai/dsh-client-ui-input-trigger',
+  // zharness: wave-6 feature plugins
+  '@deepseek-ai/dsh-client-ui-agent-preset',
+  '@deepseek-ai/dsh-client-ui-commands',
+  '@deepseek-ai/dsh-client-ui-goal',
+  '@deepseek-ai/dsh-client-ui-jobs',
+  '@deepseek-ai/dsh-client-ui-message-feedback',
+  '@deepseek-ai/dsh-client-ui-model-selection',
+  '@deepseek-ai/dsh-client-ui-permission-presets',
+  '@deepseek-ai/dsh-client-ui-plan',
+  '@deepseek-ai/dsh-client-ui-reference',
+  '@deepseek-ai/dsh-client-ui-skill',
+  '@deepseek-ai/dsh-client-ui-subagent',
+  '@deepseek-ai/dsh-client-ui-trajectory',
+  '@deepseek-ai/dsh-client-ui-user-questions',
+  '@deepseek-ai/dsh-client-ui-workflow-run',
   '@deepseek-ai/dsh-client-ui-brand-official',
 ]
 
@@ -107,12 +126,20 @@ for (const id of ROSTER) {
   })
 }
 
-// Inject closure check: every requested cordis service provider must be a listed entry.
+// Inject closure check: every requested cordis service provider must either be
+// a listed entry or a workspace package WITHOUT a web dsh.client declaration
+// (statically linked into the vite seed — always present, no plugin row to
+// list; e.g. dsh-client-ui-primitives). A client package that is built but
+// deliberately unlisted still fails here.
 const ids = new Set(entries.map(entry => entry.id))
 const missing = []
 for (const entry of entries) {
   for (const target of entry.inject ?? []) {
-    if (!ids.has(target)) missing.push(`${entry.id} -> ${target}`)
+    if (ids.has(target)) continue
+    const dir = nameToDir.get(target)
+    const pkg = dir && JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'))
+    const decl = pkg && pkg.dsh && pkg.dsh.client
+    if (decl && decl.platform === 'web') missing.push(`${entry.id} -> ${target}`)
   }
 }
 if (missing.length > 0) {

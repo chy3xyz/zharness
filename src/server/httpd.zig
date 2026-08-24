@@ -732,7 +732,7 @@ pub const WsOpcode = enum(u4) {
     pong = 10,
 
     pub fn toByte(self: WsOpcode) u8 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     /// Strict decode: reserved/unknown opcodes are protocol errors.

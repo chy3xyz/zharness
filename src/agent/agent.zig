@@ -110,6 +110,9 @@ pub const AgentLoop = struct {
     checkpoints: ?*checkpoint_mod.CheckpointStore,
     /// Loop-native tools + dynamic prompt sections; null when unwired.
     ext: ?*const Extensions,
+    /// Optional image parts attached to the next user prompt. Borrowed for
+    /// the duration of run(); the caller owns the backing slices.
+    first_user_images: []const model_mod.ImagePart = &.{},
 
     pub const EventKind = enum {
         turn_start,
@@ -218,7 +221,12 @@ pub const AgentLoop = struct {
     /// (caller frees). Drives model <-> tool loop up to max_turns.
     pub fn run(self: *AgentLoop, prompt: []const u8) ![]const u8 {
         self.agent.state = .preparing;
-        try self.messages.append(self.alloc, Message{ .role = .user, .content = try self.alloc.dupe(u8, prompt) });
+        try self.messages.append(self.alloc, Message{
+            .role = .user,
+            .content = try self.alloc.dupe(u8, prompt),
+            .images = self.first_user_images,
+        });
+        self.first_user_images = &.{};
 
         const tools_json = try self.tools.buildToolsJson(self.alloc);
         defer self.alloc.free(tools_json);

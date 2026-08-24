@@ -85,7 +85,7 @@ fn appendMessages(alloc: std.mem.Allocator, messages: []const m.Message, out: *s
             .system => continue,
             .user => {
                 try sepMsg(alloc, out, &first);
-                try appendUserTextMessage(alloc, msg.content, out);
+                try appendUserTextMessage(alloc, msg, out);
             },
             .assistant => {
                 try sepMsg(alloc, out, &first);
@@ -114,10 +114,24 @@ fn sepMsg(alloc: std.mem.Allocator, out: *std.ArrayList(u8), first: *bool) !void
     first.* = false;
 }
 
-fn appendUserTextMessage(alloc: std.mem.Allocator, content: []const u8, out: *std.ArrayList(u8)) !void {
+/// User turn: one text block, optionally followed by one base64 image source
+/// block per attached image (wave 6 H-image). Messages without images render
+/// exactly as before — the additive blocks only appear when `msg.images` is
+/// non-empty (capability gating happens in the caller: ChatClient.vision).
+fn appendUserTextMessage(alloc: std.mem.Allocator, msg: m.Message, out: *std.ArrayList(u8)) !void {
     try out.appendSlice(alloc, "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"");
-    try m.escape(alloc, content, out);
-    try out.appendSlice(alloc, "\"}]}");
+    try m.escape(alloc, msg.content, out);
+    try out.appendSlice(alloc, "\"}");
+    for (msg.images) |img| {
+        try out.appendSlice(alloc, ",{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"");
+        try m.escape(alloc, img.media_type, out);
+        try out.appendSlice(alloc, "\",\"data\":\"");
+        // Base64 alphabet carries no quote/backslash bytes; escape() is used
+        // anyway for uniformity with every other field on this wire.
+        try m.escape(alloc, img.data_b64, out);
+        try out.appendSlice(alloc, "\"}}");
+    }
+    try out.appendSlice(alloc, "]}");
 }
 
 /// Assistant turn: optional text block plus one tool_use block per echoed

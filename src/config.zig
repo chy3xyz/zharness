@@ -292,12 +292,9 @@ pub fn loadFromSnapshot(alloc: std.mem.Allocator, env: EnvSnapshot) !Config {
         cfg.endpoint = try alloc.dupe(u8, ep);
     }
 
-
     // ── File layer: ~/.zharness/config.toml (env beats file per key) ──────
     if (env.config_toml) |doc| {
-        const entries = (parseTomlFlat(alloc, doc) catch null) orelse
-            (parseTomlFlat(alloc, doc) catch null);
-        if (entries) |es| {
+        if (parseTomlFlat(alloc, doc) catch null) |es| {
             defer alloc.free(es);
             const env_key = env.zharness_api_key != null or env.deepseek_api_key != null;
             const env_endpoint = env.endpoint != null;

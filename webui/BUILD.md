@@ -93,24 +93,34 @@ content-type, and index.html head injection of the boot rows (queue facade +
 two preload scripts + `globalThis.__DSH_BOOT__`), byte-mirroring
 `packages/host/webserver/src/injections.ts` rendering semantics.
 
-## Boot-manifest trim (40+ → 15 rows)
+## Boot-manifest trim (40+ → 15 rows → 36 rows)
 
-`gen-boot-manifest.mjs` composes rows only for this roster (spec §6):
+`gen-boot-manifest.mjs` composes rows only for this roster. After the wave-6
+feature-plugin vendor pass (see `webui/VENDOR-PATCHES.md`) the roster is:
 
 ```
 dsh-client-modules · dsh-client-connection · dsh-typert-registry ·
 dsh-api-gateway · dsh-api-remotes · dsh-client-runtime · dsh-client-locale ·
 dsh-client-ui-theme · dsh-client-ui-layout · dsh-client-ui-renderer ·
 dsh-client-ui-sidebar · dsh-client-ui-settings · dsh-client-ui-conversation ·
-dsh-client-ui-tool · dsh-client-ui-brand-official
+dsh-client-ui-tool · dsh-client-ui-workspace ·
+dsh-client-ui-settings-general · dsh-client-ui-settings-models ·
+dsh-client-ui-settings-plugins · dsh-client-ui-settings-plugin-inventory ·
+dsh-client-ui-zharness-general · dsh-client-ui-input-trigger ·
+dsh-client-ui-agent-preset · dsh-client-ui-commands · dsh-client-ui-goal ·
+dsh-client-ui-jobs · dsh-client-ui-message-feedback ·
+dsh-client-ui-model-selection · dsh-client-ui-permission-presets ·
+dsh-client-ui-plan · dsh-client-ui-reference · dsh-client-ui-skill ·
+dsh-client-ui-subagent · dsh-client-ui-trajectory ·
+dsh-client-ui-user-questions · dsh-client-ui-workflow-run ·
+dsh-client-ui-brand-official
 ```
 
-Every row's `inject` target is asserted to be inside the roster at generation
-time; a violation aborts the manifest build. One built-but-unlisted bundle
-exists (`dsh-client-ui-input-trigger`, dropped as a §7 non-goal) — not
-listing a plugin is upstream's supported degradation mechanism
-(`packages/client/web/src/boot.ts::assertEntriesActive` hard-fails only
-listed entries).
+(36 rows.) Every row's `inject` target is asserted to be either inside the
+roster or a statically-linked (non-plugin) workspace package at generation
+time; anything else aborts the manifest build. The wave-6 plugins call RPCs
+the Zig backend may not implement yet; upstream's degradation rules turn
+unknown methods into bad-request shapes and the panels idle — boot stays clean.
 
 **zharness deviation (16 rows, not 15):** `dsh-client-ui-workspace` was added
 to the roster after integration testing — the conversation hero's workspace
@@ -119,7 +129,10 @@ permanently gated behind "Choose workspace" (the slot renders nothing and no
 selection can be made). The original 15-row trim is preserved in git history;
 the picker is a load-bearing UI piece, not an optional feature plugin.
 
-Current graph rev: `5b2376411f33` (changes whenever any lib/client.js changes).
+Current graph rev: `cdf63c698b20` (changes whenever any lib/client.js changes).
+
+Wave-6 vendor deviations (new packages, package.json trims, tooling changes)
+are recorded in `webui/VENDOR-PATCHES.md`.
 
 ## Integrator notes (Zig side, NOT wired yet)
 
@@ -134,8 +147,8 @@ Current graph rev: `5b2376411f33` (changes whenever any lib/client.js changes).
 ## Commit policy
 
 - **Commit**: everything under `webui/` EXCEPT gitignored paths — i.e.
-  vendored sources (~8 MB) + `apps/web/dist/` (**11 MB ≤ 20 MB threshold ⇒
-  committed**) + `build-artifacts/`. Total ≈ 19.5 MB.
+  vendored sources (~9 MB) + `apps/web/dist/` (**11 MB ≤ 20 MB threshold ⇒
+  committed**) + `build-artifacts/`. Total ≈ 20.5 MB.
 - **Never commit**: `webui/dsh/node_modules/` (536 MB),
   `webui/dsh/packages/*/*/lib/`, `webui/dsh/vendor/*/lib/`,
   `*.tsbuildinfo` — all already covered by `webui/dsh/.gitignore`
@@ -181,3 +194,15 @@ Current graph rev: `5b2376411f33` (changes whenever any lib/client.js changes).
   the user bubble and the fixture carrier's streamed assistant reply with
   turn stats (1 turn · 1 step, TTFT/tok-s metered) — the complete
   session-event fold path works without a backend.
+
+## Verification achieved (2026-08-24, wave-6 vendor pass)
+
+- `tsc -b tsconfig.vendor.json` clean across the full closure including the 16
+  newly vendored packages (14 feature plugins + workflow/{workflow,
+  tool-workflow}) — no source patches, no strictness relaxations.
+- tsdown client pass emitted all 14 new `lib/client.js` bundles; vite build +
+  manifest (36 rows, rev `cdf63c698b20`) + link-plugins + inject-index clean.
+- Live-server smokes (`zharness serve --port 3080`): boot-smoke PASS — 36
+  entries live, zero console errors / page errors / failed requests;
+  roundtrip-smoke PASS — composer unlocked, user bubble + assistant turn
+  rendered; settings page opens with zero console errors.
