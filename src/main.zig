@@ -138,18 +138,20 @@ fn onEvent(kind: agent.AgentLoop.EventKind, payload: []const u8) void {
                     "{}";
                 const name_j = jsonEsc(A, tool_name) orelse break :blk;
                 defer A.free(name_j);
-                const args_j = jsonEsc(A, raw_args) orelse break :blk;
-                defer A.free(args_j);
+                // Arguments must be a RAW JSON OBJECT (not a string) — the
+                // client's tool card renders them as structured data.
+                const args_final = if (raw_args.len > 0 and raw_args[0] == '{') raw_args else "{}";
                 const n = g_tool_call_seq.fetchAdd(1, .monotonic);
                 g_current_call_id_len = (std.fmt.bufPrint(&g_current_call_id, "call-{d}", .{n}) catch return).len;
                 const call_j = jsonEsc(A, g_current_call_id[0..g_current_call_id_len]) orelse break :blk;
                 defer A.free(call_j);
                 const data = std.fmt.allocPrint(A,
                     "{{\"turn\":1,\"step\":2,\"callId\":{s},\"name\":{s},\"arguments\":{s}}}",
-                    .{ call_j, name_j, args_j },
+                    .{ call_j, name_j, args_final },
                 ) catch break :blk;
                 defer A.free(data);
-                muxPublishEvent("tool/call", false, data);
+                if (std.c.getenv("ZH_DEBUG_FRAME") != null) std.debug.print("[frame:tool_call] {s}\n", .{data});
+    muxPublishEvent("tool/call", false, data);
             },
             .tool_result => if (jsonEsc(gpaAlloc(), payload)) |o| {
                 defer gpaAlloc().free(o);
@@ -161,6 +163,7 @@ fn onEvent(kind: agent.AgentLoop.EventKind, payload: []const u8) void {
                     .{ call_j, call_j, o, call_j },
                 ) catch return;
                 defer A.free(data);
+                if (std.c.getenv("ZH_DEBUG_FRAME") != null) std.debug.print("[frame:tool_result] {s}\n", .{data});
                 muxPublishEvent("tool/result", false, data);
             },
             .done => if (jsonEsc(gpaAlloc(), payload)) |t| {
@@ -260,6 +263,9 @@ fn publishAskFrame(frame_json: []const u8) void {
 /// wire envelope {type:'session/event', sessionId, event} (spec §4).
 fn muxPublish(payload_json: []const u8) void {
     const sid = g_mux_run_session orelse return;
+    if (std.c.getenv("ZH_DEBUG_FRAME") != null) {
+        std.debug.print("[mux] {s}\n", .{payload_json[0..@min(payload_json.len, 300)]});
+    }
     if (events_ws.sharedHubs()) |hubs| {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(gpaAlloc());
