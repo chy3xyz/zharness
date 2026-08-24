@@ -213,6 +213,10 @@ pub const ChatClient = struct {
         const body = try self.buildBody(req);
         defer self.alloc.free(body);
 
+        if (std.c.getenv("ZH_DEBUG_BODY") != null) {
+            std.debug.print("[body] {s}\n", .{body});
+        }
+
         // Private temp files (mkstemp, 0600): the JSON body and a curl config
         // file carrying url + auth header. The key stays out of argv entirely.
         const body_path = (try clib.createPrivateTemp(self.alloc, "zharness_req_")) orelse return error.HttpError;
@@ -249,6 +253,7 @@ pub const ChatClient = struct {
         _ = clib.pclosePipe(fp);
 
         const resp_body = try out.toOwnedSlice(self.alloc);
+        if (std.c.getenv("ZH_DEBUG_RESP") != null) std.debug.print("[resp] {s}\n", .{resp_body[0..@min(resp_body.len,2000)]});
         defer self.alloc.free(resp_body);
 
         // Classify failures precisely instead of substring-guessing: only a
@@ -307,9 +312,14 @@ pub const ChatClient = struct {
 
         const fp = clib.popenRead(cmd_z.ptr) orelse return error.HttpError;
         var buf: [8192]u8 = undefined;
+        var raw_first: ?[]u8 = null; // first 512B of raw stream for error diagnosis
         while (true) {
             const n = std.c.fread(&buf, 1, buf.len, fp);
             if (n == 0) break;
+            if (raw_first == null and n > 0) {
+                const cap: usize = @min(n, 512);
+                raw_first = try self.alloc.dupe(u8, buf[0..cap]);
+            }
             try parser.feed(buf[0..n]);
             if (parser.done) break;
         }
@@ -319,9 +329,21 @@ pub const ChatClient = struct {
         if (!parser.done and parser.content.items.len == 0 and
             parser.reasoning.items.len == 0 and parser.finish_reason_len == 0)
         {
-            self.setLastError("stream ended without any data from the provider");
+            // Surface the first bytes of the raw stream so the operator can
+            // distinguish rate limits, auth failures, and empty 200s.
+            if (raw_first) |rf| {
+                const msg = std.fmt.allocPrint(self.alloc,
+                    "stream ended without any data (first bytes: {s})", .{rf}) catch
+                    "stream ended without any data from the provider";
+                self.setLastError(msg);
+                self.alloc.free(msg);
+                self.alloc.free(rf);
+            } else {
+                self.setLastError("stream ended without any data from the provider");
+            }
             return error.HttpError;
         }
+        if (raw_first) |rf| self.alloc.free(rf);
 
         return parser.finish();
     }
@@ -515,8 +537,8 @@ pub const ChatClient = struct {
         if (std.mem.indexOf(u8, json, "\"tool_calls\"") != null or
             std.mem.indexOf(u8, json, "\"tool_call\"") != null)
         {
-            res.has_tools = true;
             res.tool_calls = try self.parseToolCalls(json);
+            res.has_tools = res.tool_calls.len > 0;
         }
         // Extract message content + reasoning. extractStringField is
         // escape-aware, so content containing \" sequences survives intact.
@@ -548,6 +570,10 @@ pub const ChatClient = struct {
     fn parseToolCalls(self: *ChatClient, json: []const u8) ![]ToolCall {
         // Find the first "tool_calls":[ ... ] array and parse each entry.
         var calls = try std.ArrayList(ToolCall).initCapacity(self.alloc, 0);
+        if (std.c.getenv("ZH_DEBUG_ARGS") != null) {
+            const found = std.mem.indexOf(u8, json, "\"tool_calls\":[");
+            std.debug.print("[parseTC] found=\"tool_calls\":[ : {}\n", .{found != null});
+        }
         errdefer {
             for (calls.items) |tc| {
                 self.alloc.free(tc.id);
@@ -557,10 +583,14 @@ pub const ChatClient = struct {
             calls.deinit(self.alloc);
         }
         while (std.mem.indexOf(u8, json, "\"tool_calls\":[")) |pos| {
-            const arr_start = pos + 14;
+            const arr_start = pos + 13; // point AT the '[' (not past it)
             // Arrays use brackets, so match with the bracket matcher.
-            const bracket_end = findMatchingBracket(json, arr_start) orelse break;
+            const bracket_end = findMatchingBracket(json, arr_start) orelse {
+                if (std.c.getenv("ZH_DEBUG_ARGS") != null) std.debug.print("[parseTC] bracket_end=null\n", .{});
+                break;
+            };
             const arr = json[arr_start .. bracket_end + 1];
+            if (std.c.getenv("ZH_DEBUG_ARGS") != null) std.debug.print("[parseTC] arr_len={d} arr={s}\n", .{ arr.len, arr[0..@min(arr.len,200)] });
             var i: usize = 1; // skip '['
             while (i < arr.len) : (i += 1) {
                 if (arr[i] == '{') {
@@ -580,12 +610,43 @@ pub const ChatClient = struct {
     fn extractToolCall(self: *ChatClient, obj: []const u8) !?ToolCall {
         const id = extractField(obj, "id") orelse "";
         const name = extractNestedField(obj, "function", "name") orelse return null;
-        const args = extractNestedField(obj, "function", "arguments") orelse "";
+        const raw_args = extractNestedField(obj, "function", "arguments") orelse "";
+        // Decode JSON escape sequences (\" → ", \\ → \, etc.) so the
+        // tool executor receives clean JSON it can parse.
+        const args = try decodeJsonEscapes(self.alloc, raw_args);
         return ToolCall{
             .id = try self.alloc.dupe(u8, id),
             .name = try self.alloc.dupe(u8, name),
             .arguments = try self.alloc.dupe(u8, args),
         };
+    }
+
+    /// Decode JSON escape sequences in a string (" → ", \\ → \, etc.).
+    /// Returns an owned copy; caller frees.
+    fn decodeJsonEscapes(alloc: std.mem.Allocator, input: []const u8) ![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(alloc);
+        var i: usize = 0;
+        while (i < input.len) : (i += 1) {
+            if (input[i] == '\\' and i + 1 < input.len) {
+                i += 1;
+                switch (input[i]) {
+                    '"' => try out.append(alloc, '"'),
+                    '\\' => try out.append(alloc, '\\'),
+                    '/' => try out.append(alloc, '/'),
+                    'n' => try out.append(alloc, '\n'),
+                    't' => try out.append(alloc, '\t'),
+                    'r' => try out.append(alloc, '\r'),
+                    else => {
+                        try out.append(alloc, '\\');
+                        try out.append(alloc, input[i]);
+                    },
+                }
+            } else {
+                try out.append(alloc, input[i]);
+            }
+        }
+        return out.toOwnedSlice(alloc);
     }
 };
 

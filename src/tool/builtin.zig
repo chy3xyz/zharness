@@ -91,7 +91,45 @@ fn unescapeJson(alloc: std.mem.Allocator, raw: []const u8) ![]const u8 {
 /// Parse a flat JSON object of string/number/boolean values into a map.
 /// Public so wiring layers (main.zig extension tools) reuse the same
 /// tolerant flat-arg scanner instead of duplicating it.
-pub fn parseArgs(alloc: std.mem.Allocator, json_args: []const u8) !std.StringHashMap([]const u8) {
+/// Decode JSON escape sequences in a flat JSON string (" → ", \\ → \).
+/// Returns an owned copy; caller frees. Falls back to the input on OOM.
+fn decodeArgs(alloc: std.mem.Allocator, input: []const u8) ![]const u8 {
+    if (std.mem.indexOfScalar(u8, input, '\\') == null) return input;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < input.len) : (i += 1) {
+        if (input[i] == '\\' and i + 1 < input.len) {
+            i += 1;
+            switch (input[i]) {
+                '"' => try out.append(alloc, '"'),
+                '\\' => try out.append(alloc, '\\'),
+                '/' => try out.append(alloc, '/'),
+                'n' => try out.append(alloc, '\n'),
+                't' => try out.append(alloc, '\t'),
+                'r' => try out.append(alloc, '\r'),
+                else => {
+                    try out.append(alloc, '\\');
+                    try out.append(alloc, input[i]);
+                },
+            }
+        } else {
+            try out.append(alloc, input[i]);
+        }
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+pub fn parseArgs(alloc: std.mem.Allocator, json_args_raw: []const u8) !std.StringHashMap([]const u8) {
+    // Decode JSON escape sequences (\" → ", \\ → \) so the parser sees
+    // clean JSON. The model's tool_call arguments arrive with escapes from
+    // the SSE/JSON wire format; without this the escaped quotes make every
+    // key scan run to end-of-input and the map ends up empty.
+    const json_args = decodeArgs(alloc, json_args_raw) catch json_args_raw;
+    defer if (json_args.ptr != json_args_raw.ptr) alloc.free(json_args);
+    if (std.c.getenv("ZH_DEBUG_ARGS") != null) {
+        std.debug.print("[parseArgs] input ({d}B): {s}\n", .{ json_args.len, json_args[0..@min(json_args.len,200)] });
+    }
     var map = std.StringHashMap([]const u8).init(alloc);
     errdefer {
         var it = map.iterator();
@@ -138,6 +176,12 @@ pub fn parseArgs(alloc: std.mem.Allocator, json_args: []const u8) !std.StringHas
             value = try alloc.dupe(u8, json_args[n_start..i]);
         }
         try map.put(key_un, value);
+        if (std.c.getenv("ZH_DEBUG_ARGS") != null) {
+            std.debug.print("[parseArgs] map.put: '{s}' -> '{s}'\n", .{ key_un, value });
+        }
+    }
+    if (std.c.getenv("ZH_DEBUG_ARGS") != null) {
+        std.debug.print("[parseArgs] map size: {d}\n", .{ map.count() });
     }
     return map;
 }

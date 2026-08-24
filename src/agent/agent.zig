@@ -389,19 +389,55 @@ fn snapshotMessages(alloc: std.mem.Allocator, messages: []const Message) ![]chec
 }
 
 fn tool_mod_echo(alloc: std.mem.Allocator, resp: ChatResponse) ![]const u8 {
-    // Reconstruct the tool_calls array to echo. We need the raw JSON that the
-    // model sent; since we parsed it, rebuild from the structured calls.
+    // Reconstruct the tool_calls array to echo. The arguments MUST be valid
+    // JSON — the provider rejects the entire request otherwise. If the model
+    // returned malformed arguments (SSE assembly glitch, truncation), fall
+    // back to an empty object so the conversation can continue.
     var buf = try std.ArrayList(u8).initCapacity(alloc, 0);
     errdefer buf.deinit(alloc);
     try buf.appendSlice(alloc, "[");
     for (resp.tool_calls, 0..) |tc, i| {
         if (i > 0) try buf.append(alloc, ',');
-        const piece = try std.fmt.allocPrint(alloc, "{{\"id\":\"{s}\",\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"arguments\":{s}}}}}", .{ tc.id, tc.name, tc.arguments });
+        // Validate arguments as JSON: must start with '{' or '[' and have a
+        // matching close. Degrad to "{}" otherwise.
+        const args = blk: {
+            const a = std.mem.trim(u8, tc.arguments, " \t\r\n");
+            if (a.len == 0) break :blk "{}";
+            if (a[0] != '{' and a[0] != '[') break :blk "{}";
+            // Quick balance check
+            var depth: i32 = 0;
+            var in_str = false;
+            for (a) |ch| {
+                if (in_str) {
+                    if (ch == '\\') continue; // skip escaped char (simplified)
+                    if (ch == '"') in_str = false;
+                } else {
+                    if (ch == '"') in_str = true;
+                    if (ch == '{' or ch == '[') depth += 1;
+                    if (ch == '}' or ch == ']') depth -= 1;
+                }
+            }
+            if (depth != 0 or in_str) break :blk "{}";
+            if (std.c.getenv("ZH_DEBUG_ARGS") != null) {
+                std.debug.print("[args-echo] len={d} first_100={s}\n", .{ a.len, a[0..@min(a.len,100)] });
+            }
+            break :blk a;
+        };
+        // The OpenAI/DeepSeek function-calling format requires arguments to
+        // be a JSON STRING. `args` already contains properly escaped JSON
+        // text (extractField preserves the \-escape sequences from the API
+        // response), so wrapping in quotes is sufficient — no re-escaping
+        // needed (double-escaping produces invalid JSON).
+        const piece = try std.fmt.allocPrint(alloc, "{{\"id\":\"{s}\",\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"arguments\":\"{s}\"}}}}", .{ tc.id, tc.name, args });
         defer alloc.free(piece);
         try buf.appendSlice(alloc, piece);
     }
     try buf.append(alloc, ']');
-    return buf.toOwnedSlice(alloc);
+    const result = try buf.toOwnedSlice(alloc);
+    if (std.c.getenv("ZH_DEBUG_ARGS") != null) {
+        std.debug.print("[echo] {s}\n", .{result});
+    }
+    return result;
 }
 
 // ── zcordis events (dev.md §XXXIII) ────────────────────────────────────────
