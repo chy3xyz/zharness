@@ -275,3 +275,33 @@ design language, not the framework.
   path-traversal guard, size cap). Document the one-line api.handle splice
   needed (integrator applies it).
 - `docs/web.md`: what was reused (token mapping table) vs reimplemented.
+
+---
+
+# Wave 6 — full GUI feature parity (Tiers 1+2+3, 14 packages)
+
+Ground rules: same as wave 4/5. Integrator owns main.zig + router.zig
+dispatch splices EXCEPT where a row grants router.zig explicitly.
+
+## Ownership
+
+| Agent | Owns |
+|-------|------|
+| V-vendor | webui/** (all 14 package vendoring + single rebuild chain + roster) |
+| G1-tier1 | router.zig, apiproxy/{goals_rpc,skills_rpc,models_rpc,presets_rpc,perms_rpc}.zig |
+| G2-sessions | apiproxy/{search_rpc,export_rpc,subagents_rpc}.zig, sessions.zig (additive) |
+| G3-interactive | tool/ask_user.zig, apiproxy/questions.zig |
+| G4-views | apiproxy/{plan_frames,jobs_rpc,trajectory,wf_replay}.zig |
+| H-image | model/model.zig (additive content-parts), model/anthropic.zig (additive), tool/attachments.zig (new) |
+
+## Task specs (contract truth: docs/dsh-reuse-spec.md §4 + upstream zod schemas)
+
+- V-vendor: vendor ui-{goal,skill,model-selection,agent-preset,permission-presets,subagent,plan,trajectory,user-questions,jobs,workflow-run,commands,message-feedback,reference} as available (skip hmr/directory-picker-native/deliverables); roster += all that build; ONE rebuild chain; link+inject. Report per-package build status.
+- G1-tier1: goals.{edit,clear,pause,resume,list} over a NEW process-global goal store (goals_store pattern; report the one-line main.zig hook so buildLoop's GoalBoard shares it); skills.list over a fresh SkillRegistry disk scan; sessions.models/selectModel + llm.providers over the provider matrix (selectModel persists via SettingsStore llm-deepseek ns); agentPresets.list/select over presets.zig (select persists per-session via settings or config); permission presets mapping sandbox_mode (native/process/none ↔ upstream permission levels).
+- G2-sessions: session.search (grep transcripts, snippet+score); session export (upstream session-export shape → GET download); subagents registry (process-global log of spawn_agent runs: id/parent/status/summary; subagent.list/openSubagent shapes; spawn-side hook reported for integrator).
+- G3-interactive: ask_user tool (agent asks; publishes question/requested frame; waits with timeout → cancelled answer); /api/respond full flow (resolve pending by questionRpcId); questions state file with SpinLock (events_ws pattern).
+- G4-views: plan frames (plan board state → session/projection or plan event frames; report emit-point contract); jobs (workflow runs + background tasks as jobs list); trajectory (aggregate obs/checkpoints into upstream trajectory views — recon exact shape first); workflow-run replay (read .zharness/runs/*.json → upstream workflow-run view shapes).
+- H-image: accept image content parts end-to-end: IR ContentBlock image support (openai_chat image_url + anthropic image source blocks), promptSession no longer rejects them (persist to .zharness/attachments/, reference by path in text context for non-vision providers), additive only.
+
+## Integration (wave B, integrator)
+Router dispatch lines for G2/G3/G4 handlers; main.zig hooks (goals store share, subagent log, ask_user emit); roster already done by V; full gates; smokes; commits.
