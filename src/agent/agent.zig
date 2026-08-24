@@ -424,11 +424,17 @@ fn tool_mod_echo(alloc: std.mem.Allocator, resp: ChatResponse) ![]const u8 {
             break :blk a;
         };
         // The OpenAI/DeepSeek function-calling format requires arguments to
-        // be a JSON STRING. `args` already contains properly escaped JSON
-        // text (extractField preserves the \-escape sequences from the API
-        // response), so wrapping in quotes is sufficient — no re-escaping
-        // needed (double-escaping produces invalid JSON).
-        const piece = try std.fmt.allocPrint(alloc, "{{\"id\":\"{s}\",\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"arguments\":\"{s}\"}}}}", .{ tc.id, tc.name, args });
+        // be a JSON STRING whose value is the JSON-encoded arguments object.
+        // `args` contains CLEAN JSON (decodeJsonEscapes in extractToolCall
+        // resolved the wire-format escapes). Use escape() to JSON-encode it
+        // as a string value (inner " → \", \ → \\, etc.).
+        var args_enc: std.ArrayList(u8) = .empty;
+        errdefer args_enc.deinit(alloc);
+        try args_enc.append(alloc, '"');
+        try model_mod.escape(alloc, args, &args_enc);
+        try args_enc.append(alloc, '"');
+        defer args_enc.deinit(alloc);
+        const piece = try std.fmt.allocPrint(alloc, "{{\"id\":\"{s}\",\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"arguments\":{s}}}}}", .{ tc.id, tc.name, args_enc.items });
         defer alloc.free(piece);
         try buf.appendSlice(alloc, piece);
     }
