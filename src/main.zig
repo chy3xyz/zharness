@@ -18,6 +18,7 @@ const mem_persistent = @import("memory/persistent.zig");
 const mem_working = @import("memory/working.zig");
 const plan_mod = @import("agent/plan.zig");
 const goal_mod = @import("agent/goal.zig");
+const todo_mod = @import("todo/todo.zig");
 
 // Swarm wave-2 capabilities (dev.md §VI/§XVIII–XXVI/§XXVIII/§XXX).
 const presets_mod = @import("presets.zig");
@@ -398,6 +399,7 @@ pub const LoopExtensions = struct {
     working: ?*mem_working.WorkingMemory = null,
     plan_board: *plan_mod.PlanBoard,
     goal_board: *goal_mod.GoalBoard,
+    todo_board: *todo_mod.TodoBoard,
     /// Native dylib plugins (null when no plugin dirs had loadable entries).
     plugins: ?*plugin_loader.PluginRegistry = null,
     /// WASM plugin registry (null when no .wasm tools were discovered).
@@ -432,6 +434,24 @@ pub const LoopExtensions = struct {
             const s = try self.plan_board.renderPrompt(alloc);
             if (s.len > 0) try parts.append(alloc, s) else alloc.free(s);
         }
+        if (self.todo_board.count() > 0) {
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(alloc);
+            try out.appendSlice(alloc, "## Todos\n");
+            for (self.todo_board.items.items) |it| {
+                const mk = switch (it.status) {
+                    .pending => "[ ]",
+                    .in_progress => "[~]",
+                    .completed => "[x]",
+                };
+                try out.appendSlice(alloc, mk);
+                try out.appendSlice(alloc, " ");
+                try out.appendSlice(alloc, it.content);
+                try out.append(alloc, '\n');
+            }
+            const s = try out.toOwnedSlice(alloc);
+            try parts.append(alloc, s);
+        }
         if (self.working) |wm| {
             const s = try wm.snapshotPrompt(alloc);
             if (s.len > 0) try parts.append(alloc, s) else alloc.free(s);
@@ -453,6 +473,7 @@ pub const LoopExtensions = struct {
             return try self.planBoardTool(alloc, call);
         if (std.mem.eql(u8, call.name, "plan_set")) return try self.planSet(alloc, call);
         if (std.mem.eql(u8, call.name, "goal_set")) return try self.goalSet(alloc, call);
+        if (std.mem.eql(u8, call.name, todo_mod.todo_write_name)) return try self.todoWrite(alloc, call);
         if (std.mem.eql(u8, call.name, skill_mod.skill_use_name)) return try self.skillUse(alloc, call);
         if (std.mem.eql(u8, call.name, "memory_get")) return try self.memoryGet(alloc, call);
         if (std.mem.eql(u8, call.name, "memory_set")) return try self.memorySet(alloc, io, call);
@@ -583,6 +604,31 @@ pub const LoopExtensions = struct {
         return fail(alloc, "goal_set requires 'text' or 'status'");
     }
 
+    fn todoWrite(self: *LoopExtensions, alloc: std.mem.Allocator, call: tool_builtin.ToolCall) !tool_builtin.ToolResult {
+        const msg = todo_mod.executeTool(self.todo_board, call.name, call.arguments, alloc) catch |e| switch (e) {
+            error.MissingArgument => return fail(alloc, "missing todos"),
+            error.BadArgument => return fail(alloc, "bad argument (todos must be array of {content,status})"),
+            error.InvalidTodo => return fail(alloc, "invalid todo (duplicate content, empty, or too many in_progress)"),
+            error.UnknownTool => return fail(alloc, "unknown todo tool"),
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        if (self.session_id.len > 0) {
+            // Publish todos projection (same wire key as plan_frames, but from TodoBoard).
+            if (events_ws.sharedHubs()) |hubs| {
+                const value = self.todo_board.toJson(hubs.mux.alloc) catch null;
+                if (value) |v| {
+                    defer hubs.mux.alloc.free(v);
+                    const payload = plan_frames.projectionFramePayload(hubs.mux.alloc, self.session_id, 1, "todos", v) catch null;
+                    if (payload) |p| {
+                        defer hubs.mux.alloc.free(p);
+                        hubs.mux.publish("session/projection", p);
+                    }
+                }
+            } else |_| {}
+        }
+        return .{ .success = true, .output = msg, .err_msg = null };
+    }
+
     fn skillUse(self: *LoopExtensions, alloc: std.mem.Allocator, call: tool_builtin.ToolCall) !tool_builtin.ToolResult {
         const reg = self.skills orelse return fail(alloc, "no skills are available in this session");
         var map = try tool_builtin.parseArgs(alloc, call.arguments);
@@ -666,6 +712,12 @@ pub fn registerExtensionTools(reg: *tool_reg.ToolRegistry, opts: struct { skills
         .parameters_json =
         \\{"type":"object","properties":{"text":{"type":"string","description":"The goal to pursue"},"status":{"type":"string","enum":["active","achieved","abandoned"],"description":"Transition the current goal instead of setting a new one"}},"required":[]}
         ,
+    });
+    try reg.register(.{
+        .name = todo_mod.todo_write_name,
+        .description = "Record and update a structured task list for the current work. Send the ENTIRE list every call — it REPLACES the previous list. Use it to plan multi-step work and show progress.",
+        .category = .general,
+        .parameters_json = todo_mod.TOOL_SCHEMAS[0].parameters_json,
     });
     if (opts.skills) {
         try reg.register(.{
@@ -1580,6 +1632,7 @@ pub const Built = struct {
     working: *mem_working.WorkingMemory,
     plan_board: *plan_mod.PlanBoard,
     goal_board: *goal_mod.GoalBoard,
+    todo_board: *todo_mod.TodoBoard,
     /// Heap copy of the chat client used by spawn_agent children (the loop
     /// holds its own by-value copy, so children need a stable one).
     spawn_client: ?*model.ChatClient = null,
@@ -1638,6 +1691,8 @@ pub const Built = struct {
         alloc.destroy(self.goal_board);
         self.plan_board.deinit();
         alloc.destroy(self.plan_board);
+        self.todo_board.deinit();
+        alloc.destroy(self.todo_board);
         if (self.memory) |m| {
             m.deinit();
             alloc.destroy(m);
@@ -1745,6 +1800,11 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
     goal_board.* = goal_mod.GoalBoard.init(alloc);
     errdefer goal_board.deinit();
 
+    const todo_board = try alloc.create(todo_mod.TodoBoard);
+    errdefer alloc.destroy(todo_board);
+    todo_board.* = todo_mod.TodoBoard.init(alloc);
+    errdefer todo_board.deinit();
+
     // Native plugin registry slot — declared before lext (which borrows it);
     // discovery + registration happen further down, after tool schemas.
     var plugins_reg: ?*plugin_loader.PluginRegistry = null;
@@ -1766,6 +1826,7 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
         .working = working,
         .plan_board = plan_board,
         .goal_board = goal_board,
+        .todo_board = todo_board,
         .plugins = plugins_reg,
         .wasm = wasm_reg,
         .cwd = cfg.cwd,
@@ -2004,6 +2065,7 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
         .working = working,
         .plan_board = plan_board,
         .goal_board = goal_board,
+        .todo_board = todo_board,
         .spawn_client = spawn_client,
         .spawn_env = spawn_env,
         .spawn_deps = spawn_deps,
@@ -2057,6 +2119,16 @@ fn agentRunOnce(
             else => return e,
         };
         for (s.messages.items) |m| try built.loop.seed(alloc, m);
+        // Restore durable goal/todo projections (P1 backlog item 6)
+        built.goal_board.restoreFromSession(s) catch {};
+        built.todo_board.restoreFromSession(s) catch {};
+        if (s.stored_goal) |sg| {
+            const phase: goals_rpc.Phase = if (std.mem.eql(u8, sg.phase, "paused")) .paused else if (std.mem.eql(u8, sg.phase, "blocked")) .blocked else if (std.mem.eql(u8, sg.phase, "complete")) .complete else .active;
+            const snap = goals_rpc.Snapshot{ .id = sg.id, .revision = sg.revision, .objective = sg.objective, .phase = phase, .blocked_code = sg.blocked_code, .blocked_message = sg.blocked_message, .max_goal_rounds = sg.max_goal_rounds };
+            if (goals_rpc.shared()) |store| {
+                store.hydrate(sid, snap, sg.rounds_started, sg.created_at, sg.updated_at) catch {};
+            } else |_| {}
+        }
         session_ptr = s;
     }
     defer if (session_ptr) |s| {
@@ -2069,6 +2141,8 @@ fn agentRunOnce(
 
     if (session_ptr) |s| {
         try built.loop.syncToSession(s);
+        built.goal_board.syncToSession(s) catch {};
+        built.todo_board.syncToSession(s) catch {};
         try s.save(io, session_path.?);
     }
     return answer;
@@ -2109,6 +2183,15 @@ fn chatLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts, sessi
             else => return e,
         };
         for (s.messages.items) |m| try built.loop.seed(alloc, m);
+        built.goal_board.restoreFromSession(s) catch {};
+        built.todo_board.restoreFromSession(s) catch {};
+        if (s.stored_goal) |sg| {
+            const phase: goals_rpc.Phase = if (std.mem.eql(u8, sg.phase, "paused")) .paused else if (std.mem.eql(u8, sg.phase, "blocked")) .blocked else if (std.mem.eql(u8, sg.phase, "complete")) .complete else .active;
+            const snap = goals_rpc.Snapshot{ .id = sg.id, .revision = sg.revision, .objective = sg.objective, .phase = phase, .blocked_code = sg.blocked_code, .blocked_message = sg.blocked_message, .max_goal_rounds = sg.max_goal_rounds };
+            if (goals_rpc.shared()) |store| {
+                store.hydrate(sid, snap, sg.rounds_started, sg.created_at, sg.updated_at) catch {};
+            } else |_| {}
+        }
         session_ptr = s;
     }
     defer if (session_ptr) |s| {
@@ -2146,12 +2229,16 @@ fn chatLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts, sessi
 
         if (session_ptr) |s| {
             try built.loop.syncToSession(s);
+            built.goal_board.syncToSession(s) catch {};
+            built.todo_board.syncToSession(s) catch {};
             try s.save(io, session_path.?);
         }
         alloc.free(owned);
     }
 
     if (session_ptr) |s| {
+        built.goal_board.syncToSession(s) catch {};
+        built.todo_board.syncToSession(s) catch {};
         try s.save(io, session_path.?);
         std.debug.print("\nsession saved: {s}\n", .{session_path.?});
     }

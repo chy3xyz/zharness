@@ -513,6 +513,47 @@ pub const GoalStore = struct {
         const e = self.findLocked(session_id) orelse return null;
         return try dupProjection(alloc, &e.projection);
     }
+
+    /// Hydrate the process-global store from a durable snapshot (replay after
+    /// restart). Replaces any existing projection for `session_id` without CAS.
+    pub fn hydrate(self: *GoalStore, session_id: []const u8, snapshot: Snapshot, rounds_started: u64, created_at_ms: i64, updated_at_ms: i64) !void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const e = self.findLocked(session_id) orelse blk: {
+            self.entries.append(self.alloc, .{
+                .session_id = try self.alloc.dupe(u8, session_id),
+            }) catch return error.OutOfMemory;
+            break :blk &self.entries.items[self.entries.items.len - 1];
+        };
+        if (e.projection.snapshot) |old| {
+            var old_proj = e.projection;
+            freeProjection(self.alloc, &old_proj);
+            _ = old;
+        }
+        const id_copy = try self.alloc.dupe(u8, snapshot.id);
+        const obj_copy = try self.alloc.dupe(u8, snapshot.objective);
+        var blk_code: ?[]const u8 = null;
+        var blk_msg: ?[]const u8 = null;
+        if (snapshot.blocked_code) |c| blk_code = try self.alloc.dupe(u8, c);
+        if (snapshot.blocked_message) |m| blk_msg = try self.alloc.dupe(u8, m);
+        e.projection = .{
+            .snapshot = .{
+                .id = id_copy,
+                .revision = snapshot.revision,
+                .objective = obj_copy,
+                .phase = snapshot.phase,
+                .blocked_code = blk_code,
+                .blocked_message = blk_msg,
+                .max_goal_rounds = snapshot.max_goal_rounds,
+            },
+            .rounds_started = rounds_started,
+            .created_at_ms = created_at_ms,
+            .updated_at_ms = updated_at_ms,
+        };
+        // Keep event_seq monotonic for new hydration (no seq bump needed, but
+        // ensure later mutations still increment).
+        self.event_seq += 1;
+    }
 };
 
 /// Copy a projection into the REQUEST arena (handlers render from these).

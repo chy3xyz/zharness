@@ -26,6 +26,7 @@ const mem_persistent = @import("memory/persistent.zig");
 const mem_working = @import("memory/working.zig");
 const plan_mod = @import("agent/plan.zig");
 const goal_mod = @import("agent/goal.zig");
+const todo_mod = @import("todo/todo.zig");
 const main_mod = @import("main.zig");
 
 // Swarm wave-2 modules (A/B/C/D/E/F/G) — pulled in via comptime so their
@@ -90,6 +91,7 @@ comptime {
     _ = @import("server/apiproxy/attachments.zig");
     _ = @import("tool/ask_user.zig");
     _ = @import("tool/attachments.zig");
+    _ = @import("todo/todo.zig");
 }
 
 comptime {
@@ -664,6 +666,8 @@ test "loop extensions wiring: plan goal memory skills end to end" {
     defer pb.deinit();
     var gb = goal_mod.GoalBoard.init(alloc);
     defer gb.deinit();
+    var tb = todo_mod.TodoBoard.init(alloc);
+    defer tb.deinit();
     var wm = mem_working.WorkingMemory.init(alloc);
     defer wm.deinit();
 
@@ -697,6 +701,7 @@ test "loop extensions wiring: plan goal memory skills end to end" {
         .working = &wm,
         .plan_board = &pb,
         .goal_board = &gb,
+        .todo_board = &tb,
         .plugins = null,
         .cwd = dir,
     };
@@ -846,7 +851,7 @@ test "registerExtensionTools respects availability flags" {
     var full = try tool_reg.ToolRegistry.init(alloc);
     defer full.deinit();
     try main_mod.registerExtensionTools(&full, .{ .skills = true, .memory = true });
-    for ([_][]const u8{ "plan_add", "plan_update", "plan_set", "goal_set", "skill_use", "memory_get", "memory_set" }) |n| {
+    for ([_][]const u8{ "plan_add", "plan_update", "plan_set", "goal_set", "todo_write", "skill_use", "memory_get", "memory_set" }) |n| {
         try std.testing.expect(full.contains(n));
     }
     // Wire schema must be valid JSON-ish: braces balanced overall.
@@ -860,4 +865,135 @@ test "registerExtensionTools respects availability flags" {
     try std.testing.expect(!minimal.contains("skill_use"));
     try std.testing.expect(!minimal.contains("memory_get"));
     try std.testing.expect(minimal.contains("plan_add"));
+    try std.testing.expect(minimal.contains("todo_write"));
+}
+
+test "durable goal revisions survive session restart" {
+    const alloc = std.testing.allocator;
+    var ctx = try cordis.Context.init(alloc);
+    defer ctx.deinit();
+    const io = ctx.io();
+    const path = "/tmp/zharness_goal_durable_test.json";
+    defer std.Io.Dir.deleteFile(.cwd(), io, path) catch {};
+    defer std.Io.Dir.deleteFile(.cwd(), io, "/tmp/zharness_goal_durable_test.json.projections") catch {};
+
+    var s1 = try session.Session.init(alloc, "dur-goal");
+    defer s1.deinit();
+    var gb1 = goal_mod.GoalBoard.init(alloc);
+    defer gb1.deinit();
+
+    try gb1.set("ship feature");
+    try std.testing.expectEqual(@as(u64, 1), gb1.current().?.revision);
+    _ = gb1.pause();
+    try std.testing.expectEqual(goal_mod.Phase.paused, gb1.current().?.phase);
+    _ = gb1.@"resume"();
+    try std.testing.expectEqual(goal_mod.Phase.active, gb1.current().?.phase);
+    // edit bumps revision again
+    try gb1.set("ship feature v2");
+    try std.testing.expectEqual(@as(u64, 4), gb1.current().?.revision);
+    // sync to session and persist
+    try gb1.syncToSession(&s1);
+    try s1.addUser("hello");
+    try s1.save(io, path);
+
+    // load into fresh board/session
+    var s2 = try session.Session.init(alloc, "dur-goal");
+    defer s2.deinit();
+    try s2.load(io, path);
+    var gb2 = goal_mod.GoalBoard.init(alloc);
+    defer gb2.deinit();
+    try gb2.restoreFromSession(&s2);
+    try std.testing.expectEqualStrings("ship feature v2", gb2.current().?.text);
+    try std.testing.expectEqual(@as(u64, 4), gb2.current().?.revision);
+    try std.testing.expectEqual(goal_mod.Phase.active, gb2.current().?.phase);
+    try std.testing.expect(s2.stored_goal != null);
+    try std.testing.expectEqual(@as(usize, 4), s2.goal_history.items.len); // 4 mutations logged
+}
+
+test "durable todo_write projection survives restart distinct from plan" {
+    const alloc = std.testing.allocator;
+    var ctx = try cordis.Context.init(alloc);
+    defer ctx.deinit();
+    const io = ctx.io();
+    const path = "/tmp/zharness_todo_durable_test.json";
+    defer std.Io.Dir.deleteFile(.cwd(), io, path) catch {};
+    defer std.Io.Dir.deleteFile(.cwd(), io, "/tmp/zharness_todo_durable_test.json.projections") catch {};
+
+    var s1 = try session.Session.init(alloc, "dur-todo");
+    defer s1.deinit();
+
+    var tb1 = todo_mod.TodoBoard.init(alloc);
+    defer tb1.deinit();
+    var pb1 = plan_mod.PlanBoard.init(alloc);
+    defer pb1.deinit();
+
+    // todo_write replaces whole list
+    const r = try todo_mod.executeTool(&tb1, "todo_write", "{\"todos\":[{\"content\":\"a\",\"status\":\"pending\"},{\"content\":\"b\",\"status\":\"in_progress\"}]}", alloc);
+    defer alloc.free(r);
+    try std.testing.expectEqual(@as(usize, 2), tb1.count());
+    // plan remains empty distinct
+    try std.testing.expectEqual(@as(usize, 0), pb1.count());
+    _ = try pb1.addTask("plan task");
+    try std.testing.expectEqual(@as(usize, 1), pb1.count());
+    try std.testing.expectEqual(@as(usize, 2), tb1.count());
+
+    try tb1.syncToSession(&s1);
+    try s1.save(io, path);
+
+    var s2 = try session.Session.init(alloc, "dur-todo");
+    defer s2.deinit();
+    try s2.load(io, path);
+    var tb2 = todo_mod.TodoBoard.init(alloc);
+    defer tb2.deinit();
+    try tb2.restoreFromSession(&s2);
+    try std.testing.expectEqual(@as(usize, 2), tb2.count());
+    try std.testing.expectEqualStrings("a", tb2.items.items[0].content);
+    try std.testing.expectEqual(todo_mod.TodoStatus.in_progress, tb2.items.items[1].status);
+    // plan not persisted via todo sidecar: fresh plan remains empty
+    var pb2 = plan_mod.PlanBoard.init(alloc);
+    defer pb2.deinit();
+    try std.testing.expectEqual(@as(usize, 0), pb2.count());
+    // but todo revision preserved
+    try std.testing.expectEqual(tb1.revision, tb2.revision);
+}
+
+test "loop extensions todo_write distinct from plan_*" {
+    const alloc = std.testing.allocator;
+    var ctx = try cordis.Context.init(alloc);
+    defer ctx.deinit();
+    const io = ctx.io();
+    var pb = plan_mod.PlanBoard.init(alloc);
+    defer pb.deinit();
+    var gb = goal_mod.GoalBoard.init(alloc);
+    defer gb.deinit();
+    var tb = todo_mod.TodoBoard.init(alloc);
+    defer tb.deinit();
+    var wm = mem_working.WorkingMemory.init(alloc);
+    defer wm.deinit();
+    var lext = main_mod.LoopExtensions{
+        .alloc = alloc,
+        .io = io,
+        .working = &wm,
+        .plan_board = &pb,
+        .goal_board = &gb,
+        .todo_board = &tb,
+        .cwd = "/tmp",
+    };
+    const ext = lext.extensions();
+    // todo_write works
+    var r1 = (try ext.executeTool(ext.ctx, alloc, io, .{ .name = "todo_write", .arguments = "{\"todos\":[{\"content\":\"t1\",\"status\":\"pending\"}]}" })).?;
+    defer tool_builtin.freeResult(alloc, &r1);
+    try std.testing.expect(r1.success);
+    try std.testing.expectEqual(@as(usize, 1), tb.count());
+    // plan_* still works distinct
+    var r2 = (try ext.executeTool(ext.ctx, alloc, io, .{ .name = "plan_add", .arguments = "{\"text\":\"p1\"}" })).?;
+    defer tool_builtin.freeResult(alloc, &r2);
+    try std.testing.expect(r2.success);
+    try std.testing.expectEqual(@as(usize, 1), pb.count());
+    try std.testing.expectEqual(@as(usize, 1), tb.count());
+    // context rendering contains both sections
+    const sec = try ext.renderContext(ext.ctx, alloc);
+    defer alloc.free(sec);
+    try std.testing.expect(std.mem.indexOf(u8, sec, "## Todos") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sec, "## Plan") != null);
 }
