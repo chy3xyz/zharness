@@ -94,8 +94,11 @@ comptime {
     _ = @import("tool/attachments.zig");
     _ = @import("todo/todo.zig");
     _ = @import("web/provider.zig");
-    // Dynamic Cordis runtime — pulls in src/dynamic/{registry,sandbox,lifecycle}.zig.
+    // Dynamic Cordis runtime — pulls in src/dynamic/{registry,sandbox,lifecycle,wire}.zig.
     _ = @import("dynamic/lifecycle.zig");
+    _ = @import("dynamic/registry.zig");
+    _ = @import("dynamic/sandbox.zig");
+    _ = @import("dynamic/wire.zig");
 }
 
 comptime {

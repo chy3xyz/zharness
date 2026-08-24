@@ -55,6 +55,13 @@ const config = @import("../../config.zig");
 const events_ws = @import("events_ws.zig");
 const clib = @import("../../clib.zig");
 
+// Dynamic Cordis runtime (src/dynamic/*): browser-half host endpoints +
+// the cordis leg of POST /api/respond (see dyn_wire below).
+const dyn_lifecycle = @import("../../dynamic/lifecycle.zig");
+const dyn_registry = @import("../../dynamic/registry.zig");
+const dyn_sandbox = @import("../../dynamic/sandbox.zig");
+const dyn_wire = @import("../../dynamic/wire.zig");
+
 // ── Tier-1 RPC domains (wave 6, G1-tier1) ──────────────────────────────────
 const goals_rpc = @import("goals_rpc.zig");
 const skills_rpc = @import("skills_rpc.zig");
@@ -1757,6 +1764,117 @@ fn augmentDescribeValue(
     return out.toOwnedSlice(alloc);
 }
 
+// ── dynamic cordis domain (P3 runtime) ──────────────────────────────────────
+//
+// Process-global Lifecycle singleton (installDefaultSettings pattern): one
+// registry + sandbox + lifecycle per process on the C allocator — it
+// outlives any request arena and is released with the process, matching the
+// events_ws.sharedHubs posture documented in src/dynamic/wire.zig.
+
+var default_dynamic_lifecycle: ?*dyn_lifecycle.Lifecycle = null;
+
+/// The shared dynamic runtime, created lazily on first use. Idempotent.
+pub fn sharedDynamicLifecycle() !*dyn_lifecycle.Lifecycle {
+    if (default_dynamic_lifecycle) |lc| return lc;
+    const reg = try std.heap.c_allocator.create(dyn_registry.DynamicRegistry);
+    errdefer std.heap.c_allocator.destroy(reg);
+    reg.* = dyn_registry.DynamicRegistry.init(std.heap.c_allocator);
+    const lc = try std.heap.c_allocator.create(dyn_lifecycle.Lifecycle);
+    errdefer std.heap.c_allocator.destroy(lc);
+    lc.* = dyn_lifecycle.Lifecycle.init(
+        std.heap.c_allocator,
+        reg,
+        dyn_sandbox.Sandbox.initDefault(std.heap.c_allocator),
+    );
+    default_dynamic_lifecycle = lc;
+    return lc;
+}
+
+/// dynamic.getClientCode (spec §4): the ONLY path client source reaches the
+/// browser. Answers {"code":"<clientCode>"} for the given packageId; a
+/// host-only or unknown package carries null code so the page logs and skips.
+/// Page-global read under the lifecycle lock (spec §6: no session).
+fn hDynamicGetClientCode(alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8) !UnaryResponse {
+    const lc = try sharedDynamicLifecycle();
+    const plugin_id = try reqString(alloc, payload, "pluginId");
+    const package_id = try reqString(alloc, payload, "packageId");
+    const run_id = try optString(alloc, payload, "pluginRunId");
+
+    var code: ?[]const u8 = null;
+    {
+        lc.lock.lock();
+        defer lc.lock.unlock();
+        const p = lc.reg.getPlugin(plugin_id) orelse
+            return badRequest(alloc, rpc_id, "unknown plugin");
+        // Stale-revision guard: a half pinned to another run id reads as absent.
+        if (p.run) |r| {
+            if (run_id) |want| {
+                if (!std.mem.eql(u8, want, r.pluginRunId))
+                    return badRequest(alloc, rpc_id, "stale pluginRunId");
+            }
+        }
+        const pkg = p.packages.get(package_id) orelse
+            return badRequest(alloc, rpc_id, "unknown package");
+        code = pkg.clientCode;
+    }
+
+    var value: std.ArrayList(u8) = .empty;
+    errdefer value.deinit(alloc);
+    try value.appendSlice(alloc, "{\"code\":");
+    if (code) |c| {
+        try jsonx.appendJsonString(alloc, &value, c);
+    } else {
+        try value.appendSlice(alloc, "null");
+    }
+    try value.append(alloc, '}');
+    return okValue(alloc, rpc_id, value.items);
+}
+
+/// dynamic.invoke (spec §7): unary harness.handle RPC through the ACTIVE
+/// run's host half. Value is {ok,value} | {code,message}; transport-level
+/// failures (node missing/crashed) ride the same {code,message} shape with
+/// the transport tag as code.
+fn hDynamicInvoke(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8) !UnaryResponse {
+    _ = deps;
+    const lc = try sharedDynamicLifecycle();
+    const plugin_id = try reqString(alloc, payload, "pluginId");
+    const run_id = try optString(alloc, payload, "pluginRunId");
+    const method = try reqString(alloc, payload, "method");
+    const args_raw = jsonx.getRaw(payload, "args") orelse "{}";
+
+    var inv = lc.invoke(plugin_id, run_id, method, args_raw) catch |e| {
+        // PluginNotFound/NotRunning/StaleRevision/etc.: in-band handler-level
+        // failure shape rather than a carrier error (spec §7).
+        if (e == error.OutOfMemory) return error.OutOfMemory;
+        var fallback: std.ArrayList(u8) = .empty;
+        errdefer fallback.deinit(alloc);
+        try fallback.appendSlice(alloc, "{\"ok\":false,\"code\":\"no-active-run\",\"message\":");
+        try jsonx.appendJsonString(alloc, &fallback, @errorName(e));
+        try fallback.append(alloc, '}');
+        return okValue(alloc, rpc_id, fallback.items);
+    };
+    defer inv.deinit(alloc);
+
+    var value: std.ArrayList(u8) = .empty;
+    errdefer value.deinit(alloc);
+    if (inv.ok) {
+        try value.appendSlice(alloc, "{\"ok\":true,\"value\":");
+        try value.appendSlice(alloc, if (inv.value_json.len > 0) inv.value_json else "null");
+        try value.appendSlice(alloc, "}");
+    } else {
+        try value.appendSlice(alloc, "{\"ok\":false,\"code\":");
+        try jsonx.appendJsonString(
+            alloc,
+            &value,
+            inv.code orelse inv.transport_err orelse "handler-error",
+        );
+        try value.appendSlice(alloc, ",\"message\":");
+        try jsonx.appendJsonString(alloc, &value, inv.message orelse "");
+        try value.append(alloc, '}');
+    }
+    return okValue(alloc, rpc_id, value.items);
+}
+
 // ── dispatch ────────────────────────────────────────────────────────────────
 
 pub const DispatchError = error{OutOfMemory};
@@ -1892,6 +2010,10 @@ pub fn dispatch(
     // keeps its slash form — the typert gateway composes namespace/method)
     if (std.mem.eql(u8, m, "pluginInventory/list")) return run(alloc, env, hPluginInventoryList(deps, alloc, env.rpc_id, p));
 
+    // dynamic cordis domain (P3 runtime: browser-half host endpoints)
+    if (std.mem.eql(u8, m, "dynamic.getClientCode")) return run(alloc, env, hDynamicGetClientCode(alloc, env.rpc_id, p));
+    if (std.mem.eql(u8, m, "dynamic.invoke")) return run(alloc, env, hDynamicInvoke(deps, alloc, env.rpc_id, p));
+
     return badRequest(alloc, env.rpc_id, "unknown method");
 }
 
@@ -1989,8 +2111,16 @@ pub fn handleApiRequest(
 
     // Answerable-push receipt: real question flow (ask_user tool publishes
     // question/requested; the GUI answers via /api/respond; the frame rpcId
-    // is the correlation id).
+    // is the correlation id). The dynamic cordis leg runs FIRST: wire's
+    // handleRespond self-detects cordis-shaped bodies (result.value carrying
+    // {requestId, decision}) and reports mine:false for everything else, so
+    // question answers pass through untouched to the questions.zig leg below
+    // (multiplex contract documented in src/dynamic/wire.zig).
     if (std.mem.eql(u8, seg, "respond")) {
+        if (sharedDynamicLifecycle()) |lc| {
+            const leg = try dyn_wire.handleRespond(lc, alloc, req.body);
+            if (leg.mine) return res.send(.ok, .json, leg.body);
+        } else |_| {} // no dynamic runtime on this host → questions leg only
         const questions = @import("questions.zig");
         const store = try questions.sharedStore();
         const receipt = try questions.handleRespond(store, alloc, req.body);
