@@ -76,6 +76,9 @@ fn jsonEsc(alloc: std.mem.Allocator, s: []const u8) ?[]u8 {
 // live frame can never be dropped as a replay overlap after a reload.
 
 var g_live_seq = std.atomic.Value(u64).init(1 << 20);
+var g_tool_call_seq = std.atomic.Value(u64).init(1);
+var g_current_call_id: [32]u8 = undefined;
+var g_current_call_id_len: usize = 0;
 
 /// Publish ONE strict-envelope SessionEvent for the parked run session.
 /// `surface_append` adds the fixture-parity `"surfaceOp":"append"` marker
@@ -124,13 +127,41 @@ fn onEvent(kind: agent.AgentLoop.EventKind, payload: []const u8) void {
                 defer gpaAlloc().free(t);
                 muxPublishEventEsc("assistant/chunk", "{{\"turn\":1,\"step\":1,\"chunk\":{{\"type\":\"text-delta\",\"index\":0,\"text\":{s}}}}}", false, t);
             },
-            .tool_call => if (jsonEsc(gpaAlloc(), payload)) |n| {
-                defer gpaAlloc().free(n);
-                muxPublishEventEsc("tool/call", "{{\"turn\":1,\"step\":2,\"callId\":\"live\",\"name\":{s},\"arguments\":{{}}}}", false, n);
+            .tool_call => blk: {
+                const A = gpaAlloc();
+                const open = std.mem.indexOfScalar(u8, payload, '(');
+                const close = if (open != null) std.mem.lastIndexOfScalar(u8, payload, ')') else null;
+                const tool_name = if (open) |o| payload[0..o] else payload;
+                const raw_args = if (open != null and close != null and close.? > open.?)
+                    payload[open.? + 1 .. close.?]
+                else
+                    "{}";
+                const name_j = jsonEsc(A, tool_name) orelse break :blk;
+                defer A.free(name_j);
+                const args_j = jsonEsc(A, raw_args) orelse break :blk;
+                defer A.free(args_j);
+                const n = g_tool_call_seq.fetchAdd(1, .monotonic);
+                g_current_call_id_len = (std.fmt.bufPrint(&g_current_call_id, "call-{d}", .{n}) catch return).len;
+                const call_j = jsonEsc(A, g_current_call_id[0..g_current_call_id_len]) orelse break :blk;
+                defer A.free(call_j);
+                const data = std.fmt.allocPrint(A,
+                    "{{\"turn\":1,\"step\":2,\"callId\":{s},\"name\":{s},\"arguments\":{s}}}",
+                    .{ call_j, name_j, args_j },
+                ) catch break :blk;
+                defer A.free(data);
+                muxPublishEvent("tool/call", false, data);
             },
             .tool_result => if (jsonEsc(gpaAlloc(), payload)) |o| {
                 defer gpaAlloc().free(o);
-                muxPublishEventEsc("tool/result", "{{\"turn\":1,\"step\":2,\"message\":{{\"id\":\"t-live\",\"role\":\"user\",\"content\":[{{\"type\":\"tool-result\",\"toolCallId\":\"live\",\"content\":[{{\"type\":\"text\",\"text\":{s}}}]}},\"source\":{{\"kind\":\"tool\",\"callId\":\"live\"}}]}}}}", false, o);
+                const A = gpaAlloc();
+                const call_j = jsonEsc(A, g_current_call_id[0..g_current_call_id_len]) orelse return;
+                defer A.free(call_j);
+                const data = std.fmt.allocPrint(A,
+                    "{{\"turn\":1,\"step\":2,\"message\":{{\"id\":{s},\"role\":\"user\",\"content\":[{{\"type\":\"tool-result\",\"toolCallId\":{s},\"content\":[{{\"type\":\"text\",\"text\":{s}}}]}}],\"source\":{{\"kind\":\"tool\",\"callId\":{s}}}}}}}",
+                    .{ call_j, call_j, o, call_j },
+                ) catch return;
+                defer A.free(data);
+                muxPublishEvent("tool/result", false, data);
             },
             .done => if (jsonEsc(gpaAlloc(), payload)) |t| {
                 defer gpaAlloc().free(t);
@@ -1990,6 +2021,9 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
         model.ChatClient.initProvider(alloc, ctx.io(), prof, cfg.model, cfg.api_key)
     else
         model.ChatClient.init(alloc, ctx.io(), cfg.endpoint, cfg.model, cfg.api_key);
+    if (std.c.getenv("ZH_DEBUG_CFG") != null) {
+        std.debug.print("[cfg] endpoint={s} model={s} key_len={d} provider={s}\n", .{ cfg.endpoint, cfg.model, cfg.api_key.len, cfg.provider });
+    }
     client.stream_sink = onStreamDelta;
 
     // spawn_agent wiring (dev.md §XVIII): a heap copy of the client (the loop

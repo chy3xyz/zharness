@@ -231,6 +231,8 @@ pub const ChatClient = struct {
         defer cmd.deinit(self.alloc);
         try cmd.appendSlice(self.alloc, "curl --silent --show-error --config ");
         try appendShellQuoted(self.alloc, &cmd, cfg_path);
+        try cmd.appendSlice(self.alloc, " -d @");
+        try appendShellQuoted(self.alloc, &cmd, body_path);
 
         const cmd_z = try self.alloc.dupeSentinel(u8, cmd.items, 0);
         defer self.alloc.free(cmd_z);
@@ -293,6 +295,8 @@ pub const ChatClient = struct {
         defer cmd.deinit(self.alloc);
         try cmd.appendSlice(self.alloc, "curl --silent --show-error --config ");
         try appendShellQuoted(self.alloc, &cmd, cfg_path);
+        try cmd.appendSlice(self.alloc, " -d @");
+        try appendShellQuoted(self.alloc, &cmd, body_path);
 
         const cmd_z = try self.alloc.dupeSentinel(u8, cmd.items, 0);
         defer self.alloc.free(cmd_z);
@@ -387,6 +391,8 @@ pub const ChatClient = struct {
         defer cmd.deinit(self.alloc);
         try cmd.appendSlice(self.alloc, "curl --silent --show-error --config ");
         try appendShellQuoted(self.alloc, &cmd, cfg_path);
+        try cmd.appendSlice(self.alloc, " -d @");
+        try appendShellQuoted(self.alloc, &cmd, body_path);
 
         const cmd_z = try self.alloc.dupeSentinel(u8, cmd.items, 0);
         defer self.alloc.free(cmd_z);
