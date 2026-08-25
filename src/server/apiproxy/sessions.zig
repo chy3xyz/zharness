@@ -417,7 +417,25 @@ pub fn buildHistoryPage(
     try proj.appendSlice(alloc, "{\"asOfSeq\":");
     try jsonx.appendInt(alloc, &proj, last_seq);
     try proj.appendSlice(alloc, ",\"values\":{\"title\":");
-    try jsonx.appendJsonString(alloc, &proj, title);
+    // Friendly title: first user message's first line, truncated to 40 chars.
+    // Falls back to the session_id if no user message exists.
+    var friendly_title: ?[]const u8 = null;
+    for (msgs) |m| {
+        if (std.mem.eql(u8, m.role, "user") and m.content.len > 0) {
+            const first_line_end = std.mem.indexOfScalar(u8, m.content, '\n') orelse m.content.len;
+            const line = std.mem.trim(u8, m.content[0..first_line_end], " \t\r");
+            if (line.len > 0) {
+                const trunc_len = @min(line.len, 40);
+                friendly_title = try alloc.dupe(u8, line[0..trunc_len]);
+                break;
+            }
+        }
+    }
+    if (friendly_title) |ft| {
+        try jsonx.appendJsonString(alloc, &proj, ft);
+    } else {
+        try jsonx.appendJsonString(alloc, &proj, title);
+    }
     try proj.appendSlice(alloc, "}}");
 
     const result = try entries.toOwnedSlice(alloc);

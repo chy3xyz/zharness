@@ -33,6 +33,7 @@ const std = @import("std");
 const jsonx = @import("jsonx.zig");
 const loader = @import("../../pluginabi/loader.zig");
 const wasm_loader = @import("../../pluginabi/wasm_loader.zig");
+const builtin_catalog = @import("../../pluginabi/builtin_catalog.zig");
 
 /// One inventory row already projected into wire vocabulary.
 const Entry = struct {
@@ -56,6 +57,17 @@ pub fn listValue(alloc: std.mem.Allocator, io: std.Io, cwd: []const u8, home: []
     // Both registries must outlive `entries`: rows borrow plugin paths and
     // manifest names from registry storage. Render happens below, BEFORE
     // deinit.
+    // Built-in capability catalog first (upstream tool packages compiled
+    // into zharness: fs, web, shell, goal, todo, ask-user, subagent, skill).
+    for (builtin_catalog.entries) |b| {
+        try entries.append(alloc, .{
+            .entry_id = b.entry_id,
+            .module_name = b.module_name,
+            .enabled = b.enabled,
+            .fiber_phase = b.fiber_phase,
+        });
+    }
+
     var reg = loader.PluginRegistry.init(alloc);
     defer reg.deinit();
     // Same discovery order as loadDefaultDirs, but with the home injected:
