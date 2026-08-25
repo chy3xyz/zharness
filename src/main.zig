@@ -115,6 +115,19 @@ fn muxPublishEventEsc(
     muxPublishEvent(ev_type, surface_append, data);
 }
 
+fn muxPublishEventStepEsc(
+    comptime ev_type: []const u8,
+    comptime data_fmt: []const u8,
+    surface_append: bool,
+    step: usize,
+    escaped: []const u8,
+) void {
+    const A = gpaAlloc();
+    const data = std.fmt.allocPrint(A, data_fmt, .{ step, escaped }) catch return;
+    defer A.free(data);
+    muxPublishEvent(ev_type, surface_append, data);
+}
+
 fn onEvent(kind: agent.AgentLoop.EventKind, payload: []const u8) void {
     obsEmit(kind, payload);
     // Live SessionEventMap folding for vendored-GUI runs (spec §3): when a
@@ -123,14 +136,13 @@ fn onEvent(kind: agent.AgentLoop.EventKind, payload: []const u8) void {
     // apiproxy/sessions.zig's history reconstruction exactly.
     if (g_mux_run_session != null) {
         switch (kind) {
-            .thinking => if (jsonEsc(gpaAlloc(), payload)) |t| {
-                defer gpaAlloc().free(t);
-                muxPublishEventEsc("assistant/chunk", "{{\"turn\":1,\"step\":1,\"chunk\":{{\"type\":\"reasoning-delta\",\"index\":0,\"text\":{s}}}}}", false, t);
+            .turn_start => {
+                
             },
-            .text => if (jsonEsc(gpaAlloc(), payload)) |t| {
-                defer gpaAlloc().free(t);
-                muxPublishEventEsc("assistant/chunk", "{{\"turn\":1,\"step\":1,\"chunk\":{{\"type\":\"text-delta\",\"index\":0,\"text\":{s}}}}}", false, t);
-            },
+            // NOTE: .thinking and .text streaming deltas are published by
+            // onStreamDelta (the ChatClient's stream_sink), NOT here. The
+            // onEvent .text fires after the full response is assembled and
+            // would duplicate the streaming chunks.
             .tool_call => blk: {
                 const A = gpaAlloc();
                 const open = std.mem.indexOfScalar(u8, payload, '(');
@@ -142,16 +154,16 @@ fn onEvent(kind: agent.AgentLoop.EventKind, payload: []const u8) void {
                     "{}";
                 const name_j = jsonEsc(A, tool_name) orelse break :blk;
                 defer A.free(name_j);
-                // Arguments must be a RAW JSON OBJECT (not a string) — the
-                // client's tool card renders them as structured data.
-                const args_final = if (raw_args.len > 0 and raw_args[0] == '{') raw_args else "{}";
+                // Arguments must be a JSON STRING (upstream fixture sends
+                // them as template-literal strings, not raw objects).
+                const args_j2 = jsonEsc(A, raw_args) orelse break :blk;
                 const n = g_tool_call_seq.fetchAdd(1, .monotonic);
                 g_current_call_id_len = (std.fmt.bufPrint(&g_current_call_id, "call-{d}", .{n}) catch return).len;
                 const call_j = jsonEsc(A, g_current_call_id[0..g_current_call_id_len]) orelse break :blk;
                 defer A.free(call_j);
                 const data = std.fmt.allocPrint(A,
-                    "{{\"turn\":1,\"step\":2,\"callId\":{s},\"name\":{s},\"arguments\":{s}}}",
-                    .{ call_j, name_j, args_final },
+                    "{{\"turn\":1,\"step\":0,\"callId\":{s},\"name\":{s},\"arguments\":{s}}}",
+                    .{ call_j, name_j, args_j2 },
                 ) catch break :blk;
                 defer A.free(data);
                 if (std.c.getenv("ZH_DEBUG_FRAME") != null) std.debug.print("[frame:tool_call] {s}\n", .{data});
@@ -163,7 +175,7 @@ fn onEvent(kind: agent.AgentLoop.EventKind, payload: []const u8) void {
                 const call_j = jsonEsc(A, g_current_call_id[0..g_current_call_id_len]) orelse return;
                 defer A.free(call_j);
                 const data = std.fmt.allocPrint(A,
-                    "{{\"turn\":1,\"step\":2,\"message\":{{\"id\":{s},\"role\":\"user\",\"content\":[{{\"type\":\"tool-result\",\"toolCallId\":{s},\"content\":[{{\"type\":\"text\",\"text\":{s}}}]}}],\"source\":{{\"kind\":\"tool\",\"callId\":{s}}}}}}}",
+                    "{{\"turn\":1,\"step\":0,\"message\":{{\"id\":{s},\"role\":\"user\",\"content\":[{{\"type\":\"tool-result\",\"toolCallId\":{s},\"content\":[{{\"type\":\"text\",\"text\":{s}}}]}}],\"source\":{{\"kind\":\"tool\",\"callId\":{s}}}}}}}",
                     .{ call_j, call_j, o, call_j },
                 ) catch return;
                 defer A.free(data);
@@ -172,7 +184,7 @@ fn onEvent(kind: agent.AgentLoop.EventKind, payload: []const u8) void {
             },
             .done => if (jsonEsc(gpaAlloc(), payload)) |t| {
                 defer gpaAlloc().free(t);
-                muxPublishEventEsc("assistant/message", "{{\"turn\":1,\"step\":3,\"message\":{{\"id\":\"a-live\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":{s}}}],\"source\":{{\"kind\":\"model\"}}}}}}", true, t);
+                muxPublishEventEsc("assistant/message", "{{\"turn\":1,\"step\":0,\"message\":{{\"id\":\"a-live\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":{s}}}],\"source\":{{\"kind\":\"model\"}}}}}}", true, t);
             },
             else => {},
         }
@@ -214,12 +226,16 @@ fn onStreamDelta(kind: model.StreamKind, delta: []const u8) void {
         const A = gpaAlloc();
         const dj = jsonEsc(A, delta) orelse return;
         defer A.free(dj);
-        switch (kind) {
-            .text => muxPublishEventEsc("assistant/chunk",
-                "{{\"turn\":1,\"step\":1,\"chunk\":{{\"type\":\"text-delta\",\"index\":0,\"text\":{s}}}}}", false, dj),
-            .reasoning => muxPublishEventEsc("assistant/chunk",
-                "{{\"turn\":1,\"step\":1,\"chunk\":{{\"type\":\"reasoning-delta\",\"index\":0,\"text\":{s}}}}}", false, dj),
-        }
+        const chunk_type: []const u8 = switch (kind) {
+            .text => "text-delta",
+            .reasoning => "reasoning-delta",
+        };
+        const data = std.fmt.allocPrint(A,
+            "{{\"turn\":1,\"step\":0,\"chunk\":{{\"type\":\"{s}\",\"index\":0,\"text\":{s}}}}}",
+            .{ chunk_type, dj },
+        ) catch return;
+        defer A.free(data);
+        muxPublishEvent("assistant/chunk", false, data);
     }
 }
 
@@ -1348,12 +1364,14 @@ fn runDetachedForGui(alloc: std.mem.Allocator, base_cfg: *config.Config, ov: Ser
         if (data) |d| {
             defer gpaAlloc().free(d);
             muxPublishEvent("user/message", true, d);
+    muxPublishEvent("step/start", false, "{\"turn\":1,\"step\":0}");
         }
     }
 
     hostPublishFmtSession(session_id, true);
     _ = agentRunOnce(alloc, &run_cfg, run_opts, prompt, session_id) catch {
         if (g_mux_run_error == null) g_mux_run_error = gpaAlloc().dupe(u8, "run failed") catch null;
+        muxPublishEvent("step/end", false, "{\"turn\":1,\"step\":0}");
         muxPublishEvent("turn/end", false, "{{\"turn\":1,\"reason\":{{\"kind\":\"error\",\"error\":{{\"message\":\"run failed\"}}}}}}");
         if (jsonEsc(gpaAlloc(), session_id)) |sid| {
             defer gpaAlloc().free(sid);
@@ -1391,6 +1409,7 @@ fn runDetachedForGui(alloc: std.mem.Allocator, base_cfg: *config.Config, ov: Ser
             }
         }
     } else {
+    muxPublishEvent("step/end", false, "{\"turn\":1,\"step\":0}");
         muxPublishEvent("turn/end", false, "{\"turn\":1,\"reason\":{\"kind\":\"completed\"}}");
     }
     hostPublishFmtSession(session_id, false);
