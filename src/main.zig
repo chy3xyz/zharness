@@ -1106,34 +1106,54 @@ fn apxListSessions(ctx: ?*anyopaque, alloc: std.mem.Allocator) anyerror![]apipro
         const path = try std.fmt.allocPrint(alloc, "{s}/{s}.json", .{ dir, id });
         defer alloc.free(path);
         const updated = apix_sessions.mtimeMs(io, path);
-        // Summary rows render from lightweight data only; transcript loads
-        // happen on session.history. The blank bit IS list data though: the
-        // client's connectWorkspace reuse predicate reads it, so a hardcoded
-        // false would mint a fresh session on every New-Session pick instead
-        // of reusing the workspace's existing blank one. Sniffing the head
-        // byte range suffices: an empty session serializes without any
-        // message object ("[]"), and an oversized head implies content.
         var blank = true;
-        if (std.Io.Dir.readFileAlloc(.cwd(), io, path, alloc, .limited(512))) |head| {
+        var title: ?[]u8 = null;
+        if (std.Io.Dir.readFileAlloc(.cwd(), io, path, alloc, .limited(8192))) |head| {
             defer alloc.free(head);
             blank = std.mem.indexOfScalar(u8, head, '{') == null;
+            if (std.mem.indexOf(u8, head, "user") != null) {
+                if (std.mem.indexOfPos(u8, head, 0, "\"content\":\"")) |ci| {
+                    if (ci > 0) {
+                        var ts = ci + 12;
+                        if (ts < head.len and head[ts] == '"') ts += 1;
+                        const te = std.mem.indexOfScalarPos(u8, head, ts, '"') orelse head.len;
+                        if (te > ts) {
+                            const raw = head[ts..te];
+                            const clean = std.mem.trim(u8, raw, " \t\r\n");
+                            const trunc = @min(clean.len, 40);
+                            if (trunc > 0) title = try alloc.dupe(u8, clean[0..trunc]);
+                        }
+                            // Validate UTF-8: replace with session id if invalid
+                            if (!std.unicode.utf8ValidateSlice(title.?)) {
+                                alloc.free(title.?);
+                                title = try alloc.dupe(u8, id);
+                            }
+                    }
+                }
+            }
         } else |e| switch (e) {
             error.StreamTooLong => blank = false,
             error.FileNotFound => {},
             else => return e,
         }
+        const title_src: []const u8 = title orelse id;
+        defer if (title) |t| alloc.free(t);
+        const proj = try std.fmt.allocPrint(alloc,
+            "{{\"asOfSeq\":-1,\"values\":{{\"title\":\"{s}\"}}}}",
+            .{title_src},
+        );
+        defer alloc.free(proj);
         try out.append(alloc, .{
             .session_id = try alloc.dupe(u8, id),
             .updated_at_ms = updated,
             .running = false,
             .blank = blank,
             .cwd = try alloc.dupe(u8, st.cfg.cwd),
+            .projections_json = try alloc.dupe(u8, proj),
         });
     }
     return out.toOwnedSlice(alloc);
 }
-
-/// session.history → replay pages reconstructed from the stored transcript.
 fn apxSessionHistory(
     ctx: ?*anyopaque,
     alloc: std.mem.Allocator,

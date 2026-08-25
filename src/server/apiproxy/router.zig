@@ -2027,7 +2027,13 @@ pub fn dispatch(
     const p = env.payload_raw;
 
     // sessions domain
-    if (std.mem.eql(u8, m, "session.list")) return run(alloc, env, hSessionList(deps, alloc, env.rpc_id, p));
+    if (std.mem.eql(u8, m, "session.list")) {
+        const resp = try hSessionList(deps, alloc, env.rpc_id, p);
+        const clean = try sanitizeResponseBody(alloc, resp.body);
+        if (clean.ptr == resp.body.ptr) return resp;
+        const mutable = try alloc.dupe(u8, clean);
+        return .{ .body = mutable };
+    }
     if (std.mem.eql(u8, m, "session.search")) {
         if (deps.searchSessions == null) {
             return internalError(alloc, env.rpc_id, "session.search is not implemented on this host");
