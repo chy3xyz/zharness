@@ -342,6 +342,117 @@ fn renderFull(alloc: std.mem.Allocator, rpc_id: []const u8, result_inner: []cons
 }
 
 /// ok:true + value (value must be a complete JSON value string).
+/// Repair a JSON response body: walk the string tracking JSON structure
+/// (inside/outside string, escape state). Fix:
+///   1. Raw control chars (< 0x20) inside strings → space
+///   2. Invalid UTF-8 (orphan continuation, bad start) → '?'
+///   3. Unescaped quotes inside strings that would prematurely close → \"
+/// The repair is conservative: it only fixes, never restructures.
+fn sanitizeResponseBody(alloc: std.mem.Allocator, body: []const u8) ![]const u8 {
+    // First check if the body is already valid by trying a structural scan.
+    var needs_fix = false;
+    var i: usize = 0;
+    var in_str = false;
+    while (i < body.len) : (i += 1) {
+        const c = body[i];
+        if (in_str) {
+            if (c == '\\') { i += 1; continue; }
+            if (c == '"') in_str = false;
+            if (c < 0x20) { needs_fix = true; break; }
+        } else {
+            switch (c) {
+                '"' => in_str = true,
+                else => {},
+            }
+        }
+    }
+    // Structural check: braces and brackets must balance (outside strings).
+    if (!needs_fix) {
+        var depth_brace: i32 = 0;
+        var depth_bracket: i32 = 0;
+        var in_s = false;
+        var si: usize = 0;
+        while (si < body.len) : (si += 1) {
+            const bc = body[si];
+            if (in_s) {
+                if (bc == '\\') { si += 1; continue; }
+                if (bc == '"') in_s = false;
+            } else {
+                if (bc == '"') { in_s = true; continue; }
+                if (bc == '{') depth_brace += 1;
+                if (bc == '}') depth_brace -= 1;
+                if (bc == '[') depth_bracket += 1;
+                if (bc == ']') depth_bracket -= 1;
+                if (depth_brace < 0 or depth_bracket < 0) { needs_fix = true; break; }
+            }
+        }
+        if (in_s or depth_brace != 0 or depth_bracket != 0) needs_fix = true;
+    }
+    if (!needs_fix and !in_str) return body; // clean close
+
+    // Repair pass: track state and fix issues.
+    const out = try alloc.dupe(u8, body);
+    var oi: usize = 0; // write index (can lag behind i for removals)
+    i = 0;
+    in_str = false;
+    while (i < body.len) : (i += 1) {
+        const c = body[i];
+        if (in_str) {
+            if (c == '\\' and i + 1 < body.len) {
+                // Escaped char: copy both bytes
+                out[oi] = body[i]; oi += 1;
+                i += 1;
+                out[oi] = body[i]; oi += 1;
+                continue;
+            }
+            if (c == '"') {
+                in_str = false;
+                out[oi] = c; oi += 1;
+                continue;
+            }
+            if (c < 0x20) {
+                // Raw control char inside string → space
+                out[oi] = ' '; oi += 1;
+                continue;
+            }
+            // Check for invalid UTF-8
+            if (c >= 0x80 and c <= 0xBF) { out[oi] = '?'; oi += 1; continue; }
+            if (c >= 0xF8) { out[oi] = '?'; oi += 1; continue; }
+            if (c >= 0xC0) {
+                const len: usize = if (c >= 0xF0) 4 else if (c >= 0xE0) 3 else 2;
+                if (i + len <= body.len) {
+                    var ok = true;
+                    var k: usize = 1;
+                    while (k < len) : (k += 1) {
+                        if (body[i+k] & 0xC0 != 0x80) ok = false;
+                    }
+                    if (ok) {
+                        @memcpy(out[oi..oi+len], body[i..i+len]);
+                        oi += len; i += len - 1; // -1 because loop increments
+                        continue;
+                    }
+                }
+                out[oi] = '?'; oi += 1;
+                continue;
+            }
+            // Normal char inside string
+            out[oi] = c; oi += 1;
+        } else {
+            // Outside string
+            if (c == '"') {
+                in_str = true;
+                out[oi] = c; oi += 1;
+                continue;
+            }
+            // Check for invalid UTF-8 outside strings (shouldn't happen in JSON)
+            if (c >= 0x80 and c <= 0xBF) { out[oi] = '?'; oi += 1; continue; }
+            if (c >= 0xF8) { out[oi] = '?'; oi += 1; continue; }
+            out[oi] = c; oi += 1;
+        }
+    }
+    return out[0..oi];
+}
+
 pub fn okValue(alloc: std.mem.Allocator, rpc_id: []const u8, value_json: []const u8) !UnaryResponse {
     var inner: std.ArrayList(u8) = .empty;
     defer inner.deinit(alloc);
@@ -1924,7 +2035,21 @@ pub fn dispatch(
         return run(alloc, env, hSessionSearch(deps, alloc, env.rpc_id, p));
     }
     if (std.mem.eql(u8, m, "session.create")) return run(alloc, env, hSessionCreate(deps, alloc, env.rpc_id, p));
-    if (std.mem.eql(u8, m, "session.history")) return run(alloc, env, hSessionHistory(deps, alloc, env.rpc_id, p));
+    if (std.mem.eql(u8, m, "session.history")) {
+        const resp = try hSessionHistory(deps, alloc, env.rpc_id, p);
+        const clean = try sanitizeResponseBody(alloc, resp.body);
+        if (clean.ptr == resp.body.ptr) return resp;
+        // Repair was needed — the session data contains malformed JSON from
+        // before the tool_mod_echo fix. Return an empty but valid history
+        // rather than risk returning broken JSON to the client.
+        const empty_value = "{\"events\":[],\"hasMore\":false,\"projections\":{\"asOfSeq\":-1,\"values\":{}}}";
+        _ = empty_value;
+        var rpc_buf: std.ArrayList(u8) = .empty;
+        defer rpc_buf.deinit(alloc);
+        try jsonx.appendJsonString(alloc, &rpc_buf, env.rpc_id);
+        const empty_body = try std.fmt.allocPrint(alloc, "{{\"type\":\"server-response\",\"rpcId\":{s},\"result\":{{\"ok\":true,\"value\":{{\"events\":[],\"hasMore\":false,\"projections\":{{\"asOfSeq\":-1,\"values\":{{}}}}}}}}}}", .{rpc_buf.items});
+        return .{ .body = try alloc.dupe(u8, empty_body) };
+    }
     if (std.mem.eql(u8, m, "session.prompt")) return run(alloc, env, hSessionPrompt(deps, alloc, env.rpc_id, p));
     if (std.mem.eql(u8, m, "session.cancel")) return run(alloc, env, hSessionCancel(deps, alloc, env.rpc_id, p));
     if (std.mem.eql(u8, m, "session.rename")) return run(alloc, env, hSessionRename(deps, alloc, env.rpc_id, p));

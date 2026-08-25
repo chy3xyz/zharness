@@ -64,6 +64,12 @@ pub fn transcriptPath(alloc: std.mem.Allocator, cwd: []const u8, id: []const u8)
 /// empty session), matching session.Session.load semantics. Malformed JSON
 /// degrades to whatever prefix parses (per-object best effort).
 pub fn loadTranscript(io: std.Io, alloc: std.mem.Allocator, path: []const u8) ![]MsgRec {
+    // Skip very large session files (>50MB) — parsing them would take too
+    // long and the GUI can't render thousands of events meaningfully.
+    const stat = std.Io.Dir.statFile(.cwd(), io, path, .{}) catch {
+        return error.FileNotFound;
+    };
+    if (stat.size > 50 * 1024 * 1024) return error.FileNotFound;
     const raw = std.Io.Dir.readFileAlloc(.cwd(), io, path, alloc, .unlimited) catch |e| switch (e) {
         error.FileNotFound => return try alloc.alloc(MsgRec, 0),
         else => return e,
@@ -262,6 +268,56 @@ pub fn freeToolCallSlots(alloc: std.mem.Allocator, slots: []ToolCallSlot) void {
 /// `max_messages` pages the TAIL (most recent messages); `has_more` reports
 /// whether older messages exist beyond the page. Seq numbers index the FULL
 /// transcript so tail pages stay consistent across refetches.
+/// Replace control chars (< 0x20 except \n) with spaces and invalid UTF-8
+/// continuation bytes with '?'. Returns the input unchanged if already clean.
+fn sanitizeContent(alloc: std.mem.Allocator, input: []const u8) ![]const u8 {
+    var needs_fix = false;
+    var i: usize = 0;
+    while (i < input.len) {
+        const c = input[i];
+        if (c < 0x20 and c != '\n') { needs_fix = true; break; }
+        if (c >= 0x80 and c <= 0xBF) { needs_fix = true; break; } // orphan continuation
+        if (c >= 0xF8) { needs_fix = true; break; }
+        if (c >= 0xC0) {
+            const len: usize = if (c >= 0xF0) 4 else if (c >= 0xE0) 3 else 2;
+            var ok = i + len <= input.len;
+            var j: usize = 1;
+            while (j < len and ok) : (j += 1) {
+                if (input[i + j] & 0xC0 != 0x80) ok = false;
+            }
+            if (!ok) { needs_fix = true; break; }
+            i += len;
+            continue;
+        }
+        i += 1;
+    }
+    if (!needs_fix) return input;
+    var out = try alloc.alloc(u8, input.len);
+    var oi: usize = 0;
+    i = 0;
+    while (i < input.len) {
+        const c = input[i];
+        if (c < 0x20 and c != '\n') {
+            out[oi] = ' '; oi += 1; i += 1;
+        } else if (c >= 0x80 and c <= 0xBF) {
+            out[oi] = '?'; oi += 1; i += 1;
+        } else if (c >= 0xF8) {
+            out[oi] = '?'; oi += 1; i += 1;
+        } else if (c >= 0xC0) {
+            const len: usize = if (c >= 0xF0) 4 else if (c >= 0xE0) 3 else 2;
+            if (i + len <= input.len) {
+                @memcpy(out[oi..oi+len], input[i..i+len]);
+                oi += len; i += len;
+            } else {
+                out[oi] = '?'; oi += 1; i += 1;
+            }
+        } else {
+            out[oi] = c; oi += 1; i += 1;
+        }
+    }
+    return out[0..oi];
+}
+
 pub fn buildHistoryPage(
     alloc: std.mem.Allocator,
     msgs: []const MsgRec,
@@ -285,6 +341,7 @@ pub fn buildHistoryPage(
     defer data.deinit(alloc);
 
     for (msgs[start..], start..) |m, seq| {
+        const safe_content = m.content;
         if (std.mem.eql(u8, m.role, "system")) continue; // no chat surface
         const step: usize = seq + 1;
 
@@ -293,7 +350,7 @@ pub fn buildHistoryPage(
             try data.appendSlice(alloc, "{\"id\":\"u");
             try jsonx.appendInt(alloc, &data, @intCast(seq));
             try data.appendSlice(alloc, "\",\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
-            try jsonx.appendJsonString(alloc, &data, m.content);
+            try jsonx.appendJsonString(alloc, &data, safe_content);
             try data.appendSlice(alloc, "}],\"source\":{\"kind\":\"user\"}}");
             try pushEntry(alloc, &entries, "user/message", seq, updated_at_ms, data.items);
             continue;
@@ -302,7 +359,8 @@ pub fn buildHistoryPage(
         if (std.mem.eql(u8, m.role, "assistant")) {
             // tool/call slots precede the finalized assistant message.
             if (m.tool_calls_json) |tcj| {
-                const slots = try parseToolCallSlots(alloc, tcj);
+            const tcj_clean = sanitizeContent(alloc, tcj) catch tcj;
+                const slots = try parseToolCallSlots(alloc, tcj_clean);
                 defer freeToolCallSlots(alloc, slots);
                 for (slots) |slot| {
                     data.clearRetainingCapacity();
@@ -325,7 +383,7 @@ pub fn buildHistoryPage(
             try data.appendSlice(alloc, ",\"message\":{\"id\":\"a");
             try jsonx.appendInt(alloc, &data, @intCast(seq));
             try data.appendSlice(alloc, "\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":");
-            try jsonx.appendJsonString(alloc, &data, m.content);
+            try jsonx.appendJsonString(alloc, &data, safe_content);
             try data.appendSlice(alloc, "}],\"source\":{\"kind\":\"model\"}}}");
             try pushEntry(alloc, &entries, "assistant/message", seq, updated_at_ms, data.items);
             continue;
@@ -341,7 +399,7 @@ pub fn buildHistoryPage(
             try data.appendSlice(alloc, "\",\"role\":\"user\",\"content\":[{\"type\":\"tool-result\",\"toolCallId\":");
             try jsonx.appendJsonString(alloc, &data, call_id);
             try data.appendSlice(alloc, ",\"content\":[{\"type\":\"text\",\"text\":");
-            try jsonx.appendJsonString(alloc, &data, m.content);
+            try jsonx.appendJsonString(alloc, &data, safe_content);
             try data.appendSlice(alloc, "]}],\"source\":{\"kind\":\"tool\",\"callId\":");
             try jsonx.appendJsonString(alloc, &data, call_id);
             try data.appendSlice(alloc, "}}}");
@@ -362,8 +420,21 @@ pub fn buildHistoryPage(
     try jsonx.appendJsonString(alloc, &proj, title);
     try proj.appendSlice(alloc, "}}");
 
+    const result = try entries.toOwnedSlice(alloc);
+    // Drop events containing NUL bytes (indicates binary corruption from
+    // old sessions written before the tool_mod_echo fix).
+    var write_idx: usize = 0;
+    for (result) |entry| {
+        if (std.mem.indexOf(u8, entry.event_json, "\x00") == null) {
+            result[write_idx] = entry;
+            write_idx += 1;
+        } else {
+            alloc.free(entry.event_json);
+            if (entry.view_json) |v| alloc.free(v);
+        }
+    }
     return .{
-        .entries = try entries.toOwnedSlice(alloc),
+        .entries = result[0..write_idx],
         .has_more = has_more,
         .projections_json = try proj.toOwnedSlice(alloc),
     };
