@@ -196,9 +196,26 @@ fn onEvent(kind: agent.AgentLoop.EventKind, payload: []const u8) void {
 /// Live-delta sink for streamed chat completions: text prints as it arrives;
 /// reasoning prints dimmed so it reads as scaffolding, not the answer.
 fn onStreamDelta(kind: model.StreamKind, delta: []const u8) void {
+    if (std.c.getenv("ZH_DEBUG_STREAM") != null) {
+        std.debug.print("[stream] kind={s} len={d} mux_session={s}\n", .{ @tagName(kind), delta.len, if (g_mux_run_session != null) "SET" else "NULL" });
+    }
     switch (kind) {
         .text => std.debug.print("{s}", .{delta}),
         .reasoning => std.debug.print("\x1b[2m{s}\x1b[0m", .{delta}),
+    }
+    // Stream deltas to the GUI in real time (not just after the response
+    // completes). The muxPublishEvent path handles session parking and
+    // envelope wrapping.
+    if (g_mux_run_session != null) {
+        const A = gpaAlloc();
+        const dj = jsonEsc(A, delta) orelse return;
+        defer A.free(dj);
+        switch (kind) {
+            .text => muxPublishEventEsc("assistant/chunk",
+                "{{\"turn\":1,\"step\":1,\"chunk\":{{\"type\":\"text-delta\",\"index\":0,\"text\":{s}}}}}", false, dj),
+            .reasoning => muxPublishEventEsc("assistant/chunk",
+                "{{\"turn\":1,\"step\":1,\"chunk\":{{\"type\":\"reasoning-delta\",\"index\":0,\"text\":{s}}}}}", false, dj),
+        }
     }
 }
 
