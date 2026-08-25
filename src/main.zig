@@ -28,6 +28,10 @@ const api = @import("server/api.zig");
 const webfetch = @import("tool/webfetch.zig");
 const spawn_agent = @import("tool/spawn_agent.zig");
 const subagent_mod = @import("agent/subagent.zig");
+const run_code = @import("tool/run_code.zig");
+const instructions_mod = @import("agent/instructions.zig");
+const compaction_mod = @import("agent/compaction.zig");
+const preset_tools = @import("dynamic/preset_tools.zig");
 const wf_mod = @import("workflow/workflow.zig");
 const wf_exec = @import("workflow/executor.zig");
 const wf_report = @import("workflow/run_report.zig");
@@ -540,6 +544,10 @@ pub const LoopExtensions = struct {
             return .{ .success = r.success, .output = r.output, .err_msg = r.err_msg };
         }
         // ── swarm wave-2 tool surfaces ────────────────────────────────────
+        if (std.mem.eql(u8, call.name, "run_code")) {
+            const r = try run_code.execute(alloc, .{ .name = call.name, .arguments = call.arguments });
+            return .{ .success = r.success, .output = r.output, .err_msg = r.err_msg };
+        }
         if (std.mem.eql(u8, call.name, "spawn_agent")) {
             const r = try spawn_agent.execute(alloc, .{ .name = call.name, .arguments = call.arguments });
             // spawn_agent's ToolResult mirrors the builtin shape; re-tag it so
@@ -1712,6 +1720,7 @@ pub const Built = struct {
             alloc.destroy(c);
         }
         spawn_agent.clearSpawnCtx();
+        run_code.clearCtx();
         ask_user.clearAskCtx();
         for (self.mcp_clients) |c| {
             c.deinit();
@@ -1903,6 +1912,7 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
     // spawn_agent (dev.md §XVIII) — schema registered now; the executor slot
     // is wired right after the chat client exists below.
     try tools.register(spawn_agent.definition);
+    try tools.register(run_code.definition);
     try tools.register(ask_user.definition);
     // Upstream alias — canonical is ask_user_question (advertise both,
     // document canonical). Keep alias for backward compatibility.
@@ -2084,6 +2094,13 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
     spawn_agent.setSpawnCtx(spawn_deps);
     errdefer spawn_agent.clearSpawnCtx();
 
+    // Code Mode (run_code) wiring
+    const rc_deps = try alloc.create(run_code.Deps);
+    errdefer alloc.destroy(rc_deps);
+    rc_deps.* = .{ .io = ctx.io(), .cwd = cfg.cwd, .sandbox_mode = cfg.sandbox_mode };
+    run_code.setCtx(rc_deps);
+    errdefer run_code.clearCtx();
+
     // Heap-allocate the config so the pointer `Agent` holds stays valid after
     // buildLoop returns (a stack-local would dangle and corrupt system_prompt).
     // A preset (dev.md §XXVIII) appends its prompt fragment and supplies the
@@ -2092,10 +2109,28 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
     var max_turns = cfg.max_turns;
     if (opts.preset) |kind| {
         const spec = presets_mod.spec(kind);
-        system_prompt = try std.fmt.allocPrint(alloc, "{s}\n\n{s}", .{ SYSTEM_PROMPT, spec.system_prompt_fragment });
+        // Persona template: {{model}}/{{cwd}} substitution
+        const persona = try presets_mod.resolvePersona(alloc, spec, cfg.model, cfg.cwd);
+        if (spec.complete_prompt) {
+            // complete_prompt: persona IS the entire system prompt
+            system_prompt = persona;
+        } else {
+            system_prompt = try std.fmt.allocPrint(alloc, "{s}\n\n{s}", .{ persona, spec.system_prompt_fragment });
+        }
         if (cfg.max_turns == 0) max_turns = spec.default_max_turns;
     }
     errdefer if (system_prompt.ptr != SYSTEM_PROMPT.ptr) alloc.free(system_prompt);
+
+    // Agent instructions: per-preset custom instructions file (max 64KB)
+    if (opts.preset != null or true) {
+        const preset_name = if (opts.preset) |k| presets_mod.spec(k).name else "standard";
+        if (instructions_mod.loadFor(alloc, cfg.cwd, preset_name) catch null) |instr| {
+            defer alloc.free(instr);
+            const augmented = try std.fmt.allocPrint(alloc, "{s}\n\n{s}", .{ system_prompt, instr });
+            if (system_prompt.ptr != SYSTEM_PROMPT.ptr) alloc.free(system_prompt);
+            system_prompt = augmented;
+        }
+    }
 
     const acfg = try alloc.create(agent.AgentConfig);
     errdefer alloc.destroy(acfg);

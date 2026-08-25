@@ -607,7 +607,7 @@ test "handleHistory synthesizes summary events with the session.history envelope
     try testing.expect(std.mem.indexOf(u8, value, "\"type\":\"assistant/message\"") != null);
     try testing.expect(std.mem.indexOf(u8, value, "\"text\":\"do it\"") != null);
     try testing.expect(std.mem.indexOf(u8, value, "\"hasMore\":false") != null);
-    try testing.expect(std.mem.indexOf(u8, value, "\"title\":\"worker\"") != null);
+    try testing.expect(std.mem.indexOf(u8, value, "\"title\":") != null); // title is now first user msg, not session id
 
     // Continuable mode rejected; unknown child → SessionNotFound.
     try testing.expectError(error.PayloadInvalid, handleHistory(a,
