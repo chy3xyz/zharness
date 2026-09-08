@@ -314,6 +314,10 @@ const RunLock = struct {
 var g_run_mutex: RunLock = .{};
 var g_apx_state: ?*ApxState = null;
 var g_ask_storage: ask_user.AskCtx = .{};
+/// Dynamic-Cordis wiring slot (preset_tools.setCordisCtx points here); the
+/// lifecycle pointer is the process-global sharedDynamicLifecycle() singleton,
+/// so a plain static outlives every per-run Built.
+var g_cordis_deps: preset_tools.CordisDeps = undefined;
 
 fn publishAskFrame(frame_json: []const u8) void {
     if (events_ws.sharedHubs()) |hubs| hubs.mux.publishFrame(frame_json) else |_| {}
@@ -444,6 +448,18 @@ fn splitCommand(alloc: std.mem.Allocator, cmd: []const u8) ![][]const u8 {
 fn builtinAllowedByPreset(allowed: []const []const u8, name: []const u8) bool {
     for (allowed) |a| {
         if (std.mem.eql(u8, a, name)) return true;
+    }
+    return false;
+}
+
+/// True for names any preset toolkit mentions (the classic fs/shell/git
+/// surface) — the only tools preset filtering may remove. Derived from
+/// presets.table so the two cannot drift apart.
+fn isPresetConstrainedName(name: []const u8) bool {
+    for (presets_mod.table) |spec| {
+        for (spec.tools) |n| {
+            if (std.mem.eql(u8, n, name)) return true;
+        }
     }
     return false;
 }
@@ -598,6 +614,10 @@ pub const LoopExtensions = struct {
         if (std.mem.startsWith(u8, call.name, "mcp_")) {
             const res = mcp_bridge.execute(alloc, call.name, call.arguments);
             return res;
+        }
+        if (std.mem.startsWith(u8, call.name, "cordis_")) {
+            const r = try preset_tools.execute(alloc, .{ .name = call.name, .arguments = call.arguments });
+            return .{ .success = r.success, .output = r.output, .err_msg = r.err_msg };
         }
         if (self.plugins) |p| {
             if (try p.execute(alloc, call.name, call.arguments)) |out| {
@@ -846,6 +866,10 @@ pub fn registerExtensionTools(reg: *tool_reg.ToolRegistry, opts: struct { skills
             ,
         });
     }
+    // Dynamic-Cordis surface (docs/dynamic-cordis-spec.md §9). Registered
+    // unconditionally like ask_user: before the host calls setCordisCtx the
+    // executor answers with teaching text instead of acting.
+    for (preset_tools.definitions) |d| try reg.register(d);
 }
 
 // ── serve (dev.md §XXIII): HTTP API over the agent loop ─────────────────────
@@ -1779,6 +1803,7 @@ pub const Built = struct {
         spawn_agent.clearSpawnCtx();
         run_code.clearCtx();
         ask_user.clearAskCtx();
+        preset_tools.clearCordisCtx();
         for (self.mcp_clients) |c| {
             c.deinit();
             alloc.destroy(c);
@@ -1980,6 +2005,19 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
     g_ask_storage = .{ .publish = publishAskFrame, .store = questions.sharedStore() catch null };
     ask_user.setAskCtx(&g_ask_storage);
 
+    // ── dynamic Cordis (docs/dynamic-cordis-spec.md §9): lifecycle wiring.
+    // Tool schemas are registered by registerExtensionTools above; here we
+    // only hand the executor the process-global lifecycle singleton (the same
+    // one the apiproxy router serves — definitions made via cordis_define are
+    // visible to connected pages and vice versa) and the owning session id.
+    // Headless runs (CLI: empty session id) get an approval budget because no
+    // page can ever resolve cordis/request-run — the wait would never end.
+    if (apiproxy.sharedDynamicLifecycle()) |lc| {
+        if (opts.session_id.len == 0) lc.approval_timeout_ms = 30_000;
+        g_cordis_deps = .{ .lc = lc, .session_id = opts.session_id };
+        preset_tools.setCordisCtx(&g_cordis_deps);
+    } else |_| {}
+
     // ── native plugins (dev.md §XXV–XXVI): best-effort discovery ──────────
     {
         const p = try alloc.create(plugin_loader.PluginRegistry);
@@ -2084,14 +2122,15 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
     }
 
     // ── preset filtering (dev.md §XXVIII): narrow the core builtin surface.
-    // Extension/web/mcp/plugin/subagent capabilities stay available; presets
-    // constrain the classic coding-toolset only.
+    // Only the classic coding-toolset names (the union of the preset
+    // toolkits: fs/shell/git) are constrained; extension/web/mcp/plugin/
+    // subagent/cordis capabilities stay available in every preset.
     if (opts.preset) |kind| {
         const spec = presets_mod.spec(kind);
         const names = try tools.list();
         defer alloc.free(names);
         for (names) |name| {
-            if (!builtinAllowedByPreset(spec.tools, name)) _ = tools.remove(name);
+            if (isPresetConstrainedName(name) and !builtinAllowedByPreset(spec.tools, name)) _ = tools.remove(name);
         }
         std.debug.print("[preset] {s}: {d} builtin tool(s) allowed\n", .{ spec.name, spec.tools.len });
     }

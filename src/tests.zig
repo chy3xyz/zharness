@@ -28,6 +28,7 @@ const plan_mod = @import("agent/plan.zig");
 const goal_mod = @import("agent/goal.zig");
 const todo_mod = @import("todo/todo.zig");
 const main_mod = @import("main.zig");
+const preset_tools = @import("dynamic/preset_tools.zig");
 
 // Swarm wave-2 modules (A/B/C/D/E/F/G) — pulled in via comptime so their
 // inline test blocks join `zig build test` even where nothing references them.
@@ -874,6 +875,47 @@ test "registerExtensionTools respects availability flags" {
     try std.testing.expect(!minimal.contains("memory_get"));
     try std.testing.expect(minimal.contains("plan_add"));
     try std.testing.expect(minimal.contains("todo_write"));
+    // Dynamic-Cordis tools register unconditionally (ask_user precedent):
+    // availability is decided at execute time by the setCordisCtx slot.
+    for ([_][]const u8{ "cordis_define", "cordis_run", "cordis_stop", "cordis_undefine", "cordis_inspect" }) |n| {
+        try std.testing.expect(minimal.contains(n));
+        try std.testing.expect(full.contains(n));
+    }
+}
+
+test "cordis tools route through loop extensions to preset_tools" {
+    const alloc = std.testing.allocator;
+    var ctx = try cordis.Context.init(alloc);
+    defer ctx.deinit();
+    const io = ctx.io();
+
+    var pb = plan_mod.PlanBoard.init(alloc);
+    defer pb.deinit();
+    var gb = goal_mod.GoalBoard.init(alloc);
+    defer gb.deinit();
+    var tb = todo_mod.TodoBoard.init(alloc);
+    defer tb.deinit();
+
+    var lext = main_mod.LoopExtensions{
+        .alloc = alloc,
+        .io = io,
+        .plan_board = &pb,
+        .goal_board = &gb,
+        .todo_board = &tb,
+        .cwd = "/tmp",
+    };
+    const ext = lext.extensions();
+
+    // No wiring slot installed: the call must degrade to the teaching error,
+    // never touch the lifecycle.
+    preset_tools.clearCordisCtx();
+    var r = (try ext.executeTool(ext.ctx, alloc, io, .{
+        .name = "cordis_inspect",
+        .arguments = "{}",
+    })).?;
+    defer tool_builtin.freeResult(alloc, &r);
+    try std.testing.expect(!r.success);
+    try std.testing.expect(std.mem.indexOf(u8, r.err_msg.?, "not wired") != null);
 }
 
 test "durable goal revisions survive session restart" {
