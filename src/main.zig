@@ -994,7 +994,7 @@ fn serveGetSession(
 const ServeBundle = struct {
     apx_deps: *const apiproxy.ApiProxyDeps,
     api_handler: httpd.Handler,
-    /// Static root for the Web UI (dsh dist preferred, vanilla web/ fallback).
+    /// Static root for the Web UI (webui/dist — vendored dsh GUI).
     static_root: []const u8,
 };
 

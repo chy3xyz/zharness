@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Zig 0.17](https://img.shields.io/badge/Zig-0.17-orange.svg)](https://ziglang.org/)
-[![Tests](https://img.shields.io/badge/Tests-382%20passing-brightgreen.svg)](#testing)
+[![Tests](https://img.shields.io/badge/Tests-387%20passing-brightgreen.svg)](#testing)
 
 ---
 
@@ -290,7 +290,7 @@ zharness/
 ## Testing
 
 ```bash
-zig build test                              # full suite (382 tests)
+zig build test                              # full suite (387 tests)
 zig test test/_t_g1.zig                    # a single test root
 ```
 
@@ -330,10 +330,11 @@ and `Scheduler`.
 - Skills & memory system
 - Plan & goal tracking
 
-### MVP-3 🚧
+### MVP-3 ✅
 - SubAgent orchestration
 - Workflow execution
 - WASM plugin sandbox
+- Dynamic Cordis runtime (model-defined JS plugin halves)
 - Enhanced observability
 
 ### Production 📋

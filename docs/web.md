@@ -39,6 +39,15 @@ The GUI speaks the upstream DeepSeek Harness protocol:
 | `/api/events.host`     | WS     | Workspace/session list liveness             |
 | `/healthz`             | GET    | Health check                                |
 
+Beyond this core surface, `src/server/apiproxy/router.zig` dispatches the
+full upstream feature set — settings, subagents, goals, skills, presets,
+models, permissions, search/export, questions (`/api/respond`), jobs,
+trajectory, workflow-run replay, dynamic Cordis (`dynamic.getClientCode` /
+`dynamic.invoke`) — plus zharness extensions (`zharness.jobs.list`,
+`zharness.trajectory.get`, `zharness.workflowRun.*`). Unknown methods return
+upstream's bad-request envelope shape, so panels the backend does not
+implement simply idle.
+
 A legacy minimal JSON API (`POST /run`, `GET /sessions`, `/healthz`, `/events`)
 remains available on the same port for scripts.
 
@@ -54,6 +63,7 @@ var → value table (surfaces, text, borders, shape, rhythm, motion).
 
 ## Limitations
 
-- Settings/subagents/goals degrade gracefully per upstream's own
-  missing-feature rules.
 - Single-user local tool: no auth, no TLS, binds loopback only.
+- One synthesized workspace per server (no multi-workspace routing);
+  `host.listDirectory`/`createDirectory`, `session.fork`, and
+  `llm.discoverModels` upstream methods are not implemented.

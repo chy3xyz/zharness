@@ -35,7 +35,7 @@ only affect branding/build-record metadata.
 corepack enable
 corepack prepare pnpm@11.7.0 --activate
 
-# 2. install (from webui/dsh)
+# 2. install (from webui/)
 cd webui
 pnpm install --no-frozen-lockfile     # lockfile was rewritten once at vendor time; see Deviations
 
@@ -45,7 +45,7 @@ pnpm install --no-frozen-lockfile     # lockfile was rewritten once at vendor ti
 # 4. typert generation (writes lib/typert.* + ./remote subpath artifacts;
 #    upstream does this inside its host-face tsdown pass — we drive the
 #    generator directly because the host aggregate references dropped packages)
-node ../tools/gen-typert.mjs
+node tools/gen-typert.mjs
 
 # NOTE on ordering: steps 3 and 4 are mutually dependent the first time only —
 # step 3 fails on missing ./remote modules until step 4 has run once, and
@@ -53,7 +53,7 @@ node ../tools/gen-typert.mjs
 # First build order: 3 → (expect /remote errors) → 4 → 3 again. Subsequent
 # incremental builds can run either order. A clean-tree one-liner:
 #   ./node_modules/.bin/tsc -b tsconfig.vendor.json ; \
-#   node ../tools/gen-typert.mjs ; \
+#   node tools/gen-typert.mjs ; \
 #   ./node_modules/.bin/tsc -b tsconfig.vendor.json
 
 # 5. bundle all node halves + client bundles + static-channel libs
@@ -66,12 +66,12 @@ pnpm exec tsdown --config tsdown.vendor-libs.ts
 pnpm --filter @deepseek-ai/dsh-web-frontend run build
 
 # 8. regenerate the trimmed boot manifest (after any rebuild — revs are content hashes)
-node ../tools/gen-boot-manifest.mjs
+node tools/gen-boot-manifest.mjs
 
 # 9. link plugin bundles into dist + render the boot-injected index
 #    (vite wipes dist on every build — BOTH steps are mandatory after step 7)
-python3 ../tools/link-plugins.py     # symlinks /plugins/<pkg> -> packages/*/lib
-node ../tools/inject-index.mjs       # index.injected.html (static.zig serves it for "/")
+python3 tools/link-plugins.py     # symlinks /plugins/<pkg> -> packages/*/lib
+node tools/inject-index.mjs       # index.injected.html (static.zig serves it for "/")
 ```
 
 Steps 5–6–7 are incremental and fast (~2s combined when warm).
@@ -80,9 +80,9 @@ Steps 5–6–7 are incremental and fast (~2s combined when warm).
 
 ```sh
 cd webui
-node ../tools/serve-fixture.mjs 4173          # http://localhost:4173/?fixture
-python3 ../tools/boot-smoke.py 4173           # headless boot assertion
-python3 ../tools/roundtrip-smoke.py 4173      # headless prompt round-trip
+node tools/serve-fixture.mjs 4173          # http://localhost:4173/?fixture
+python3 tools/boot-smoke.py 4173           # headless boot assertion
+python3 tools/roundtrip-smoke.py 4173      # headless prompt round-trip
 ```
 
 The URL query `?fixture` makes the vendored connection plugin swap in its
@@ -134,15 +134,14 @@ Current graph rev: `cdf63c698b20` (changes whenever any lib/client.js changes).
 Wave-6 vendor deviations (new packages, package.json trims, tooling changes)
 are recorded in `webui/VENDOR-PATCHES.md`.
 
-## Integrator notes (Zig side, NOT wired yet)
+## Integrator notes (Zig side — WIRED)
 
-- Serve `dist/**` at `/`, `/plugins/<id>/client.js`(+`.map`) from
-  `webui/packages/*/*/lib/`, and inject the four `injections` rows from
-  `build-artifacts/boot-manifest.json` into every served index.html.
-- Implement the §4 wire surface (13 unary methods + 2 WS downlinks).
-- Attribution per spec §8: ship `webui/LICENSE` next to deployed
-  artifacts; add the root `THIRD_PARTY_NOTICES.md` entry ("deepseek-harness
-  Web GUI — Copyright (c) 2026 DeepSeek — MIT") and README note.
+- `src/server/static.zig` serves `dist/**` at `/` (index.injected.html for
+  "/"); `src/server/apiproxy/router.zig` implements the RPC surface (well
+  beyond the original §4 minimum — see its dispatch) plus the two WS
+  downlinks (`/api/events.mux`, `/api/events.host`).
+- Attribution per spec §8 shipped: `webui/LICENSE`, root
+  `THIRD_PARTY_NOTICES.md`, and the README note.
 
 ## Commit policy
 

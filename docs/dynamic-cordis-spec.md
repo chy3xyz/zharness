@@ -1,8 +1,6 @@
-# Dynamic Cordis Runtime — P3 Spec (pre-implementation)
+# Dynamic Cordis Runtime — P3 Spec
 
-Status: spec only; no code. Decides the runtime for `tool-cordis` / `cordis-host-runner` / `cordis-client-runner` before those packages exist. `ABI v1` (`src/pluginabi/capi.zig`, `ffi.zig`, `loader.zig`, `wasm_loader.zig`, `docs/plugins.md`) stays narrow and is not broadened to imitate this.
-
-Source of truth for the reference design: `_ref/deepseek-harness/packages/extensions/{tool-cordis,cordis-host-runner,cordis-client-runner}` (READMEs + `src/*`). Verified in this checkout 2026-08-24.
+Status: IMPLEMENTED. `src/dynamic/{types,registry,sandbox,lifecycle,wire,preset_tools}.zig` realizes this spec; the server half is dispatched by `src/server/apiproxy/router.zig` (`dynamic.getClientCode`, `dynamic.invoke`, the cordis leg of `/api/respond`) and the model-facing `cordis_*` tools are wired into the agent loop by `src/main.zig` (registerExtensionTools + the `sharedDynamicLifecycle` wiring slot). Reference design source of truth: `_ref/deepseek-harness/packages/extensions/{tool-cordis,cordis-host-runner,cordis-client-runner}` (READMEs + `src/*`). Verified in this checkout 2026-08-24. `ABI v1` (`src/pluginabi/capi.zig`, `ffi.zig`, `loader.zig`, `wasm_loader.zig`, `docs/plugins.md`) stays narrow and is not broadened to imitate this.
 
 ---
 
