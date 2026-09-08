@@ -2,7 +2,7 @@
 //! `POST /api/<method>` (docs/dsh-reuse-spec.md §4; contract truth:
 //! `_ref/deepseek-harness/packages/host/apiproxy/src/api/*.schema.ts`).
 //!
-//! Wire contract (§4, byte-exact fixtures in src/_t_apiproxy.zig):
+//! Wire contract (§4, byte-exact fixtures in test/_t_apiproxy.zig):
 //!
 //!   request  {"type":"client-request","rpcId":"<uuid>","method":"<m>","payload":{…}}
 //!   response ALWAYS HTTP 200; business errors live in result.error

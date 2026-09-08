@@ -29,7 +29,7 @@
 //! pointed-to definitions. Specs returned by `resolve`/`CustomStore.list`
 //! may own heap memory (origin == .custom); release them via `freeSpec`.
 //!
-//! Tests live in this file; run everything via `zig test -lc src/_t_obs.zig`.
+//! Tests live in this file; run everything via `zig test -lc test/_t_obs.zig`.
 
 const std = @import("std");
 

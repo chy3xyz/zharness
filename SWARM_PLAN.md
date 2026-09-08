@@ -28,9 +28,9 @@ in one shared working tree.
    explicitly owns them. Never run `git commit`.
 6. **Decouple from cordis**: modules take plain params (allocators, io, fn
    pointers/sinks). The integrator wires cordis Context/EventBus later.
-7. **Self-test root**: create `src/_t_<area>.zig` at TOP-LEVEL src/ (so `..`
+7. **Self-test root**: create `test/_t_<area>.zig` at TOP-LEVEL src/ (so `..`
    imports stay inside the module path) importing your module files, then run:
-   `zig test -lc src/_t_<area>.zig`. All inline `test` blocks must pass. Leave
+   `zig test -lc test/_t_<area>.zig`. All inline `test` blocks must pass. Leave
    the `_t_` file in place — the integrator folds it into `tests.zig`.
 8. **Style**: `//!` doc-comment header explaining contract (see sandbox.zig),
    English comments, error names PascalCase after `error.`, atomic writes.
@@ -164,7 +164,7 @@ in one shared working tree.
 ## Integration protocol (integrator = ox-alpha, wave 3)
 
 After all agents report done:
-1. Fold every `src/_t_*.zig` into `tests.zig`, delete the `_t_` files.
+1. Fold every `test/_t_*.zig` into `tests.zig`, delete the `_t_` files.
 2. main.zig: `serve` → B.api; `--preset` flag → F.presets; `zharness plugin
    list/install` → G.loader; `--mcp <cmd>` → E.bridge; obs.emit hooked at
    agent-loop emit points (small agent.zig edit — W1 finished by then);

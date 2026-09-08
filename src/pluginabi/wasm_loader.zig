@@ -728,7 +728,7 @@ pub const WasmRegistry = struct {
 };
 
 // ─────────────────────────────────────────────────────────────────────────
-// Tests (pure helpers here; end-to-end fixtures live in src/_t_wasm.zig)
+// Tests (pure helpers here; end-to-end fixtures live in test/_t_wasm.zig)
 // ─────────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;

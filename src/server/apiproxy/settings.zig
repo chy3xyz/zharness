@@ -176,7 +176,7 @@ const schema_locale =
 ;
 
 /// The vendored GUI's current WelcomeNotice version (onboarding-copy.ts).
-/// Kept in sync when webui/dsh is re-vendored.
+/// Kept in sync when webui/ is re-vendored.
 pub const onboarding_notice_version = "2026-08-13.1";
 
 // ── effective-config projection ─────────────────────────────────────────────

@@ -21,7 +21,7 @@
  * in-browser FixtureApiClient — no backend needed. This server therefore
  * implements NO /api routes.
  *
- * Usage: node ../tools/serve-fixture.mjs [port]   (cwd must be webui/dsh)
+ * Usage: node ../tools/serve-fixture.mjs [port]   (cwd must be webui)
  */
 import { createServer } from 'node:http'
 import { readFile } from 'node:fs/promises'
@@ -29,13 +29,13 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { extname, join, normalize, resolve, sep } from 'node:path'
 
 const root = process.cwd()
-const distRoot = resolve(root, 'apps/web/dist')
+const distRoot = resolve(root, 'dist')
 const distIndex = join(distRoot, 'index.html')
 const manifestPath = resolve(root, 'build-artifacts/boot-manifest.json')
 const port = Number(process.argv[2] ?? 4173)
 
 if (!existsSync(distIndex) || !existsSync(manifestPath)) {
-  console.error('serve-fixture: need apps/web/dist/index.html and build-artifacts/boot-manifest.json (build first)')
+  console.error('serve-fixture: need dist/index.html and build-artifacts/boot-manifest.json (build first)')
   process.exit(1)
 }
 const { graph, injections } = JSON.parse(await readFile(manifestPath, 'utf8'))

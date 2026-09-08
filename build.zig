@@ -23,14 +23,14 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("cordis", cordis_mod);
 
     const exe = b.addExecutable(.{
-        .name = "zharness",
+        .name = "zh",
         .root_module = exe_mod,
     });
     b.installArtifact(exe);
 
     const run_exe = b.addRunArtifact(exe);
     run_exe.step.dependOn(b.getInstallStep());
-    const run_step = b.step("run", "Run zharness");
+    const run_step = b.step("run", "Run zh");
     run_step.dependOn(&run_exe.step);
 
     // ── unit tests ────────────────────────────────────────────────────────

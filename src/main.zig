@@ -83,11 +83,15 @@ var g_live_seq = std.atomic.Value(u64).init(1 << 20);
 var g_tool_call_seq = std.atomic.Value(u64).init(1);
 var g_current_call_id: [32]u8 = undefined;
 var g_current_call_id_len: usize = 0;
+var g_current_step: u64 = 0;
 
 /// Publish ONE strict-envelope SessionEvent for the parked run session.
 /// `surface_append` adds the fixture-parity `"surfaceOp":"append"` marker
 /// carried by whole-message events (user/message, assistant/message).
 fn muxPublishEvent(ev_type: []const u8, surface_append: bool, data_json: []const u8) void {
+    if (std.c.getenv("ZH_DEBUG_FRAME") != null) {
+        std.debug.print("[mux:{s}] {s}\n", .{ ev_type, data_json[0..@min(data_json.len, 200)] });
+    }
     const A = gpaAlloc();
     const tj = jsonEsc(A, ev_type) orelse return;
     defer A.free(tj);
@@ -137,7 +141,13 @@ fn onEvent(kind: agent.AgentLoop.EventKind, payload: []const u8) void {
     if (g_mux_run_session != null) {
         switch (kind) {
             .turn_start => {
-                
+                // Publish step/start event so the client knows a new turn/step has begun,
+                // which suppresses the "Interrupted" markers from previous steps.
+                const A = gpaAlloc();
+                const step_n = g_tool_call_seq.load(.monotonic);
+                const data = std.fmt.allocPrint(A, "{{\"step\":{d}}}", .{ step_n }) catch return;
+                defer A.free(data);
+                muxPublishEvent("step/start", false, data);
             },
             // NOTE: .thinking and .text streaming deltas are published by
             // onStreamDelta (the ChatClient's stream_sink), NOT here. The
@@ -154,16 +164,17 @@ fn onEvent(kind: agent.AgentLoop.EventKind, payload: []const u8) void {
                     "{}";
                 const name_j = jsonEsc(A, tool_name) orelse break :blk;
                 defer A.free(name_j);
-                // Arguments must be a JSON STRING (upstream fixture sends
-                // them as template-literal strings, not raw objects).
-                const args_j2 = jsonEsc(A, raw_args) orelse break :blk;
+                // Arguments are passed as a raw JSON string (extracted from the
+                // model payload). The client renders them as a readable code block.
+                const args_j2 = raw_args;
                 const n = g_tool_call_seq.fetchAdd(1, .monotonic);
+                g_current_step = n;
                 g_current_call_id_len = (std.fmt.bufPrint(&g_current_call_id, "call-{d}", .{n}) catch return).len;
                 const call_j = jsonEsc(A, g_current_call_id[0..g_current_call_id_len]) orelse break :blk;
                 defer A.free(call_j);
                 const data = std.fmt.allocPrint(A,
-                    "{{\"turn\":1,\"step\":0,\"callId\":{s},\"name\":{s},\"arguments\":{s}}}",
-                    .{ call_j, name_j, args_j2 },
+                    "{{\"turn\":1,\"step\":{d},\"callId\":{s},\"name\":{s},\"arguments\":{s}}}",
+                    .{ n, call_j, name_j, args_j2 },
                 ) catch break :blk;
                 defer A.free(data);
                 if (std.c.getenv("ZH_DEBUG_FRAME") != null) std.debug.print("[frame:tool_call] {s}\n", .{data});
@@ -175,8 +186,8 @@ fn onEvent(kind: agent.AgentLoop.EventKind, payload: []const u8) void {
                 const call_j = jsonEsc(A, g_current_call_id[0..g_current_call_id_len]) orelse return;
                 defer A.free(call_j);
                 const data = std.fmt.allocPrint(A,
-                    "{{\"turn\":1,\"step\":0,\"message\":{{\"id\":{s},\"role\":\"user\",\"content\":[{{\"type\":\"tool-result\",\"toolCallId\":{s},\"content\":[{{\"type\":\"text\",\"text\":{s}}}]}}],\"source\":{{\"kind\":\"tool\",\"callId\":{s}}}}}}}",
-                    .{ call_j, call_j, o, call_j },
+                    "{{\"turn\":1,\"step\":{d},\"message\":{{\"id\":{s},\"role\":\"user\",\"content\":[{{\"type\":\"tool-result\",\"toolCallId\":{s},\"content\":[{{\"type\":\"text\",\"text\":{s}}}]}}],\"source\":{{\"kind\":\"tool\",\"callId\":{s}}}}}}}",
+                    .{ g_current_step, call_j, call_j, o, call_j },
                 ) catch return;
                 defer A.free(data);
                 if (std.c.getenv("ZH_DEBUG_FRAME") != null) std.debug.print("[frame:tool_result] {s}\n", .{data});
@@ -184,7 +195,19 @@ fn onEvent(kind: agent.AgentLoop.EventKind, payload: []const u8) void {
             },
             .done => if (jsonEsc(gpaAlloc(), payload)) |t| {
                 defer gpaAlloc().free(t);
-                muxPublishEventEsc("assistant/message", "{{\"turn\":1,\"step\":0,\"message\":{{\"id\":\"a-live\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":{s}}}],\"source\":{{\"kind\":\"model\"}}}}}}", true, t);
+                // Publish step/end before the final assistant/message so the
+                // client knows this turn/step is complete.
+                const end_data = std.fmt.allocPrint(gpaAlloc(), "{{\"step\":{d}}}", .{ g_current_step }) catch return;
+                defer gpaAlloc().free(end_data);
+                muxPublishEvent("step/end", false, end_data);
+                // Assistant message uses the same step as the tool call/result
+                // so the client can merge streaming chunks with the final message.
+                const msg_data = std.fmt.allocPrint(gpaAlloc(),
+                    "{{\"turn\":1,\"step\":{d},\"message\":{{\"id\":\"a-live\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":{s}}}],\"source\":{{\"kind\":\"model\"}}}}}}",
+                    .{ g_current_step, t },
+                ) catch return;
+                defer gpaAlloc().free(msg_data);
+                muxPublishEvent("assistant/message", true, msg_data);
             },
             else => {},
         }
@@ -231,8 +254,8 @@ fn onStreamDelta(kind: model.StreamKind, delta: []const u8) void {
             .reasoning => "reasoning-delta",
         };
         const data = std.fmt.allocPrint(A,
-            "{{\"turn\":1,\"step\":0,\"chunk\":{{\"type\":\"{s}\",\"index\":0,\"text\":{s}}}}}",
-            .{ chunk_type, dj },
+            "{{\"turn\":1,\"step\":{d},\"chunk\":{{\"type\":\"{s}\",\"index\":0,\"text\":{s}}}}}",
+            .{ g_current_step, chunk_type, dj },
         ) catch return;
         defer A.free(data);
         muxPublishEvent("assistant/chunk", false, data);
@@ -1037,13 +1060,8 @@ fn cmdServe(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts, port_
     // known session (lastSeq 0 — no durable seq store in v1).
     events_ws.on_mux_open = &apxMuxOpen;
 
-    // Web root: prefer the vendored dsh dist; fall back to the vanilla UI.
-    const web_root: []const u8 = blk: {
-        if (std.Io.Dir.statFile(.cwd(), io, "webui/dsh/apps/web/dist/index.html", .{})) |_| {
-            break :blk "webui/dsh/apps/web/dist";
-        } else |_| {}
-        break :blk server_static.default_root;
-    };
+    // Web root: vendored DeepSeek Harness GUI (webui/dist).
+    const web_root: []const u8 = server_static.default_root;
 
     const bundle = try alloc.create(ServeBundle);
     defer alloc.destroy(bundle);
@@ -1687,16 +1705,16 @@ fn cmdPluginExec(alloc: std.mem.Allocator, name: []const u8, args_json: []const 
 
 fn printUsage() void {
     std.debug.print(
-        \\zharness - a native coding-agent harness
+        \\zh - a native coding-agent harness
         \\
         \\Usage:
-        \\  zharness run "prompt"          Run a single agent task
-        \\  zharness chat                  Start an interactive REPL
-        \\  zharness serve [--port N]      HTTP API (default port 3080)
-        \\  zharness workflow <file.json>  Run a step workflow through the agent
-        \\  zharness plugin list [--dir X] List native plugin tools
-        \\  zharness plugin exec <name> '<json>'  Invoke a plugin tool directly
-        \\  zharness --help                Show this help
+        \\  zh run "prompt"          Run a single agent task
+        \\  zh chat                  Start an interactive REPL
+        \\  zh serve [--port N]      HTTP API (default port 3080)
+        \\  zh workflow <file.json>  Run a step workflow through the agent
+        \\  zh plugin list [--dir X] List native plugin tools
+        \\  zh plugin exec <name> '<json>'  Invoke a plugin tool directly
+        \\  zh --help                Show this help
         \\
         \\Flags (run/chat):
         \\  --model X        Override the model

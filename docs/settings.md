@@ -7,7 +7,7 @@ the zharness-side contract: which namespaces exist, where each field lives in
 `~/.zharness/config.toml`, and what the guarantees and limits are.
 
 Wire truth: `_ref/deepseek-harness/packages/host/apiproxy/src/api/settings*.ts`
-(zod schemas) and `webui/dsh/packages/client/ui-settings/src/**` (the browser
+(zod schemas) and `webui/packages/client/ui-settings/src/**` (the browser
 mirror). Implementation: `src/server/apiproxy/settings.zig` (document model),
 `src/server/apiproxy/router.zig` (RPC surface), `src/config.zig`
 (flat-TOML reader/writer).

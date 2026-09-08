@@ -11,7 +11,7 @@ pass came up clean on first try.
 
 | File | Reason | Diff summary |
 |---|---|---|
-| `webui/dsh/packages/workflow/tool-workflow/package.json` | devDependency `@deepseek-ai/dsh-workflow-worker-thread` is not vendored (its own closure pulls subagent spawn drivers); `src/` never imports it — it is test-only. Left in place it would break `pnpm install` workspace resolution. | removed one `devDependencies` entry |
+| `webui/packages/workflow/tool-workflow/package.json` | devDependency `@deepseek-ai/dsh-workflow-worker-thread` is not vendored (its own closure pulls subagent spawn drivers); `src/` never imports it — it is test-only. Left in place it would break `pnpm install` workspace resolution. | removed one `devDependencies` entry |
 
 That is the only edit to any upstream file. The 14 UI plugin packages
 (`ui-goal`, `ui-skill`, `ui-model-selection`, `ui-agent-preset`,
@@ -32,7 +32,7 @@ That is the only edit to any upstream file. The 14 UI plugin packages
     the vite seed — e.g. `dsh-client-ui-primitives`, injected by ui-jobs /
     ui-subagent but never a plugin row, upstream included). Targets that ARE
     client packages but unlisted still abort the manifest build.
-- `webui/dsh/tsconfig.vendor.json`: added project references for the 14 UI
+- `webui/tsconfig.vendor.json`: added project references for the 14 UI
   plugins + `packages/workflow/{workflow,tool-workflow}`.
 
 ## New npm dependencies

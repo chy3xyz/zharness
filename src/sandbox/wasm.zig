@@ -334,7 +334,7 @@ pub const WasmVm = struct {
 };
 
 // ─────────────────────────────────────────────────────────────────────────
-// Tests (small fixtures; full ABI round-trips live in src/_t_wasm.zig)
+// Tests (small fixtures; full ABI round-trips live in test/_t_wasm.zig)
 // ─────────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;

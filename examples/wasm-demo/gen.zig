@@ -1,5 +1,5 @@
 // One-off fixture generator: emits a full WASM ABI v1 plugin module
-// (demo.wasm) using the hand-assembler from src/_t_wasm.zig.
+// (demo.wasm) using the hand-assembler from test/_t_wasm.zig.
 const std = @import("std");
 const fixture = @import("_t_wasm.zig");
 

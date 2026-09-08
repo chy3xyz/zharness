@@ -1,0 +1,1 @@
+{"version":3,"file":"rpc.d.ts","sourceRoot":"","sources":["../../../src/client/rpc.ts"],"names":[],"mappings":"AAAA,gEAAgE;AAOhE,OAAO,KAAK,EAAE,mBAAmB,EAAE,MAAM,WAAW,CAAA;AAOpD,iFAAiF;AACjF,MAAM,MAAM,QAAQ,GAAG,CAAC,KAAK,EAAE,GAAG,EAAE,IAAI,EAAE,WAAW,KAAK,OAAO,CAAC,QAAQ,CAAC,CAAA;AAE3E;;;;GAIG;AACH,wBAAgB,sBAAsB,CAAC,OAAO,CAAC,EAAE,QAAQ,GAAG,mBAAmB,CA+B9E"}

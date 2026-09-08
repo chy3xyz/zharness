@@ -1,4 +1,4 @@
-//! Static file serving for the zero-build web UI in `<repo>/web/`.
+//! Static file serving for the vendored DeepSeek Harness GUI.
 //!
 //! Contract:
 //! - HandlerFn-compatible with api.handle: identical 4-argument shape, so it
@@ -11,7 +11,7 @@
 //!   envelope the API produces.
 //! - Pure core: `claims(path)` and `resolvePath(root, url_path)` make ALL
 //!   routing/security decisions without touching disk or sockets; they are
-//!   unit-tested in `src/_t_static.zig`. `handle()` adds only open/read/send.
+//!   unit-tested in `test/_t_static.zig`. `handle()` adds only open/read/send.
 //! - Security posture: URL paths are percent-decoded BEFORE validation, so
 //!   `%2e%2e` cannot smuggle a traversal. Segments `.`, `..`, empty (`//`),
 //!   NUL, and backslash are rejected. Reads are capped at `max_file_bytes`
@@ -61,7 +61,7 @@
 //!
 //! Both options preserve every existing API behavior byte-for-byte: static
 //! intercepts only GET/HEAD for `/` and `/assets/*`. Run zharness from the
-//! repository root (or set `.root`) so `web/index.html` resolves.
+//! repository root (or set `.root`) so the GUI index.html resolves.
 
 const std = @import("std");
 const httpd = @import("httpd.zig");
@@ -85,12 +85,13 @@ const seek_end: c_int = 2; // SEEK_END
 pub const max_file_bytes: usize = 5 * 1024 * 1024;
 
 /// Default filesystem root for the URL space, resolved against the process
-/// CWD (the repository's `web/` directory when zharness runs from the repo).
-pub const default_root: []const u8 = "web";
+/// CWD. The vendored DeepSeek Harness GUI lives under webui/dist.
+pub const default_root: []const u8 = "webui/dist";
 
 /// Handler context. Heap-lifetime in main.zig; `handle` only reads it.
 pub const Ctx = struct {
     /// Directory the URL space is rooted at (CWD-relative ok).
+    /// Defaults to the vendored DeepSeek Harness GUI dist.
     root: []const u8 = default_root,
     /// Delegate for URLs outside the static space — normally
     /// `.{ .ctx = deps, .call = api.handle }`.
@@ -141,8 +142,8 @@ pub const Resolved = struct {
 /// traversals ("%2e%2e%2f") are caught. Caller frees `Resolved.path`.
 ///
 /// Examples:
-///   resolvePath(a, "web", "/")               -> "web/index.html", text/html
-///   resolvePath(a, "web", "/assets/app.js")  -> "web/assets/app.js", text/javascript
+///   resolvePath(a, "webui/dist", "/")               -> "webui/dist/index.html", text/html
+///   resolvePath(a, "webui/dist", "/assets/app.js")  -> "webui/dist/assets/app.js", text/javascript
 ///   resolvePath(a, "/srv/w", "/assets/../x") -> error.Forbidden
 ///   resolvePath(a, "web", "/run")            -> error.NotStaticSpace
 pub fn resolvePath(alloc: std.mem.Allocator, root: []const u8, url_path: []const u8) ResolveError!Resolved {
@@ -183,7 +184,7 @@ fn validateSegments(decoded: []const u8) ResolveError!void {
 }
 
 /// Extension -> Content-Type. Unknown or missing extensions serve as
-/// application/octet-stream; the namespace is rooted at web/, so this is a
+/// application/octet-stream; the namespace is rooted at webui/dist/, so this is a
 /// local development surface only.
 pub fn contentTypeFor(rel_path: []const u8) []const u8 {
     const base = if (std.mem.lastIndexOfScalar(u8, rel_path, '/')) |s|

@@ -840,7 +840,7 @@ pub const PluginRegistry = struct {
 };
 
 // ─────────────────────────────────────────────────────────────────────────
-// Tests (pure — no dlopen; the dylib round trip lives in src/_t_plug.zig)
+// Tests (pure — no dlopen; the dylib round trip lives in test/_t_plug.zig)
 // ─────────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;

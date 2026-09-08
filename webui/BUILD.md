@@ -1,27 +1,27 @@
 # webui — Vendored DSH Frontend (build contract)
 
-`webui/dsh/` is a pruned vendored copy of the DeepSeek Harness web frontend
+`webui/` is a pruned vendored copy of the DeepSeek Harness web frontend
 (upstream MIT, vendored at commit `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`
-— see `webui/dsh/VENDOR-NOTICE.md`). Scope and protocol rationale live in
+— see `webui/VENDOR-NOTICE.md`). Scope and protocol rationale live in
 `docs/dsh-reuse-spec.md`; this file is the operational build/serve contract.
 
 ## Layout
 
 ```
-webui/dsh/                     vendored pnpm workspace (pruned closure, 94 packages + vendor/)
-  apps/web/dist/               PRODUCTION DIST — final static assets (the integrator serves this)
+webui/                          vendored pnpm workspace (pruned closure, 94 packages + vendor/)
+  dist/                         PRODUCTION DIST — final static assets (the integrator serves this)
   build-artifacts/
-    boot-manifest.json         trimmed window.__DSH_BOOT__ graph: { graph, injections, roster }
-  packages/*/*/lib/            build intermediates (gitignored): lib/types (tsc), client.js (tsdown)
-  vendor/                      upstream's pinned Cordis framework sources
-  tsconfig.vendor.json         zharness-added tsc solution over the pruned closure
-  tsdown.vendor-libs.ts        zharness-added scoped vendor-library pass
-webui/tools/                   zharness-side helpers (not part of the app):
-  gen-typert.mjs               typert generation step (replaces upstream's host-face plugin)
-  gen-boot-manifest.mjs        composes the trimmed 15-row boot manifest
-  serve-fixture.mjs            static server implementing the hosting contract (dist + /plugins + boot injection)
-  boot-smoke.py                headless boot assertion (?fixture carrier)
-  roundtrip-smoke.py           headless prompt round-trip through the fixture carrier
+    boot-manifest.json          trimmed window.__DSH_BOOT__ graph: { graph, injections, roster }
+  packages/*/*/lib/             build intermediates (gitignored): lib/types (tsc), client.js (tsdown)
+  vendor/                       upstream's pinned Cordis framework sources
+  tsconfig.vendor.json          zharness-added tsc solution over the pruned closure
+  tsdown.vendor-libs.ts         zharness-added scoped vendor-library pass
+  tools/                        zharness-side helpers (not part of the app):
+    gen-typert.mjs              typert generation step (replaces upstream's host-face plugin)
+    gen-boot-manifest.mjs       composes the trimmed 15-row boot manifest
+    serve-fixture.mjs           static server implementing the hosting contract (dist + /plugins + boot injection)
+    boot-smoke.py               headless boot assertion (?fixture carrier)
+    roundtrip-smoke.py          headless prompt round-trip through the fixture carrier
 ```
 
 ## Rebuild from scratch (exact chain)
@@ -36,7 +36,7 @@ corepack enable
 corepack prepare pnpm@11.7.0 --activate
 
 # 2. install (from webui/dsh)
-cd webui/dsh
+cd webui
 pnpm install --no-frozen-lockfile     # lockfile was rewritten once at vendor time; see Deviations
 
 # 3. typecheck + emit lib/types for the whole pruned closure
@@ -62,7 +62,7 @@ pnpm exec tsdown --env.DSH_BUILD_FACE client
 # 6. bundle the vendored framework libraries (cordis et al.) for the vite seed chunk
 pnpm exec tsdown --config tsdown.vendor-libs.ts
 
-# 7. production dist → apps/web/dist/
+# 7. production dist → dist/ (apps/web/dist is a symlink → ../../dist)
 pnpm --filter @deepseek-ai/dsh-web-frontend run build
 
 # 8. regenerate the trimmed boot manifest (after any rebuild — revs are content hashes)
@@ -79,7 +79,7 @@ Steps 5–6–7 are incremental and fast (~2s combined when warm).
 ## Serve locally (fixture mode, no backend)
 
 ```sh
-cd webui/dsh
+cd webui
 node ../tools/serve-fixture.mjs 4173          # http://localhost:4173/?fixture
 python3 ../tools/boot-smoke.py 4173           # headless boot assertion
 python3 ../tools/roundtrip-smoke.py 4173      # headless prompt round-trip
@@ -136,24 +136,24 @@ are recorded in `webui/VENDOR-PATCHES.md`.
 
 ## Integrator notes (Zig side, NOT wired yet)
 
-- Serve `apps/web/dist/**` at `/`, `/plugins/<id>/client.js`(+`.map`) from
-  `webui/dsh/packages/*/*/lib/`, and inject the four `injections` rows from
+- Serve `dist/**` at `/`, `/plugins/<id>/client.js`(+`.map`) from
+  `webui/packages/*/*/lib/`, and inject the four `injections` rows from
   `build-artifacts/boot-manifest.json` into every served index.html.
 - Implement the §4 wire surface (13 unary methods + 2 WS downlinks).
-- Attribution per spec §8: ship `webui/dsh/LICENSE` next to deployed
+- Attribution per spec §8: ship `webui/LICENSE` next to deployed
   artifacts; add the root `THIRD_PARTY_NOTICES.md` entry ("deepseek-harness
   Web GUI — Copyright (c) 2026 DeepSeek — MIT") and README note.
 
 ## Commit policy
 
 - **Commit**: everything under `webui/` EXCEPT gitignored paths — i.e.
-  vendored sources (~9 MB) + `apps/web/dist/` (**11 MB ≤ 20 MB threshold ⇒
+  vendored sources (~9 MB) + `dist/` (**11 MB ≤ 20 MB threshold ⇒
   committed**) + `build-artifacts/`. Total ≈ 20.5 MB.
-- **Never commit**: `webui/dsh/node_modules/` (536 MB),
-  `webui/dsh/packages/*/*/lib/`, `webui/dsh/vendor/*/lib/`,
-  `*.tsbuildinfo` — all already covered by `webui/dsh/.gitignore`
+- **Never commit**: `webui/node_modules/` (536 MB),
+  `webui/packages/*/*/lib/`, `webui/vendor/*/lib/`,
+  `*.tsbuildinfo` — all already covered by `webui/.gitignore`
   (upstream's own ignore rules; the nested file applies repo-wide below
-  `webui/dsh/`). Note: upstream ignored `apps/web/dist/`; that line was
+  `webui/`). Note: upstream ignored `dist/`; that line was
   removed so dist can be committed.
 - After pulling changes to vendored sources, rerun the full chain above;
   `lib/` artifacts stay local-only.
@@ -174,7 +174,7 @@ are recorded in `webui/VENDOR-PATCHES.md`.
    rewritten `pnpm-lock.yaml` matches the pruned member set and is committed.
 4. **Additive files**: `tsconfig.vendor.json`, `tsdown.vendor-libs.ts`,
    `VENDOR-NOTICE.md`, `build-artifacts/` (zharness tooling outputs).
-5. **`.gitignore`: removed the `apps/web/dist/` line** so the production
+5. **`.gitignore`: removed the `dist/` line** so the production
    dist can be committed per the ≤20 MB rule.
 6. **Build orchestration replaced** by the 8-step chain above because
    upstream's aggregates (`tsconfig.client.json`, `scripts/build.ts`) span
@@ -183,7 +183,7 @@ are recorded in `webui/VENDOR-PATCHES.md`.
 ## Verification achieved (2026-08-23)
 
 - `tsc -b tsconfig.vendor.json`: clean across 94 packages + 7 vendor packages.
-- vite build: succeeds; `apps/web/dist/` = 114 files, 11 MB.
+- vite build: succeeds; `dist/` = 114 files, 11 MB.
 - Static contract: index + all 89 non-map dist assets + all 15 plugin bundles
   + source maps return 200 with correct MIME via `serve-fixture.mjs`.
 - Headless Chromium (playwright): full boot against `?fixture` — module

@@ -17,16 +17,16 @@
  * before generation (chicken-and-egg on ./remote subpaths); the follow-up
  * `tsc -b tsconfig.vendor.json` provides the equivalent whole-graph check.
  *
- * Usage: node ../tools/gen-typert.mjs   (cwd must be webui/dsh)
+ * Usage: node ../tools/gen-typert.mjs   (cwd must be webui)
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { WorkspaceAnalyzer } from '../dsh/packages/typert/generator/lib/types/analyzer.js'
-import { FaceModelEmitter } from '../dsh/packages/typert/generator/lib/types/emitter.js'
+import { WorkspaceAnalyzer } from '../packages/typert/generator/lib/types/analyzer.js'
+import { FaceModelEmitter } from '../packages/typert/generator/lib/types/emitter.js'
 
 const root = process.cwd()
 if (!existsSync(join(root, 'tsconfig.vendor.json')) || !existsSync(join(root, 'packages/typert/generator/package.json'))) {
-  console.error('gen-typert: run with cwd = webui/dsh')
+  console.error('gen-typert: run with cwd = webui')
   process.exit(1)
 }
 

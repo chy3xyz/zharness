@@ -50,8 +50,7 @@ Why not B / C:
   upstream forever.
 - **C adds nothing A lacks.** The genuinely useful "hybrid" tactics are
   already available *inside* A at zero extra cost:
-  - keep the existing vanilla `web/index.html` UI as a fallback page until
-    the React shell boots (zharness already serves it);
+  - the vanilla `web/` fallback has been removed; only the vendored React GUI is served;
   - frontend development against `?fixture` mode — the connection plugin
     swaps in a fully in-browser mock carrier when the page URL carries
     `?fixture` (`packages/client/connection/src/client/index.ts`,

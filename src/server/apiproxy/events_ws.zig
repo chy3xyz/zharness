@@ -440,7 +440,7 @@ test "mapObsEnvelope maps the documented lifecycle table" {
 
 test "frame hub fans out to subscribers and drops dead ones" {
     // Stand-in conns are impossible without sockets; the socket-level test
-    // lives in src/_t_apiproxy.zig over real loopback. Here: subscribe/
+    // lives in test/_t_apiproxy.zig over real loopback. Here: subscribe/
     // unsubscribe bookkeeping with a null-fd conn that never gets written to.
     // (The shared-hubs singleton lifecycle has no standalone unit test: its
     // teardown races detached pump threads, so integration tests own it and

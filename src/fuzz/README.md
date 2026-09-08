@@ -4,13 +4,13 @@ Corpus-driven robustness suites over EVERY zharness parser surface.
 Deterministic and hermetic: fixed PRNG seeds, compile-time-embedded corpora,
 short bounded timeouts — no fuzzer toolchain required, everything runs inside
 plain `zig build test` (via tests.zig folding) or the standalone root
-`src/_t_fuzz.zig`.
+`test/_t_fuzz.zig`.
 
 ## Run
 
 ```sh
 # Standalone root (all 11 suites; same test blocks as zig build test):
-zig test -lc --dep cordis -Mroot=src/_t_fuzz.zig -Mcordis=../zcordis/src/cordis.zig
+zig test -lc --dep cordis -Mroot=test/_t_fuzz.zig -Mcordis=../zcordis/src/cordis.zig
 
 # Through the official build graph (after the integrator folds _t_fuzz.zig
 # imports into src/tests.zig):
@@ -18,7 +18,7 @@ zig build test
 ```
 
 The `-Mcordis` alias is required because `session/session.zig` imports
-zcordis — identical shape to `src/_t_w1.zig`. `-lc` is needed for the libc
+zcordis — identical shape to `test/_t_w1.zig`. `-lc` is needed for the libc
 popen/time helpers used by modules under test.
 
 ## Method

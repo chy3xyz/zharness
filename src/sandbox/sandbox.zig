@@ -25,7 +25,7 @@
 //! `../clib.zig` relative import, this file cannot be compiled as its own
 //! test root (`zig test -lc src/sandbox/sandbox.zig` fails: import outside
 //! module path); run its tests from a src/-level root such as
-//! `src/_t_w1.zig` or `src/tests.zig` instead.
+//! `test/_t_w1.zig` or `src/tests.zig` instead.
 
 const std = @import("std");
 const clib = @import("../clib.zig");

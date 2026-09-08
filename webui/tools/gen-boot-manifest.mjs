@@ -14,19 +14,19 @@
  * that are NOT on the roster (currently ui-input-trigger) are simply not
  * listed — the supported degradation mechanism per packages/client/web/src/boot.ts.
  *
- * Output: webui/dsh/build-artifacts/boot-manifest.json
+ * Output: webui/build-artifacts/boot-manifest.json
  *   { graph: WebBootGraph, injections: IndexInjection[], roster: string[] }
  *
- * Usage: node ../tools/gen-boot-manifest.mjs   (cwd must be webui/dsh)
+ * Usage: node ../tools/gen-boot-manifest.mjs   (cwd must be webui)
  */
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { bootInjections, orderByModuleGraph } from '../dsh/packages/client/modules/lib/types/index.js'
+import { bootInjections, orderByModuleGraph } from '../packages/client/modules/lib/types/index.js'
 
 const root = process.cwd()
-if (!existsSync(join(root, 'apps/web/dist/index.html'))) {
-  console.error('gen-boot-manifest: apps/web/dist missing — run the vite build first')
+if (!existsSync(join(root, 'dist/index.html'))) {
+  console.error('gen-boot-manifest: dist missing — run the vite build first')
   process.exit(1)
 }
 

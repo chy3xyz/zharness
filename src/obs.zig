@@ -36,7 +36,7 @@
 //!
 //! Deliberately self-contained (JSON helpers adapted from
 //! src/session/checkpoint.zig): testable in isolation via
-//! `zig test -lc src/_t_obs.zig`.
+//! `zig test -lc test/_t_obs.zig`.
 
 const std = @import("std");
 
