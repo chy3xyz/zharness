@@ -2083,6 +2083,8 @@ pub fn dispatch(
     env: *const Envelope,
 ) anyerror!UnaryResponse {
     const m_raw = env.method;
+    if (std.c.getenv("ZH_DEBUG_RPC") != null)
+        std.debug.print("[rpc] {s}\n", .{m_raw});
     const p = env.payload_raw;
     // Wire-form normalization: the v0.1.6 typert gateway composes endpoints as
     // `namespace/method` while the v0.1.1 surface used `namespace.method`.
@@ -2220,6 +2222,9 @@ pub fn dispatch(
     // manifest sync is accepted and mirrored as a no-op.
     if (std.mem.eql(u8, m, "dynamicCordisRunner.inventory")) return run(alloc, env, hDynamicInventory(alloc, env.rpc_id));
     if (std.mem.eql(u8, m, "dynamicCordisRunner.syncInspectManifest")) return run(alloc, env, okValue(alloc, env.rpc_id, "null"));
+    // Gateway-internal event-result endpoint: waterfalls carry no pending
+    // queries in zharness yet, so any result is accepted as a no-op.
+    if (std.mem.eql(u8, m, "$events.result")) return run(alloc, env, okValue(alloc, env.rpc_id, "null"));
 
     if (std.c.getenv("ZH_DEBUG_RPC") != null)
         std.debug.print("[rpc] unknown method: {s}\n", .{m});

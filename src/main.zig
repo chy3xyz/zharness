@@ -43,6 +43,8 @@ const server_events = @import("server/events.zig");
 const server_static = @import("server/static.zig");
 const apiproxy = @import("server/apiproxy/router.zig");
 const apix_sessions = @import("server/apiproxy/sessions.zig");
+const remote_mux = @import("server/apiproxy/remote_mux.zig");
+const apix_jsonx = @import("server/apiproxy/jsonx.zig");
 const apix_inventory = @import("server/apiproxy/inventory.zig");
 const events_ws = @import("server/apiproxy/events_ws.zig");
 const questions = @import("server/apiproxy/questions.zig");
@@ -103,7 +105,50 @@ fn muxPublishEvent(ev_type: []const u8, surface_append: bool, data_json: []const
     else
         std.fmt.allocPrint(A, "{{\"type\":{s},\"seq\":{d},\"time\":{d},\"data\":{s}}}", .{ tj, seq, ms, data_json }) catch return;
     defer A.free(line);
+    followPublishLine(A, ev_type, line);
     muxPublish(line);
+}
+
+/// Mirror one live frame onto the remote.mux session.follow streams (the
+/// v0.1.6 GUI's journal transport). `line` is already the SessionWireEvent
+/// wire shape. Transformations for vocabulary drift the legacy publishers
+/// carry:
+///   - assistant/chunk -> assistant/live-chunk, data gains "attemptId"
+///   - step/start|end gain "turn":1 when the publisher omitted it
+/// Only the journal vocabulary routes; other frame types stay legacy-only.
+fn followPublishLine(alloc: std.mem.Allocator, ev_type: []const u8, line: []const u8) void {
+    const sid = g_mux_run_session orelse return;
+    const known = [_][]const u8{
+        "turn/start",   "turn/end",         "step/start",      "step/end",
+        "user/message", "assistant/message", "assistant/chunk", "tool/call",
+        "tool/result",
+    };
+    var routed = false;
+    for (known) |k| {
+        if (std.mem.eql(u8, ev_type, k)) {
+            routed = true;
+            break;
+        }
+    }
+    if (!routed) return;
+
+    var out: []const u8 = line;
+    if (std.mem.eql(u8, ev_type, "assistant/chunk")) {
+        const t = std.mem.indexOf(u8, out, "\"assistant/chunk\"") orelse return;
+        const with_type = std.fmt.allocPrint(alloc, "{s}\"assistant/live-chunk\"{s}", .{ out[0..t], out[t + "\"assistant/chunk\"".len ..] }) catch return;
+        defer alloc.free(with_type);
+        const marker = "\"data\":{";
+        const didx = std.mem.indexOf(u8, with_type, marker) orelse return;
+        out = std.fmt.allocPrint(alloc, "{s}\"attemptId\":\"attempt-live\",{s}", .{ with_type[0 .. didx + marker.len], with_type[didx + marker.len ..] }) catch return;
+    } else if (std.mem.eql(u8, ev_type, "step/start") or std.mem.eql(u8, ev_type, "step/end")) {
+        const marker = "\"data\":{";
+        const didx = std.mem.indexOf(u8, out, marker) orelse return;
+        const data = out[didx + "\"data\":".len ..];
+        if (apix_jsonx.getRaw(data, "turn") != null) return; // publisher already carries turn
+        out = std.fmt.allocPrint(alloc, "{s}\"turn\":1,{s}", .{ out[0 .. didx + marker.len], out[didx + marker.len ..] }) catch return;
+    }
+    remote_mux.publishLine(sid, out);
+    if (out.ptr != line.ptr) alloc.free(out);
 }
 
 /// Publish a SessionEvent whose data embeds exactly one JSON-escaped string.

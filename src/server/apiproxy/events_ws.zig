@@ -50,6 +50,9 @@
 const std = @import("std");
 const httpd = @import("../httpd.zig");
 const jsonx = @import("jsonx.zig");
+const remote_mux = @import("remote_mux.zig");
+
+extern "c" fn clock_gettime(clk_id: c_int, tp: *std.c.timespec) c_int;
 
 // ── lock (same design as server/events.zig's private copy) ─────────────────
 
@@ -290,14 +293,34 @@ pub fn serveHostStream(alloc: std.mem.Allocator, conn: *httpd.WsConn) anyerror!v
 const WhichHub = enum { mux, host };
 
 /// Bidirectional pump for GET /api/remote.mux — the Gateway multiplexed
-/// Remote-stream socket (upstream stream-protocol.ts). v1 accepts the socket
-/// and answers every logical `open` with a structured `unavailable` stream
-/// error so the client's degradation rules apply cleanly; `cancel` is
-/// ignored. The session.follow/session.control stream providers land with the
-/// journal integration.
+/// Remote-stream socket (upstream stream-protocol.ts). Served logical
+/// streams:
+///
+///   open {endpoint: "session.follow", payload:{address:{sessionId}}}  ->
+///     register a follow stream, emit the opening snapshot, then live
+///     journal events from main.zig's publishers (remote_mux.publishEvent).
+///   open {endpoint: "session.control"}                                ->
+///     register a control stream and emit the (empty) baseline.
+///   any other endpoint                                                ->
+///     structured `unavailable` stream error so the client's degradation
+///     rules apply cleanly.
+///
+/// `cancel` closes nothing (streams end server-side); unknown kinds are
+/// ignored. Runs on the connection thread until the peer closes.
 pub fn serveRemoteMux(alloc: std.mem.Allocator, conn: *httpd.WsConn) anyerror!void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
+
+    // Stream ids opened on THIS connection, unregistered at pump exit so a
+    // publisher can never reach a dead conn.
+    var owned: std.ArrayList(u8) = .empty;
+    defer owned.deinit(alloc);
+    defer {
+        var it = std.mem.splitScalar(u8, owned.items, 0);
+        while (it.next()) |id| {
+            if (id.len != 0) remote_mux.unregister(id);
+        }
+    }
 
     while (true) {
         const opcode = conn.readMessage(&buf) catch |e| switch (e) {
@@ -306,30 +329,115 @@ pub fn serveRemoteMux(alloc: std.mem.Allocator, conn: *httpd.WsConn) anyerror!vo
         };
         switch (opcode) {
             .text, .binary => {
-                const stream_id = jsonx.getStringAlloc(alloc, buf.items, "streamId") catch null;
-                defer if (stream_id) |s| alloc.free(s);
-                const kind = jsonx.getRaw(buf.items, "type");
-                const is_open = kind != null and jsonx.isString(kind.?) and
-                    std.mem.eql(u8, jsonx.decodeString(alloc, kind.?) catch "", "open");
-                if (is_open) {
-                    if (stream_id) |sid| {
-                        var id_json: std.ArrayList(u8) = .empty;
-                        defer id_json.deinit(alloc);
-                        jsonx.appendJsonString(alloc, &id_json, sid) catch continue;
-                        const frame = std.fmt.allocPrint(
-                            alloc,
-                            "{{\"type\":\"error\",\"streamId\":{s},\"error\":{{\"code\":\"unavailable\",\"message\":\"zharness: remote stream endpoints are not implemented yet\",\"details\":{{}}}}}}",
-                            .{id_json.items},
-                        ) catch continue;
-                        defer alloc.free(frame);
-                        conn.writeText(frame) catch return;
-                    }
+                const kind = (jsonx.getStringAlloc(alloc, buf.items, "type") catch null) orelse continue;
+                defer alloc.free(kind);
+                if (!std.mem.eql(u8, kind, "open")) continue; // cancel: streams end server-side
+
+                const stream_id = (jsonx.getStringAlloc(alloc, buf.items, "streamId") catch null) orelse continue;
+                defer alloc.free(stream_id);
+                const endpoint_const = (jsonx.getStringAlloc(alloc, buf.items, "endpoint") catch null) orelse continue;
+                defer alloc.free(endpoint_const);
+                // The v0.1.6 gateway composes stream endpoints slash-form
+                // (namespace/method); match on the dot form.
+                const endpoint: []u8 = @constCast(endpoint_const);
+                for (endpoint) |*ch| {
+                    if (ch.* == '/') ch.* = '.';
                 }
-                // 'cancel' and unknown kinds: no response required.
+
+                if (std.mem.eql(u8, endpoint, "session.follow")) {
+                    const session_id = (try followSessionId(alloc, buf.items)) orelse {
+                        if (std.c.getenv("ZH_DEBUG_RPC") != null)
+                            std.debug.print("[follow] no sessionId in: {s}\n", .{buf.items[0..@min(buf.items.len, 400)]});
+                        sendStreamError(alloc, conn, stream_id, "bad-request", "session.follow requires payload.address.sessionId");
+                        continue;
+                    };
+                    defer alloc.free(session_id);
+                    const s = remote_mux.register(stream_id, session_id, .follow, conn) catch {
+                        sendStreamError(alloc, conn, stream_id, "internal", "stream registration failed");
+                        continue;
+                    };
+                    owned.appendSlice(alloc, stream_id) catch continue;
+                    owned.append(alloc, 0) catch continue;
+                    remote_mux.sendSnapshot(alloc, s, session_id);
+                } else if (std.mem.eql(u8, endpoint, "$events")) {
+                    // Gateway-internal forwarded-event stream: the Connection
+                    // generation completes when the ready frame arrives.
+                    // zharness forwards no cordis events yet, so after the
+                    // handshake the stream just stays open.
+                    var cid: [32]u8 = undefined;
+                    var ts: std.c.timespec = undefined;
+                    _ = clock_gettime(0, &ts);
+                    var seed: u64 = @intCast(@as(u64, @bitCast(ts.nsec)) & 0x7fffffffffffffff);
+                    for (&cid) |*b| {
+                        seed = seed *% 6364136223846793005 +% 1442695040888963407;
+                        const nibble: u8 = @intCast((seed >> 60) & 0xF);
+                        b.* = "0123456789abcdef"[nibble];
+                    }
+                    const home = std.c.getenv("HOME") orelse "/root";
+                    var home_json: std.ArrayList(u8) = .empty;
+                    defer home_json.deinit(alloc);
+                    jsonx.appendJsonString(alloc, &home_json, std.mem.span(home)) catch continue;
+                    var sid_json: std.ArrayList(u8) = .empty;
+                    defer sid_json.deinit(alloc);
+                    jsonx.appendJsonString(alloc, &sid_json, stream_id) catch continue;
+                    const frame = std.fmt.allocPrint(alloc, "{{\"type\":\"item\",\"streamId\":{s},\"value\":{{\"type\":\"ready\",\"clientId\":\"zh-{s}\",\"host\":{{\"home\":{s}}}}}}}", .{ sid_json.items, cid, home_json.items }) catch continue;
+                    defer alloc.free(frame);
+                    conn.writeText(frame) catch continue;
+                } else if (std.mem.eql(u8, endpoint, "session.control")) {
+                    const s = remote_mux.register(stream_id, "", .control, conn) catch {
+                        sendStreamError(alloc, conn, stream_id, "internal", "stream registration failed");
+                        continue;
+                    };
+                    owned.appendSlice(alloc, stream_id) catch continue;
+                    owned.append(alloc, 0) catch continue;
+                    remote_mux.publishControl(alloc, "{\"queues\":{},\"jobs\":{},\"projections\":{}}");
+                    _ = s;
+                } else if (std.mem.eql(u8, endpoint, "workspace.follow")) {
+                    const s = remote_mux.register(stream_id, "", .workspace, conn) catch {
+                        sendStreamError(alloc, conn, stream_id, "internal", "stream registration failed");
+                        continue;
+                    };
+                    owned.appendSlice(alloc, stream_id) catch continue;
+                    owned.append(alloc, 0) catch continue;
+                    remote_mux.sendWorkspaceBaseline(alloc, s);
+                } else {
+                    sendStreamError(alloc, conn, stream_id, "unavailable", "zharness: remote stream endpoint is not implemented yet");
+                }
             },
             else => {},
         }
     }
+}
+
+/// Extract payload.address.sessionId from one raw open frame. Null when the
+/// address is absent (caller answers bad-request); error only on OOM.
+fn followSessionId(alloc: std.mem.Allocator, frame_json: []const u8) !?[]const u8 {
+    // Wire form (v0.1.6 gateway): payload = {args:{request:{address:{...}}}}.
+    // Fall back through the progressively flatter shapes for robustness.
+    var payload = jsonx.getRaw(frame_json, "payload") orelse return null;
+    if (jsonx.getRaw(payload, "args")) |args| payload = args;
+    if (jsonx.getRaw(payload, "request")) |req| payload = req;
+    if (jsonx.getRaw(payload, "address")) |address| payload = address;
+    return try jsonx.getStringAlloc(alloc, payload, "sessionId");
+}
+
+fn sendStreamError(alloc: std.mem.Allocator, conn: *httpd.WsConn, stream_id: []const u8, code: []const u8, message: []const u8) void {
+    var sid: std.ArrayList(u8) = .empty;
+    defer sid.deinit(alloc);
+    jsonx.appendJsonString(alloc, &sid, stream_id) catch return;
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(alloc);
+    jsonx.appendJsonString(alloc, &msg, message) catch return;
+    var frame: std.ArrayList(u8) = .empty;
+    defer frame.deinit(alloc);
+    frame.appendSlice(alloc, "{\"type\":\"error\",\"streamId\":") catch return;
+    frame.appendSlice(alloc, sid.items) catch return;
+    frame.appendSlice(alloc, ",\"error\":{\"code\":") catch return;
+    jsonx.appendJsonString(alloc, &frame, code) catch return;
+    frame.appendSlice(alloc, ",\"message\":") catch return;
+    frame.appendSlice(alloc, msg.items) catch return;
+    frame.appendSlice(alloc, ",\"details\":{}}}") catch return;
+    conn.writeText(frame.items) catch {};
 }
 
 fn pumpStream(which: WhichHub, hub: *FrameHub, alloc: std.mem.Allocator, conn: *httpd.WsConn, sub: *Sub) anyerror!void {
