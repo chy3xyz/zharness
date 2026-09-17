@@ -99,7 +99,12 @@ pub fn listValueFromDisk(
 
 pub fn handle(deps: *const router.ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8) !router.UnaryResponse {
     // sessionId required by schema; unused beyond validation (single-cwd host).
-    const raw = jsonx.getRaw(payload, "sessionId") orelse return error.PayloadInvalid;
+    // v0.1.6 client nests it as {request:{sessionId}} inside the args-unwrapped
+    // payload; accept both shapes.
+    var raw = jsonx.getRaw(payload, "sessionId") orelse blk: {
+        const request = jsonx.getRaw(payload, "request") orelse return error.PayloadInvalid;
+        break :blk jsonx.getRaw(request, "sessionId") orelse return error.PayloadInvalid;
+    };
     if (!jsonx.isString(raw)) return error.PayloadInvalid;
     _ = jsonx.decodeString(alloc, raw[1 .. raw.len - 1]) catch return error.OutOfMemory;
 
