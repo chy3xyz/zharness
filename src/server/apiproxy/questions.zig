@@ -235,6 +235,41 @@ pub const Store = struct {
     /// error.code 'cancelled' (any other code → bad-response); ok=true
     /// validates the value payload against the exact stored questions before
     /// settling answered. Never frees memory directly — the waiter claims.
+    /// Resolve one pending question from the v0.1.6 `$events/result` route:
+    /// outcome.kind 'result' carries the bare {answers:[…]} object (the GUI's
+    /// AskUserQuestionAnswer), which is wrapped into the canonical respond
+    /// value shape {"sessionId":…,"answer":…} before validation; 'rejected'
+    /// and 'next' both cancel the request.
+    pub fn respondEvent(self: *Store, event_id: []const u8, outcome_kind: []const u8, value_json: []const u8) Receipt {
+        // Look up the pending entry first to correlate its session (the
+        // canonical respond value carries "sessionId").
+        const sid: []u8 = blk: {
+            self.lock.lock();
+            defer self.lock.unlock();
+            const p = self.findLocked(event_id) orelse return .not_pending;
+            break :blk self.alloc.dupe(u8, p.session_id) catch return .bad_response;
+        };
+        defer self.alloc.free(sid);
+
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(self.alloc);
+        const ok_literal = if (std.mem.eql(u8, outcome_kind, "result")) "true" else "false";
+
+        body.appendSlice(self.alloc, "{\"type\":\"client-response\",\"rpcId\":") catch return .bad_response;
+        jsonx.appendJsonString(self.alloc, &body, event_id) catch return .bad_response;
+        body.appendSlice(self.alloc, ",\"result\":{\"ok\":") catch return .bad_response;
+        body.appendSlice(self.alloc, ok_literal) catch return .bad_response;
+        if (std.mem.eql(u8, outcome_kind, "result")) {
+            body.appendSlice(self.alloc, ",\"value\":{\"sessionId\":") catch return .bad_response;
+            jsonx.appendJsonString(self.alloc, &body, sid) catch return .bad_response;
+            body.appendSlice(self.alloc, ",\"answer\":") catch return .bad_response;
+            body.appendSlice(self.alloc, value_json) catch return .bad_response;
+            body.appendSlice(self.alloc, "}") catch return .bad_response;
+        }
+        body.appendSlice(self.alloc, "}}") catch return .bad_response;
+        return self.respond(body.items);
+    }
+
     pub fn respond(self: *Store, body: []const u8) Receipt {
         // Envelope check: only client-response full forms carry answers.
         const t = jsonx.getRaw(body, "type") orelse return .bad_response;

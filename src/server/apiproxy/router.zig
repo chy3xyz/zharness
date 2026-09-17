@@ -46,6 +46,7 @@
 const std = @import("std");
 const httpd = @import("../httpd.zig");
 const jsonx = @import("jsonx.zig");
+const questions = @import("questions.zig");
 const subagents_rpc = @import("subagents_rpc.zig");
 const jobs_rpc = @import("jobs_rpc.zig");
 const trajectory = @import("trajectory.zig");
@@ -2085,7 +2086,14 @@ pub fn dispatch(
     const m_raw = env.method;
     if (std.c.getenv("ZH_DEBUG_RPC") != null)
         std.debug.print("[rpc] {s}\n", .{m_raw});
-    const p = env.payload_raw;
+    // Payload unwrap: the v0.1.6 typert gateway transports every unary
+    // request as {args: <request>} while handlers read the request's own
+    // top-level fields. Unwrap once here; bare (legacy) payloads without an
+    // "args" object member pass through unchanged.
+    var p = env.payload_raw;
+    if (jsonx.getRaw(p, "args")) |args| {
+        if (jsonx.objectBody(args) != null) p = args;
+    }
     // Wire-form normalization: the v0.1.6 typert gateway composes endpoints as
     // `namespace/method` while the v0.1.1 surface used `namespace.method`.
     // Match on the dot form so both eras hit the same handlers.
@@ -2179,6 +2187,21 @@ pub fn dispatch(
     // src/presets.zig)
     if (std.mem.eql(u8, m, "agentPreset.list")) return run(alloc, env, presets_rpc.handleList(deps, alloc, env.rpc_id));
     if (std.mem.eql(u8, m, "agentPreset.select")) return run(alloc, env, presets_rpc.handleSelect(deps, alloc, env.rpc_id, p));
+    // v0.1.6 client namespaces (plural) — same handlers, alias dispatch.
+    if (std.mem.eql(u8, m, "agentPresets.list")) return run(alloc, env, presets_rpc.handleList(deps, alloc, env.rpc_id));
+    if (std.mem.eql(u8, m, "agentPresets.select")) return run(alloc, env, presets_rpc.handleSelect(deps, alloc, env.rpc_id, p));
+    if (std.mem.eql(u8, m, "subagents.list")) {
+        const value = try subagents_rpc.handleList(alloc, p);
+        return okValue(alloc, env.rpc_id, value);
+    }
+    if (std.mem.eql(u8, m, "subagents.history")) {
+        const value = try subagents_rpc.handleHistory(alloc, p);
+        return okValue(alloc, env.rpc_id, value);
+    }
+    if (std.mem.eql(u8, m, "skills.list")) return run(alloc, env, skills_rpc.handle(deps, alloc, env.rpc_id, p));
+    // Composer slash-command catalog: zharness's chat command registry is
+    // interactive-only, so the web catalog is empty for now.
+    if (std.mem.eql(u8, m, "commands.list")) return run(alloc, env, okValue(alloc, env.rpc_id, "[]"));
 
     // host domain
     if (std.mem.eql(u8, m, "host.describe")) return run(alloc, env, hHostDescribe(deps, alloc, env.rpc_id, p));
@@ -2222,9 +2245,22 @@ pub fn dispatch(
     // manifest sync is accepted and mirrored as a no-op.
     if (std.mem.eql(u8, m, "dynamicCordisRunner.inventory")) return run(alloc, env, hDynamicInventory(alloc, env.rpc_id));
     if (std.mem.eql(u8, m, "dynamicCordisRunner.syncInspectManifest")) return run(alloc, env, okValue(alloc, env.rpc_id, "null"));
-    // Gateway-internal event-result endpoint: waterfalls carry no pending
-    // queries in zharness yet, so any result is accepted as a no-op.
-    if (std.mem.eql(u8, m, "$events.result")) return run(alloc, env, okValue(alloc, env.rpc_id, "null"));
+    // Gateway-internal event-result endpoint: user-questions waterfall
+    // answers settle their pending question here (first answer wins).
+    if (std.mem.eql(u8, m, "$events.result")) {
+        const store = questions.sharedStore() catch null;
+        const store_ptr = store orelse return run(alloc, env, okValue(alloc, env.rpc_id, "null"));
+        const event_id = (jsonx.getStringAlloc(alloc, p, "eventId") catch null) orelse
+            return badRequest(alloc, env.rpc_id, "$events.result requires eventId");
+        const outcome = jsonx.getRaw(p, "outcome") orelse
+            return badRequest(alloc, env.rpc_id, "$events.result requires outcome");
+        const kind = (jsonx.getStringAlloc(alloc, outcome, "kind") catch null) orelse
+            return badRequest(alloc, env.rpc_id, "$events.result requires outcome.kind");
+        const value = jsonx.getRaw(outcome, "value") orelse "null";
+        const receipt = store_ptr.respondEvent(event_id, kind, value);
+        if (receipt.accepted) return run(alloc, env, okValue(alloc, env.rpc_id, "null"));
+        return badRequest(alloc, env.rpc_id, receipt.reason);
+    }
 
     if (std.c.getenv("ZH_DEBUG_RPC") != null)
         std.debug.print("[rpc] unknown method: {s}\n", .{m});
@@ -2354,7 +2390,7 @@ pub fn handleApiRequest(
             const leg = try dyn_wire.handleRespond(lc, alloc, req.body);
             if (leg.mine) return res.send(.ok, .json, leg.body);
         } else |_| {} // no dynamic runtime on this host → questions leg only
-        const questions = @import("questions.zig");
+
         const store = try questions.sharedStore();
         const receipt = try questions.handleRespond(store, alloc, req.body);
         return res.send(.ok, .json, receipt);
@@ -2373,6 +2409,8 @@ pub fn handleApiRequest(
         return res.send(.unsupported_media_type, .text, "content type must be application/json");
     }
 
+    if (std.c.getenv("ZH_DEBUG_RPC") != null)
+        std.debug.print("[env] {s} body[{d}]: {s}\n", .{ req.path, req.body.len, req.body[0..@min(req.body.len, 260)] });
     const env = parseEnvelope(alloc, req.body) catch |e| switch (e) {
         error.NotJson => return res.send(.bad_request, .text, "body is not JSON"),
         error.OutOfMemory => return error.OutOfMemory,

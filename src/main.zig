@@ -366,6 +366,33 @@ var g_cordis_deps: preset_tools.CordisDeps = undefined;
 
 fn publishAskFrame(frame_json: []const u8) void {
     if (events_ws.sharedHubs()) |hubs| hubs.mux.publishFrame(frame_json) else |_| {}
+    forwardQuestionWaterfall(frame_json);
+}
+
+/// Mirror one question/requested frame onto the remote.mux $events streams as
+/// the gateway-internal waterfall the v0.1.6 user-questions UI consumes:
+/// {type:'waterfall', event:'user-questions/request', eventId, agentId,
+///  request:{questions:[...]}}. The GUI answers through $events/result.
+fn forwardQuestionWaterfall(frame_json: []const u8) void {
+    const sid = apix_jsonx.getStringAlloc(gpaAlloc(), frame_json, "sessionId") catch null;
+    defer if (sid) |s| gpaAlloc().free(s);
+    const rpc = apix_jsonx.getStringAlloc(gpaAlloc(), frame_json, "questionRpcId") catch null;
+    defer if (rpc) |r| gpaAlloc().free(r);
+    const questions_raw = apix_jsonx.getRaw(frame_json, "questions") orelse return;
+    var value: std.ArrayList(u8) = .empty;
+    defer value.deinit(gpaAlloc());
+    const sid_j = jsonEsc(gpaAlloc(), sid orelse "") orelse return;
+    defer gpaAlloc().free(sid_j);
+    const rpc_j = jsonEsc(gpaAlloc(), rpc orelse "") orelse return;
+    defer gpaAlloc().free(rpc_j);
+    value.appendSlice(gpaAlloc(), "{\"type\":\"waterfall\",\"event\":\"user-questions/request\",\"eventId\":") catch return;
+    value.appendSlice(gpaAlloc(), rpc_j) catch return;
+    value.appendSlice(gpaAlloc(), ",\"agentId\":") catch return;
+    value.appendSlice(gpaAlloc(), sid_j) catch return;
+    value.appendSlice(gpaAlloc(), ",\"request\":{\"questions\":") catch return;
+    value.appendSlice(gpaAlloc(), questions_raw) catch return;
+    value.appendSlice(gpaAlloc(), "}}") catch return;
+    remote_mux.publishEvents(gpaAlloc(), value.items);
 }
 
 /// Publish one SessionEventMap payload onto the mux hub, wrapped in the

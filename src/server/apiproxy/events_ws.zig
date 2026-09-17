@@ -360,6 +360,15 @@ pub fn serveRemoteMux(alloc: std.mem.Allocator, conn: *httpd.WsConn) anyerror!vo
                     owned.append(alloc, 0) catch continue;
                     remote_mux.sendSnapshot(alloc, s, session_id);
                 } else if (std.mem.eql(u8, endpoint, "$events")) {
+                    // Registered so ask_user waterfalls (main.zig) reach this
+                    // page; multiple pages each observe the request and the
+                    // question store settles on the first answer.
+                    _ = remote_mux.register(stream_id, "", .events, conn) catch {
+                        sendStreamError(alloc, conn, stream_id, "internal", "stream registration failed");
+                        continue;
+                    };
+                    owned.appendSlice(alloc, stream_id) catch continue;
+                    owned.append(alloc, 0) catch continue;
                     // Gateway-internal forwarded-event stream: the Connection
                     // generation completes when the ready frame arrives.
                     // zharness forwards no cordis events yet, so after the

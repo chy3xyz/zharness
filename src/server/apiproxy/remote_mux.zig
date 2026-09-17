@@ -54,7 +54,7 @@ fn unlock() void {
 var g_streams: std.ArrayListUnmanaged(*Stream) = .empty;
 var g_seq: u64 = 0;
 
-pub const Kind = enum { follow, control, workspace };
+pub const Kind = enum { follow, control, workspace, events };
 
 pub const Stream = struct {
     stream_id: []u8,
@@ -188,6 +188,24 @@ pub fn sendWorkspaceBaseline(alloc: std.mem.Allocator, s: *Stream) void {
     const value = std.fmt.allocPrint(alloc, "{{\"type\":\"baseline\",\"value\":{{\"items\":[{{\"workspaceId\":\"ws-zharness\",\"path\":{s},\"title\":\"zharness\",\"sessionIds\":[],\"createdAt\":\"2026-01-01T00:00:00.000Z\",\"updatedAt\":\"2026-01-01T00:00:00.000Z\"}}],\"archivedSessionIds\":[]}}}}", .{path_json.items}) catch return;
     defer alloc.free(value);
     sendItem(alloc, s, value);
+}
+
+/// Forward one Gateway-internal event/waterfall frame value to every
+/// `$events` stream (user-questions waterfalls and future cordis fan-out).
+pub fn publishEvents(alloc: std.mem.Allocator, value_json: []const u8) void {
+    var id_json: std.ArrayList(u8) = .empty;
+    defer id_json.deinit(alloc);
+
+    lock();
+    defer unlock();
+    for (g_streams.items) |s| {
+        if (s.kind != .events) continue;
+        id_json.clearRetainingCapacity();
+        jsonx.appendJsonString(c_alloc, &id_json, s.stream_id) catch continue;
+        const frame = std.fmt.allocPrint(c_alloc, "{{\"type\":\"item\",\"streamId\":{s},\"value\":{s}}}", .{ id_json.items, value_json }) catch continue;
+        defer c_alloc.free(frame);
+        s.conn.writeText(frame) catch {};
+    }
 }
 
 pub fn streamCount() usize {
