@@ -2202,6 +2202,9 @@ pub fn dispatch(
     // Composer slash-command catalog: zharness's chat command registry is
     // interactive-only, so the web catalog is empty for now.
     if (std.mem.eql(u8, m, "commands.list")) return run(alloc, env, okValue(alloc, env.rpc_id, "[]"));
+    // Settings-panel preset-directory affordance: zharness keeps presets in
+    // config.toml (no directory to open), so the affordance is unavailable.
+    if (std.mem.eql(u8, m, "settings.canOpenAgentPresetDirectory")) return run(alloc, env, okValue(alloc, env.rpc_id, "false"));
 
     // host domain
     if (std.mem.eql(u8, m, "host.describe")) return run(alloc, env, hHostDescribe(deps, alloc, env.rpc_id, p));

@@ -193,6 +193,20 @@ pub const Request = struct {
 /// Parse a complete raw HTTP request (head CRLFCRLF + body). Pure: no I/O.
 /// The result owns copies of all slices; caller applies `deinit` unless the
 /// allocation came from an arena.
+/// Bytes of body still expected after `head_end`, from the Content-Length
+/// header (0 when absent — bodyless GET/HEAD). Case-insensitive scan over
+/// the raw header block ending at `head_end`.
+fn bodyBytesPending(raw: []const u8, head_end: usize) usize {
+    var it = std.mem.splitSequence(u8, raw[0..head_end], "\r\n");
+    while (it.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " \t"), "content-length")) continue;
+        const v = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        return std.fmt.parseInt(usize, v, 10) catch 0;
+    }
+    return 0;
+}
+
 pub fn parseRequest(alloc: std.mem.Allocator, raw: []const u8) ParseError!Request {
     const sep = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.BadRequest;
     const head = raw[0..sep];
@@ -621,8 +635,19 @@ pub const Server = struct {
         var res = Responder{ .fd = conn_fd, .alloc = alloc };
 
         while (true) {
-            if (std.mem.indexOf(u8, buf.items, "\r\n\r\n") != null) break;
-            if (buf.items.len > MaxHeadBytes) {
+            if (std.mem.indexOf(u8, buf.items, "\r\n\r\n")) |head_end| {
+                // Head complete: keep reading until the full Content-Length
+                // body has arrived. The head and a large body frequently land
+                // in separate TCP segments — parsing here would report a
+                // spurious 400 on every multi-segment request.
+                const need = bodyBytesPending(buf.items, head_end + 4);
+                if (need == 0) break;
+                if (buf.items.len >= head_end + 4 + need) break;
+                if (head_end + 4 + need > MaxBodyBytes) {
+                    failEarly(&res, .payload_too_large, "body too large") catch {};
+                    return;
+                }
+            } else if (buf.items.len > MaxHeadBytes) {
                 failEarly(&res, .payload_too_large, "head too large") catch {};
                 return;
             }
