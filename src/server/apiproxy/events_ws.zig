@@ -337,6 +337,8 @@ pub fn serveRemoteMux(alloc: std.mem.Allocator, conn: *httpd.WsConn) anyerror!vo
                 defer alloc.free(stream_id);
                 const endpoint_const = (jsonx.getStringAlloc(alloc, buf.items, "endpoint") catch null) orelse continue;
                 defer alloc.free(endpoint_const);
+                if (std.c.getenv("ZH_DEBUG_RPC") != null)
+                    std.debug.print("[stream-open] {s}\n", .{endpoint_const});
                 // The v0.1.6 gateway composes stream endpoints slash-form
                 // (namespace/method); match on the dot form.
                 const endpoint: []u8 = @constCast(endpoint_const);
@@ -359,6 +361,15 @@ pub fn serveRemoteMux(alloc: std.mem.Allocator, conn: *httpd.WsConn) anyerror!vo
                     owned.appendSlice(alloc, stream_id) catch continue;
                     owned.append(alloc, 0) catch continue;
                     remote_mux.sendSnapshot(alloc, s, session_id);
+                    // Seed the model-selection projection row for this
+                    // session on the control streams — the composer's model
+                    // seat waits for it (config default: deepseek route).
+                    var sid_j: std.ArrayList(u8) = .empty;
+                    defer sid_j.deinit(alloc);
+                    jsonx.appendJsonString(alloc, &sid_j, session_id) catch continue;
+                    const proj = std.fmt.allocPrint(alloc, "{{\"type\":\"projection\",\"sessionId\":{s},\"key\":\"modelSelection\",\"value\":{{\"lastUsed\":{{\"provider\":\"deepseek\",\"model\":\"deepseek-v4-flash\"}},\"pending\":null}},\"seq\":1}}", .{ sid_j.items }) catch continue;
+                    defer alloc.free(proj);
+                    remote_mux.publishControlRaw(proj);
                 } else if (std.mem.eql(u8, endpoint, "$events")) {
                     // Registered so ask_user waterfalls (main.zig) reach this
                     // page; multiple pages each observe the request and the

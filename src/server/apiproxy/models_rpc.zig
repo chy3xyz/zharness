@@ -293,6 +293,35 @@ pub fn handleSessionModels(deps: *const router.ApiProxyDeps, alloc: std.mem.Allo
     return router.okValue(alloc, rpc_id, value.items);
 }
 
+/// session.modelCatalog (v0.1.6 shape): default selection, routable provider
+/// ids, provider groups, and per-provider catalog failures.
+pub fn handleModelCatalog(deps: *const router.ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: []const u8) !router.UnaryResponse {
+    const entries = try docEntries(deps, alloc);
+    const current = currentSelection(entries);
+
+    var value: std.ArrayList(u8) = .empty;
+    errdefer value.deinit(alloc);
+    try value.appendSlice(alloc, "{\"default\":{\"provider\":");
+    try appendSelectionJsonStr(alloc, &value, current.provider);
+    try value.appendSlice(alloc, ",\"model\":");
+    try appendSelectionJsonStr(alloc, &value, current.model);
+    try value.appendSlice(alloc, "},\"routableProviders\":[");
+    try value.appendSlice(alloc, if (providers.Provider.fromString(current.provider) != null) "\"deepseek\"" else "");
+    try value.appendSlice(alloc, "],\"groups\":[");
+    try appendGroupsJson(alloc, &value, entries);
+    try value.appendSlice(alloc, "],\"failures\":[]}");
+    return router.okValue(alloc, rpc_id, value.items);
+}
+
+/// String-literal append with JSON escaping (models/provider ids here are
+/// plain ASCII; escape anyway so nothing can break the envelope).
+fn appendSelectionJsonStr(alloc: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+    var tmp: std.ArrayList(u8) = .empty;
+    defer tmp.deinit(alloc);
+    try jsonx.appendJsonString(alloc, &tmp, s);
+    try out.appendSlice(alloc, tmp.items);
+}
+
 pub fn handleSessionSelectModel(deps: *const router.ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8) !router.UnaryResponse {
     const sid_raw = jsonx.getRaw(payload, "sessionId") orelse return error.PayloadInvalid;
     if (!jsonx.isString(sid_raw)) return error.PayloadInvalid;

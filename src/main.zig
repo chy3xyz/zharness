@@ -425,6 +425,18 @@ fn hostPublishFmtSession(session_id: []const u8, running: bool) void {
         defer gpaAlloc().free(line);
         hostPublish("host/session-status", line);
     }
+    // v0.1.6 session-controller live event: the GUI's session list flips the
+    // running pill from this forwarded cordis event ($events stream).
+    {
+        var value: std.ArrayList(u8) = .empty;
+        defer value.deinit(gpaAlloc());
+        const sid_j = jsonEsc(gpaAlloc(), session_id) orelse return;
+        defer gpaAlloc().free(sid_j);
+        value.appendSlice(gpaAlloc(), "{\"type\":\"emit\",\"event\":\"api-session/status\",\"args\":[") catch return;
+        value.appendSlice(gpaAlloc(), sid_j) catch return;
+        value.appendSlice(gpaAlloc(), if (running) ",true]" else ",false]") catch return;
+        remote_mux.publishEvents(gpaAlloc(), value.items);
+    }
 }
 
 /// Push a frame on the HOST hub (workspace/session list liveness).

@@ -149,7 +149,7 @@ pub fn sendSnapshot(alloc: std.mem.Allocator, s: *Stream, session_id: []const u8
     var id_json: std.ArrayList(u8) = .empty;
     defer id_json.deinit(alloc);
     jsonx.appendJsonString(alloc, &id_json, session_id) catch return;
-    const head = std.fmt.allocPrint(alloc, "{{\"type\":\"snapshot\",\"header\":{{\"version\":1,\"id\":{s},\"createdAt\":{d},\"isSeeded\":false}},\"cursor\":-1,\"records\":[],\"hasMore\":false,\"assistantStream\":{{\"revision\":0,\"attempts\":[]}},", .{ id_json.items, nowMs() }) catch return;
+    const head = std.fmt.allocPrint(alloc, "{{\"type\":\"snapshot\",\"header\":{{\"version\":1,\"id\":{s},\"createdAt\":{d},\"isSeeded\":false}},\"cursor\":-1,\"records\":[],\"hasMore\":false,\"assistantStream\":{{\"revision\":0,\"attempts\":[]}},\"projections\":{{\"asOfSeq\":-1,\"values\":{{\"modelSelection\":{{\"lastUsed\":null,\"pending\":null}}}}}},", .{ id_json.items, nowMs() }) catch return;
     defer alloc.free(head);
     const value = std.fmt.allocPrint(alloc, "{s}\"projections\":{{\"asOfSeq\":0,\"values\":{{}}}}}}", .{head}) catch return;
     defer alloc.free(value);
@@ -193,11 +193,14 @@ pub fn sendWorkspaceBaseline(alloc: std.mem.Allocator, s: *Stream) void {
 /// Forward one Gateway-internal event/waterfall frame value to every
 /// `$events` stream (user-questions waterfalls and future cordis fan-out).
 pub fn publishEvents(alloc: std.mem.Allocator, value_json: []const u8) void {
+    _ = alloc;
     var id_json: std.ArrayList(u8) = .empty;
-    defer id_json.deinit(alloc);
+    defer id_json.deinit(c_alloc);
 
     lock();
     defer unlock();
+    if (std.c.getenv("ZH_DEBUG_RPC") != null)
+        std.debug.print("[publishEvents] streams={d}\n", .{g_streams.items.len});
     for (g_streams.items) |s| {
         if (s.kind != .events) continue;
         id_json.clearRetainingCapacity();
@@ -205,6 +208,24 @@ pub fn publishEvents(alloc: std.mem.Allocator, value_json: []const u8) void {
         const frame = std.fmt.allocPrint(c_alloc, "{{\"type\":\"item\",\"streamId\":{s},\"value\":{s}}}", .{ id_json.items, value_json }) catch continue;
         defer c_alloc.free(frame);
         s.conn.writeText(frame) catch {};
+    }
+}
+
+/// Publish one pre-built control-stream frame (projection / queue / jobs)
+/// to every control stream, bypassing the baseline wrapper.
+pub fn publishControlRaw(frame_json: []const u8) void {
+    if (std.c.getenv("ZH_DEBUG_RPC") != null)
+        std.debug.print("[proj] {s}\n", .{frame_json[0..@min(frame_json.len, 200)]});
+    lock();
+    defer unlock();
+    for (g_streams.items) |s| {
+        if (s.kind != .control) continue;
+        var id_json: std.ArrayList(u8) = .empty;
+        defer id_json.deinit(c_alloc);
+        jsonx.appendJsonString(c_alloc, &id_json, s.stream_id) catch continue;
+        const item = std.fmt.allocPrint(c_alloc, "{{\"type\":\"item\",\"streamId\":{s},\"value\":{s}}}", .{ id_json.items, frame_json }) catch continue;
+        defer c_alloc.free(item);
+        s.conn.writeText(item) catch {};
     }
 }
 

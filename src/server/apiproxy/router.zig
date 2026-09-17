@@ -46,6 +46,7 @@
 const std = @import("std");
 const httpd = @import("../httpd.zig");
 const jsonx = @import("jsonx.zig");
+const remote_mux = @import("remote_mux.zig");
 const questions = @import("questions.zig");
 const subagents_rpc = @import("subagents_rpc.zig");
 const jobs_rpc = @import("jobs_rpc.zig");
@@ -888,6 +889,49 @@ fn hSessionSearch(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: [
     return okValue(alloc, rpc_id, value.items);
 }
 
+extern "c" fn clock_gettime(clk_id: c_int, tp: *std.c.timespec) c_int;
+fn nowMsValue() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = clock_gettime(0, &ts);
+    return @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, 1_000_000);
+}
+
+/// session.create + announce: after a successful create, forward the
+/// `api-session/added` cordis event onto the $events streams — the GUI's
+/// session store learns new sessions exclusively through that event.
+fn sessionCreateAndAnnounce(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8) !UnaryResponse {
+    if (std.c.getenv("ZH_DEBUG_RPC") != null)
+        std.debug.print("[announce] wrapper entered\n", .{});
+    const resp = try hSessionCreate(deps, alloc, rpc_id, payload);
+    if (std.c.getenv("ZH_DEBUG_RPC") != null)
+        std.debug.print("[announce] resp body: {s}\n", .{resp.body[0..@min(resp.body.len, 220)]});
+    // Salvage the created id from the ok-value ({"sessionId":…}); the body is
+    // the full server-response envelope, so descend through "result".
+    const result = jsonx.getRaw(resp.body, "result") orelse return resp;
+    const value_raw = jsonx.getRaw(result, "value") orelse return resp;
+    const sid = (jsonx.getStringAlloc(alloc, value_raw, "sessionId") catch null) orelse return resp;
+    defer alloc.free(sid);
+
+    var sid_j: std.ArrayList(u8) = .empty;
+    defer sid_j.deinit(alloc);
+    jsonx.appendJsonString(alloc, &sid_j, sid) catch return resp;
+
+    const emit = std.fmt.allocPrint(alloc, "{{\"type\":\"emit\",\"event\":\"api-session/added\",\"args\":[{{\"sessionId\":{s},\"updatedAt\":{d},\"running\":false,\"blank\":true}}]}}", .{ sid_j.items, nowMsValue() }) catch return resp;
+    defer alloc.free(emit);
+    remote_mux.publishEvents(alloc, emit);
+
+    // Model-selection projection for the new session: the composer's model
+    // seat waits for this row; absent it renders "loading models" forever and
+    // the input stays gated. Default = the host's configured route.
+    var sid_j2: std.ArrayList(u8) = .empty;
+    defer sid_j2.deinit(alloc);
+    jsonx.appendJsonString(alloc, &sid_j2, sid) catch return resp;
+    const proj_frame = std.fmt.allocPrint(alloc, "{{\"type\":\"projection\",\"sessionId\":{s},\"key\":\"modelSelection\",\"value\":{{\"lastUsed\":{{\"provider\":\"deepseek\",\"model\":\"deepseek-v4-flash\"}},\"pending\":null}},\"seq\":1}}", .{ sid_j2.items }) catch return resp;
+    defer alloc.free(proj_frame);
+    remote_mux.publishControlRaw(proj_frame);
+    return resp;
+}
+
 fn hSessionCreate(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8) !UnaryResponse {
     const opts = CreateOptions{
         .workspace_id = try optString(alloc, payload, "workspaceId"),
@@ -938,6 +982,38 @@ fn promptContentValid(payload: []const u8) bool {
     return seen >= 1;
 }
 
+/// session.page (v0.1.6 paged history): remaps the upstream request
+/// {address:{sessionId}, throughSeq, beforeSeq?, maxMessages?} onto the
+/// session.history handler (flat sessionId + beforeSeq + maxMessages).
+fn hSessionPage(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8) !UnaryResponse {
+    var address = jsonx.getRaw(payload, "address") orelse return error.PayloadInvalid;
+    if (jsonx.getRaw(address, "sessionId")) |_| {} else {
+        if (jsonx.getRaw(payload, "request")) |req| {
+            if (jsonx.getRaw(req, "address")) |a2| address = a2;
+        }
+    }
+    const sid_raw = jsonx.getRaw(address, "sessionId") orelse return error.PayloadInvalid;
+    if (!jsonx.isString(sid_raw)) return error.PayloadInvalid;
+    const session_id = try jsonx.decodeString(alloc, sid_raw[1 .. sid_raw.len - 1]);
+    defer alloc.free(session_id);
+
+    var flat: std.ArrayList(u8) = .empty;
+    defer flat.deinit(alloc);
+    try flat.appendSlice(alloc, "{\"sessionId\":");
+    try flat.appendSlice(alloc, sid_raw);
+    if (jsonx.getInt(payload, "throughSeq")) |through| {
+        try flat.appendSlice(alloc, try std.fmt.allocPrint(alloc, ",\"throughSeq\":{d}", .{through}));
+    }
+    if (jsonx.getInt(payload, "beforeSeq")) |before| {
+        try flat.appendSlice(alloc, try std.fmt.allocPrint(alloc, ",\"beforeSeq\":{d}", .{before}));
+    }
+    if (jsonx.getInt(payload, "maxMessages")) |max| {
+        try flat.appendSlice(alloc, try std.fmt.allocPrint(alloc, ",\"maxMessages\":{d}", .{max}));
+    }
+    try flat.append(alloc, '}');
+    return hSessionHistory(deps, alloc, rpc_id, flat.items);
+}
+
 fn hSessionHistory(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8) !UnaryResponse {
     const session_id = try reqString(alloc, payload, "sessionId");
     const before_seq_i = try optInt(payload, "beforeSeq");
@@ -952,10 +1028,10 @@ fn hSessionHistory(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: 
     const page = try deps.sessionHistory(deps.ctx, alloc, session_id, before_seq_i, if (max_i) |v| @intCast(v) else null);
     var value: std.ArrayList(u8) = .empty;
     errdefer value.deinit(alloc);
-    try value.appendSlice(alloc, "{\"events\":[");
+    try value.appendSlice(alloc, "{\"records\":[");
     for (page.entries, 0..) |e, i| {
         if (i > 0) try value.appendSlice(alloc, ",");
-        try value.appendSlice(alloc, "{\"event\":");
+        try value.appendSlice(alloc, "{\"type\":\"event\",\"event\":");
         try value.appendSlice(alloc, e.event_json);
         if (e.view_json) |v| {
             try value.appendSlice(alloc, ",\"view\":");
@@ -2094,6 +2170,13 @@ pub fn dispatch(
     if (jsonx.getRaw(p, "args")) |args| {
         if (jsonx.objectBody(args) != null) p = args;
     }
+    // Session-controller faces nest their request one layer deeper
+    // ({args:{request:{...}}} on the wire — {request:{...}} after the args
+    // unwrap above); descend when present so handlers see the request's own
+    // top-level fields.
+    if (jsonx.getRaw(p, "request")) |request| {
+        if (jsonx.objectBody(request) != null) p = request;
+    }
     // Wire-form normalization: the v0.1.6 typert gateway composes endpoints as
     // `namespace/method` while the v0.1.1 surface used `namespace.method`.
     // Match on the dot form so both eras hit the same handlers.
@@ -2119,7 +2202,7 @@ pub fn dispatch(
         }
         return run(alloc, env, hSessionSearch(deps, alloc, env.rpc_id, p));
     }
-    if (std.mem.eql(u8, m, "session.create")) return run(alloc, env, hSessionCreate(deps, alloc, env.rpc_id, p));
+    if (std.mem.eql(u8, m, "session.create")) return run(alloc, env, sessionCreateAndAnnounce(deps, alloc, env.rpc_id, p));
     if (std.mem.eql(u8, m, "session.history")) {
         const resp = try hSessionHistory(deps, alloc, env.rpc_id, p);
         const clean = try sanitizeResponseBody(alloc, resp.body);
@@ -2127,12 +2210,12 @@ pub fn dispatch(
         // Repair was needed — the session data contains malformed JSON from
         // before the tool_mod_echo fix. Return an empty but valid history
         // rather than risk returning broken JSON to the client.
-        const empty_value = "{\"events\":[],\"hasMore\":false,\"projections\":{\"asOfSeq\":-1,\"values\":{}}}";
+        const empty_value = "{\"records\":[],\"hasMore\":false,\"projections\":{\"asOfSeq\":-1,\"values\":{}}}";
         _ = empty_value;
         var rpc_buf: std.ArrayList(u8) = .empty;
         defer rpc_buf.deinit(alloc);
         try jsonx.appendJsonString(alloc, &rpc_buf, env.rpc_id);
-        const empty_body = try std.fmt.allocPrint(alloc, "{{\"type\":\"server-response\",\"rpcId\":{s},\"result\":{{\"ok\":true,\"value\":{{\"events\":[],\"hasMore\":false,\"projections\":{{\"asOfSeq\":-1,\"values\":{{}}}}}}}}}}", .{rpc_buf.items});
+        const empty_body = try std.fmt.allocPrint(alloc, "{{\"type\":\"server-response\",\"rpcId\":{s},\"result\":{{\"ok\":true,\"value\":{{\"records\":[],\"hasMore\":false,\"projections\":{{\"asOfSeq\":-1,\"values\":{{}}}}}}}}}}", .{rpc_buf.items});
         return .{ .body = try alloc.dupe(u8, empty_body) };
     }
     if (std.mem.eql(u8, m, "session.prompt")) return run(alloc, env, hSessionPrompt(deps, alloc, env.rpc_id, p));
@@ -2171,7 +2254,14 @@ pub fn dispatch(
     // model selection domain (Tier-1: vendored ui-model-selection)
     if (std.mem.eql(u8, m, "session.models")) return run(alloc, env, models_rpc.handleSessionModels(deps, alloc, env.rpc_id, p));
     // v0.1.6 rename: model catalog over the same provider matrix.
-    if (std.mem.eql(u8, m, "session.modelCatalog")) return run(alloc, env, models_rpc.handleSessionModels(deps, alloc, env.rpc_id, p));
+    if (std.mem.eql(u8, m, "session.modelCatalog")) return run(alloc, env, models_rpc.handleModelCatalog(deps, alloc, env.rpc_id));
+    // v0.1.6 paged cold history (address + throughSeq cursor).
+    if (std.mem.eql(u8, m, "session.page")) return run(alloc, env, hSessionPage(deps, alloc, env.rpc_id, p));
+    // llm provider directory (settings model selector + selector defaults).
+    if (std.mem.eql(u8, m, "llm.listProviders"))
+        return run(alloc, env, okValue(alloc, env.rpc_id, "[{\"id\":\"deepseek\",\"name\":\"DeepSeek\"}]"));
+    if (std.mem.eql(u8, m, "llm.listConfigurableProviders"))
+        return run(alloc, env, okValue(alloc, env.rpc_id, "[{\"provider\":\"deepseek\",\"displayName\":\"DeepSeek\",\"settingsNs\":\"llm-deepseek\",\"settingsPath\":[]}]"));
     if (std.mem.eql(u8, m, "session.selectModel")) return run(alloc, env, models_rpc.handleSessionSelectModel(deps, alloc, env.rpc_id, p));
 
     // skills domain (Tier-1: vendored ui-skill; fresh disk scan per call)
