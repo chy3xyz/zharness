@@ -42,10 +42,11 @@ const { graph, injections } = JSON.parse(await readFile(manifestPath, 'utf8'))
 
 /** Package name -> absolute lib dir, resolved once from the vendored manifests. */
 const pluginLibDirs = new Map()
-for (const group of ['packages/client', 'packages/typert', 'packages/api']) {
-  const groupDir = join(root, ...group.split('/'))
-  if (!existsSync(groupDir)) continue
-  for (const leaf of readdirSync(groupDir)) {
+for (const group of readdirSync(join(root, 'packages'))) {
+  const groupDir = join(root, 'packages', group)
+  let leaves
+  try { leaves = readdirSync(groupDir) } catch { continue }
+  for (const leaf of leaves) {
     const manifestFile = join(groupDir, leaf, 'package.json')
     if (!existsSync(manifestFile)) continue
     try {
@@ -89,6 +90,8 @@ function renderRow(row) {
       return { placement: row.placement, markup: `<script>${row.text}</script>` }
     case 'script-src':
       return { placement: row.placement, markup: `<script src="${escapeHtmlAttribute(row.src)}"></script>` }
+    case 'script-preload':
+      return { placement: 'head', markup: `<link rel="preload" as="script" href="${escapeHtmlAttribute(row.src)}">` }
     case 'style':
       return { placement: 'head', markup: `<style>${row.text}</style>` }
     case 'html':
@@ -123,6 +126,37 @@ const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url ?? '/', 'http://localhost')
     const pathname = decodeURIComponent(url.pathname)
+
+    // Combo route: /plugins/??<id>/client.js,<id>/client.js,...&rev=<rev>
+    // (search form: '??' survives URL parsing as search). Mirrors the host
+    // ClientModuleRegistry buildComboScript concatenation semantics.
+    if (url.search.startsWith('??')) {
+      const list = url.search.slice(2).split('&rev=')[0]
+      const resources = list.split(',').filter(Boolean)
+      const parts = []
+      for (const resource of resources) {
+        const isMap = resource.endsWith('.map')
+        const rel = isMap ? resource.slice(0, -'.map'.length) : resource
+        if (!rel.endsWith('/client.js')) throw new Error('serve-fixture: bad combo resource ' + resource)
+        const id = rel.slice(0, -'/client.js'.length)
+        const libDir = pluginLibDirs.get(id)
+        const file = libDir === undefined ? undefined : join(libDir, isMap ? 'client.js.map' : 'client.js')
+        let body
+        try { body = await readFile(file) } catch { body = undefined }
+        if (body === undefined) { res.writeHead(404); res.end(); return }
+        if (isMap) { parts.push(body) } else {
+          let source = body.toString('utf8').replace(/(?:\r?\n)?\/\/# sourceURL=[^\r\n]*(?:\r?\n)?$/, '').replace(/(?:\r?\n)?\/\/# sourceMappingURL=[^\r\n]*(?:\r?\n)?$/, '')
+          if (!source.endsWith('\n')) source += '\n'
+          parts.push(Buffer.from(source + ';\n', 'utf8'))
+        }
+      }
+      if (resources.every(r => !r.endsWith('.map'))) {
+        parts.push(Buffer.from('//# sourceMappingURL=' + '/plugins/??' + list + '.map&rev=' + (url.searchParams.get('rev') ?? '') + '\n', 'utf8'))
+      }
+      res.writeHead(200, { 'content-type': resources.some(r => r.endsWith('.map')) ? 'application/json; charset=utf-8' : 'text/javascript; charset=utf-8', 'cache-control': 'no-cache' })
+      res.end(resources.some(r => r.endsWith('.map')) && resources.length > 1 ? Buffer.concat(parts) : Buffer.concat(parts))
+      return
+    }
 
     // Plugin bundles (+ source maps), served from the built lib dirs.
     const prefix = '/plugins/'

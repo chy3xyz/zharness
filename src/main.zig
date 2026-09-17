@@ -1003,6 +1003,11 @@ fn serveDispatch(ctx: ?*anyopaque, alloc: std.mem.Allocator, req: *const httpd.R
     if (std.mem.startsWith(u8, req.path, "/api/")) {
         return apiproxy.handleApiRequest(b.apx_deps, alloc, req, res);
     }
+    // Host route for the ui-open-in-app plugin: zharness registers no external
+    // applications, so the catalog is always empty (upstream shape).
+    if (std.mem.eql(u8, req.path, "/open-in-app/apps")) {
+        return res.send(.ok, .json, "{\"apps\":[]}");
+    }
     if (server_static.claims(req.path)) {
         var sctx = server_static.Ctx{ .root = b.static_root };
         return server_static.handle(@ptrCast(&sctx), alloc, req, res);

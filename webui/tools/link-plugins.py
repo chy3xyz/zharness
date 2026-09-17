@@ -9,15 +9,30 @@ manifest = json.load(open(os.path.join(root, "build-artifacts", "boot-manifest.j
 base = os.path.join(root, "packages")
 
 os.makedirs(os.path.join(dist, "plugins", "@deepseek-ai"), exist_ok=True)
+
+# name -> packages/ subdir, derived from each package's own location in the
+# workspace (single source of truth: scan packages/*/*/package.json names).
+name_to_sub = {}
+for group in sorted(os.listdir(base)):
+    gdir = os.path.join(base, group)
+    if not os.path.isdir(gdir):
+        continue
+    for leaf in sorted(os.listdir(gdir)):
+        pj = os.path.join(gdir, leaf, "package.json")
+        if not os.path.isfile(pj):
+            continue
+        try:
+            name = json.load(open(pj)).get("name")
+        except Exception:
+            continue
+        if name:
+            name_to_sub[name] = f"{group}/{leaf}"
+
 n = 0
 for pkg in manifest["roster"]:
-    short = pkg.split("@deepseek-ai/")[1]
-    if   short.startswith("dsh-client-"):  sub = "client/" + short[len("dsh-client-"):]
-    elif short.startswith("dsh-typert"):   sub = "typert/registry"
-    elif short == "dsh-api-gateway":       sub = "api/gateway"
-    elif short == "dsh-api-remotes":       sub = "api/remotes"
-    else:
-        continue
+    sub = name_to_sub.get(pkg)
+    if sub is None:
+        print("MISS", pkg); continue
     lib = os.path.join(base, sub, "lib")
     if not os.path.isdir(lib):
         print("MISS", pkg); continue

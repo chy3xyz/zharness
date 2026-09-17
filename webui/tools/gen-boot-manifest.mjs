@@ -1,28 +1,33 @@
 #!/usr/bin/env node
 /**
- * zharness vendored-build helper: compose the TRIMMED window.__DSH_BOOT__
- * graph (15 plugin rows) from the built vendored tree.
+ * zharness vendored-build helper: compose the window.__DSH_BOOT__ graph from
+ * the built vendored tree.
  *
- * Row composition, rev hashing (sha1-12 of lib/client.js), module-graph
- * ordering, and the boot injection rows are delegated to the vendored
- * node half itself (`@deepseek-ai/dsh-client-modules` lib/types exports:
- * orderByModuleGraph + bootInjections), so the output is byte-compatible
- * with what upstream's host would compose for the same package set.
+ * Mirrors ClientModuleRegistry.compose() (packages/client/modules/src/index.ts)
+ * for a STATIC dist: module-graph ordered entries, bootstrap/application combo
+ * batches (URL-length partitioned, rev = framedHash('combo', ...)), and the
+ * graph rev = shortHash(JSON.stringify({entries, batches})). Bundle revs are
+ * framedHash('plugin-artifact', [bundle]) — the same values the Zig static
+ * server's `/plugins/??` combo route is keyed by. Row composition, ordering,
+ * and the boot injection rows are delegated to the vendored node half itself
+ * (`@deepseek-ai/dsh-client-modules` lib exports), so the output is
+ * byte-compatible with what upstream's host composes for the same set.
  *
- * The roster is zharness's trimmed list (docs/dsh-reuse-spec.md §5.1/§6):
- * upstream ships ~40 rows; zharness serves 15. Packages with built bundles
- * that are NOT on the roster (currently ui-input-trigger) are simply not
- * listed — the supported degradation mechanism per packages/client/web/src/boot.ts.
+ * Roster: EVERY web client plugin in the vendored closure except
+ * dsh-client-hmr (upstream's dev-server machinery; zharness serves a static
+ * production dist). Plugins whose Host-facing RPC zharness does not implement
+ * follow upstream's degradation rules — unknown methods answer bad-request
+ * shapes and the panels idle.
  *
  * Output: webui/build-artifacts/boot-manifest.json
  *   { graph: WebBootGraph, injections: IndexInjection[], roster: string[] }
  *
- * Usage: node ../tools/gen-boot-manifest.mjs   (cwd must be webui)
+ * Usage: node tools/gen-boot-manifest.mjs   (cwd must be webui)
  */
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { bootInjections, orderByModuleGraph } from '../packages/client/modules/lib/types/index.js'
+import { bootInjections, orderByModuleGraph } from '../packages/client/modules/lib/index.js'
 
 const root = process.cwd()
 if (!existsSync(join(root, 'dist/index.html'))) {
@@ -30,32 +35,47 @@ if (!existsSync(join(root, 'dist/index.html'))) {
   process.exit(1)
 }
 
-/** zharness trimmed roster (spec §6 "Manifest rows (15)"). */
 const ROSTER = [
+  // core: loader + connection + api faces
   '@deepseek-ai/dsh-client-modules',
   '@deepseek-ai/dsh-client-connection',
   '@deepseek-ai/dsh-typert-registry',
   '@deepseek-ai/dsh-api-gateway',
   '@deepseek-ai/dsh-api-remotes',
-  '@deepseek-ai/dsh-client-runtime',
+  '@deepseek-ai/dsh-api-session-controller',
+  '@deepseek-ai/dsh-api-terminal-controller',
+  '@deepseek-ai/dsh-api-workspace-controller',
+  '@deepseek-ai/dsh-api-workspace-files',
+  '@deepseek-ai/dsh-client-file-upload',
+  '@deepseek-ai/dsh-client-resources',
   '@deepseek-ai/dsh-client-locale',
+  '@deepseek-ai/dsh-session-log-export',
+  // dynamic cordis browser half (zharness wire.zig delivers its packages)
+  '@deepseek-ai/dsh-cordis-client-runner',
+  '@deepseek-ai/dsh-client-ui-cordis',
+  // ui core
   '@deepseek-ai/dsh-client-ui-theme',
   '@deepseek-ai/dsh-client-ui-layout',
   '@deepseek-ai/dsh-client-ui-renderer',
+  '@deepseek-ai/dsh-client-ui-session',
   '@deepseek-ai/dsh-client-ui-sidebar',
+  '@deepseek-ai/dsh-client-ui-sidebar-right',
+  '@deepseek-ai/dsh-client-ui-sidebar-files',
+  '@deepseek-ai/dsh-client-ui-sidebar-documentpreview',
+  '@deepseek-ai/dsh-client-ui-sidebar-terminal',
   '@deepseek-ai/dsh-client-ui-settings',
   '@deepseek-ai/dsh-client-ui-settings-general',
   '@deepseek-ai/dsh-client-ui-settings-models',
   '@deepseek-ai/dsh-client-ui-settings-plugins',
   '@deepseek-ai/dsh-client-ui-settings-plugin-inventory',
-  '@deepseek-ai/dsh-client-ui-zharness-general',
+  '@deepseek-ai/dsh-client-ui-settings-unarchive-sessions',
   '@deepseek-ai/dsh-client-ui-conversation',
+  '@deepseek-ai/dsh-client-ui-chat',
   '@deepseek-ai/dsh-client-ui-tool',
   '@deepseek-ai/dsh-client-ui-workspace',
-  // zharness: composer input-trigger plugin — previously dropped as a §7
-  // non-goal, but the wave-6 feature plugins (ui-skill/ui-commands/
-  // ui-reference/ui-subagent) inject it, so it is load-bearing again.
   '@deepseek-ai/dsh-client-ui-input-trigger',
+  // zharness: General-page rows over the agent namespace (config.toml knobs)
+  '@deepseek-ai/dsh-client-ui-zharness-general',
   // zharness: wave-6 feature plugins
   '@deepseek-ai/dsh-client-ui-agent-preset',
   '@deepseek-ai/dsh-client-ui-commands',
@@ -72,11 +92,51 @@ const ROSTER = [
   '@deepseek-ai/dsh-client-ui-user-questions',
   '@deepseek-ai/dsh-client-ui-workflow-run',
   '@deepseek-ai/dsh-client-ui-brand-official',
+  // v0.1.6 feature plugins (degrade gracefully where the RPC is zharness-absent)
+  '@deepseek-ai/dsh-client-ui-approval',
+  '@deepseek-ai/dsh-client-ui-attachment',
+  '@deepseek-ai/dsh-client-ui-deliverables',
+  '@deepseek-ai/dsh-client-ui-open-in-app',
+  '@deepseek-ai/dsh-client-ui-schedule',
 ]
 
-/** sha1 content hash shortened to 12 hex chars — mirrors modules/src/index.ts shortHash. */
-const shortHash = input => createHash('sha1').update(input).digest('hex').slice(0, 12)
+// ── ClientModuleRegistry internals (mirrored, lib-internal there) ──────────
+const HASH_REVISION_LENGTH = 12
+const MAX_COMBO_URL_BYTES = 3 * 1024
+const COMBO_REVISION_PLACEHOLDER = '0'.repeat(HASH_REVISION_LENGTH)
+/** sha1 content hash shortened to 12 hex chars (combo / graph rev). */
+const shortHash = input => createHash('sha1').update(input).digest('hex').slice(0, HASH_REVISION_LENGTH)
+/** Hash several response fields without allowing bytes to move across field boundaries. */
+const framedHash = (domain, parts) => {
+  const hash = createHash('sha1').update(domain).update('\0')
+  for (const part of parts) hash.update(`${String(part.byteLength)}:`).update(part)
+  return hash.digest('hex').slice(0, HASH_REVISION_LENGTH)
+}
+const artifactRevision = bundle => framedHash('plugin-artifact', [bundle])
+/** Address one ordered plugin-file list through the shared combo route. */
+const comboUrl = (ids, rev, sourceMap = false) =>
+  `/plugins/??${ids.map(id => `${id}/client.js${sourceMap ? '.map' : ''}`).join(',')}&rev=${rev}`
+const comboRevision = resources =>
+  framedHash('combo', resources.flatMap(resource => [Buffer.from(resource.id), Buffer.from(resource.rev)]))
+const projectedComboUrlBytes = ids =>
+  Buffer.byteLength(comboUrl(ids, COMBO_REVISION_PLACEHOLDER, true))
+/** Partition one phase in graph order without exceeding the combo URL limit. */
+function partitionIds(ids) {
+  const chunks = []
+  let current = []
+  for (const id of ids) {
+    const candidate = [...current, id]
+    if (projectedComboUrlBytes(candidate) <= MAX_COMBO_URL_BYTES) { current = candidate; continue }
+    if (current.length === 0) throw new Error(`gen-boot-manifest: ${id} exceeds the ${MAX_COMBO_URL_BYTES}-byte combo URL limit`)
+    chunks.push(current)
+    current = [id]
+  }
+  if (current.length > 0) chunks.push(current)
+  return chunks
+}
+const PARSER_PRELOAD_IDS = ['@deepseek-ai/dsh-client-modules']
 
+// ── roster rows → entries ───────────────────────────────────────────────────
 const nameToDir = new Map()
 for (const group of ['vendor', 'packages']) {
   const groupDir = join(root, group)
@@ -111,14 +171,13 @@ for (const id of ROSTER) {
     ? pkg.exports['./client']
     : pkg.exports?.['./client']?.default
   if (clientRel !== './lib/client.js') {
-    // Keep the export contract visible: the served path must map to the file we hashed.
     console.error(`gen-boot-manifest: ${id} exports "./client" as ${JSON.stringify(clientRel)}, expected "./lib/client.js"`)
     process.exit(1)
   }
-  const rev = shortHash(readFileSync(clientPath))
+  const rev = artifactRevision(readFileSync(clientPath))
   entries.push({
     id,
-    url: `/plugins/${id}/client.js?rev=${rev}`,
+    url: comboUrl([id], rev),
     rev,
     ...(Array.isArray(decl.inject) && decl.inject.length > 0 ? { inject: decl.inject } : {}),
     ...(decl.immediately === true ? { immediately: true } : {}),
@@ -126,11 +185,9 @@ for (const id of ROSTER) {
   })
 }
 
-// Inject closure check: every requested cordis service provider must either be
-// a listed entry or a workspace package WITHOUT a web dsh.client declaration
-// (statically linked into the vite seed — always present, no plugin row to
-// list; e.g. dsh-client-ui-primitives). A client package that is built but
-// deliberately unlisted still fails here.
+// Inject closure check: every requested cordis service provider must be a
+// listed entry or a statically-linked package WITHOUT a web dsh.client
+// declaration (in the vite seed — no plugin row to list).
 const ids = new Set(entries.map(entry => entry.id))
 const missing = []
 for (const entry of entries) {
@@ -143,19 +200,31 @@ for (const entry of entries) {
   }
 }
 if (missing.length > 0) {
-  console.error('gen-boot-manifest: inject targets outside the trimmed roster:\n  ' + missing.join('\n  '))
+  console.error('gen-boot-manifest: inject targets outside the roster:\n  ' + missing.join('\n  '))
   process.exit(1)
 }
 
+// ── compose: mirror ClientModuleRegistry.compose() ──────────────────────────
 const ordered = orderByModuleGraph(entries)
-const graph = { rev: shortHash(JSON.stringify(ordered)), entries: ordered }
+const bootstrapIds = new Set(PARSER_PRELOAD_IDS)
+const bootstrap = ordered.filter(entry => bootstrapIds.has(entry.id))
+const application = ordered.filter(entry => !bootstrapIds.has(entry.id))
+const revOf = new Map(ordered.map(entry => [entry.id, entry.rev]))
+const batches = []
+for (const [phase, group] of [['bootstrap', bootstrap], ['application', application]]) {
+  for (const chunk of partitionIds(group.map(entry => entry.id))) {
+    const rev = comboRevision(chunk.map(id => ({ id, rev: revOf.get(id) })))
+    batches.push({ phase, url: comboUrl(chunk, rev), rev, entries: chunk })
+  }
+}
+const graph = { rev: shortHash(JSON.stringify({ entries: ordered, batches })), entries: ordered, batches }
 const injections = bootInjections(graph)
 
 const outDir = join(root, 'build-artifacts')
 mkdirSync(outDir, { recursive: true })
 const outFile = join(outDir, 'boot-manifest.json')
 writeFileSync(outFile, JSON.stringify({ graph, injections, roster: ROSTER }, null, 2) + '\n')
-console.log(`gen-boot-manifest: ${ordered.length} rows, graph rev ${graph.rev}`)
+console.log(`gen-boot-manifest: ${ordered.length} rows, ${batches.length} batches, graph rev ${graph.rev}`)
 console.log(`gen-boot-manifest: wrote ${outFile}`)
 for (const injection of injections) {
   console.log(`  row: ${injection.kind}${injection.kind === 'script-src' ? ` ${injection.src}` : injection.kind === 'global' ? ` ${injection.name}` : ''}`)

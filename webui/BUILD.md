@@ -1,9 +1,10 @@
 # webui — Vendored DSH Frontend (build contract)
 
 `webui/` is a pruned vendored copy of the DeepSeek Harness web frontend
-(upstream MIT, vendored at commit `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`
-— see `webui/VENDOR-NOTICE.md`). Scope and protocol rationale live in
-`docs/dsh-reuse-spec.md`; this file is the operational build/serve contract.
+(upstream MIT, vendored at commit `0d1f50007f9bca3f52b06e1c3074fa14d5fb0720`,
+master just past `dsh-v0.1.6-alpha.1` — see `webui/VENDOR-NOTICE.md`). Scope
+and protocol rationale live in `docs/dsh-reuse-spec.md`; this file is the
+operational build/serve contract.
 
 ## Layout
 
@@ -56,8 +57,19 @@ node tools/gen-typert.mjs
 #   node tools/gen-typert.mjs ; \
 #   ./node_modules/.bin/tsc -b tsconfig.vendor.json
 
-# 5. bundle all node halves + client bundles + static-channel libs
-pnpm exec tsdown --env.DSH_BUILD_FACE client
+# 5. bundle client halves — PER PACKAGE, not via the root workspace pass:
+#    the root pass keeps different externals for some api/* packages than the
+#    package-local configs do (unrun-config inlining difference), which leaves
+#    require() calls the loader cannot answer at boot. Loop every dir with a
+#    tsdown.config.ts instead:
+for cfg in $(find packages native -name tsdown.config.ts -not -path "*/node_modules/*"); do
+  (cd "$(dirname "$cfg")" && pnpm exec tsdown)
+done
+#    plus the three pure util libs the seed table imports (no local config —
+#    they mirror the root host face's lib/types → lib/index.js):
+for d in packages/util/brand packages/util/crypto packages/util/values; do
+  cp "$d/lib/types/index.js" "$d/lib/index.js"
+done
 
 # 6. bundle the vendored framework libraries (cordis et al.) for the vite seed chunk
 pnpm exec tsdown --config tsdown.vendor-libs.ts
@@ -65,7 +77,8 @@ pnpm exec tsdown --config tsdown.vendor-libs.ts
 # 7. production dist → dist/ (apps/web/dist is a symlink → ../../dist)
 pnpm --filter @deepseek-ai/dsh-web-frontend run build
 
-# 8. regenerate the trimmed boot manifest (after any rebuild — revs are content hashes)
+# 8. regenerate the boot manifest (after any rebuild — revs are content hashes;
+#    mirrors ClientModuleRegistry.compose(): framedHash revs, combo batches)
 node tools/gen-boot-manifest.mjs
 
 # 9. link plugin bundles into dist + render the boot-injected index
@@ -74,7 +87,11 @@ python3 tools/link-plugins.py     # symlinks /plugins/<pkg> -> packages/*/lib
 node tools/inject-index.mjs       # index.injected.html (static.zig serves it for "/")
 ```
 
-Steps 5–6–7 are incremental and fast (~2s combined when warm).
+Steps 6–7 are incremental and fast when warm. The boot graph addresses
+bundles through the `/plugins/??<id>/client.js,…&rev=<rev>` combo route;
+`src/server/static.zig` serves it with upstream's buildComboScript semantics
+(trailer stripping, `;\n` joins, stamped combo map URL), so no combo artifacts
+are materialized on disk.
 
 ## Serve locally (fixture mode, no backend)
 
@@ -93,46 +110,23 @@ content-type, and index.html head injection of the boot rows (queue facade +
 two preload scripts + `globalThis.__DSH_BOOT__`), byte-mirroring
 `packages/host/webserver/src/injections.ts` rendering semantics.
 
-## Boot-manifest trim (40+ → 15 rows → 36 rows)
+## Boot-manifest roster (v0.1.6: full parity)
 
-`gen-boot-manifest.mjs` composes rows only for this roster. After the wave-6
-feature-plugin vendor pass (see `webui/VENDOR-PATCHES.md`) the roster is:
+The v0.1.6 re-vendor takes the opposite policy to the old trimmed roster:
+EVERY web client plugin in the vendored closure is a manifest row (56 rows,
+see `tools/gen-boot-manifest.mjs`), except:
 
-```
-dsh-client-modules · dsh-client-connection · dsh-typert-registry ·
-dsh-api-gateway · dsh-api-remotes · dsh-client-runtime · dsh-client-locale ·
-dsh-client-ui-theme · dsh-client-ui-layout · dsh-client-ui-renderer ·
-dsh-client-ui-sidebar · dsh-client-ui-settings · dsh-client-ui-conversation ·
-dsh-client-ui-tool · dsh-client-ui-workspace ·
-dsh-client-ui-settings-general · dsh-client-ui-settings-models ·
-dsh-client-ui-settings-plugins · dsh-client-ui-settings-plugin-inventory ·
-dsh-client-ui-zharness-general · dsh-client-ui-input-trigger ·
-dsh-client-ui-agent-preset · dsh-client-ui-commands · dsh-client-ui-goal ·
-dsh-client-ui-jobs · dsh-client-ui-message-feedback ·
-dsh-client-ui-model-selection · dsh-client-ui-permission-presets ·
-dsh-client-ui-plan · dsh-client-ui-reference · dsh-client-ui-skill ·
-dsh-client-ui-subagent · dsh-client-ui-trajectory ·
-dsh-client-ui-user-questions · dsh-client-ui-workflow-run ·
-dsh-client-ui-brand-official
-```
+- `dsh-client-hmr` — upstream's dev-server machinery; zharness serves a
+  static production dist;
+- `ui-directory-picker-browse` / `ui-directory-picker-native` — §7 non-goal;
+  the browse variant hard-fails activation without the host directoryPicker
+  RPC.
 
-(36 rows.) Every row's `inject` target is asserted to be either inside the
-roster or a statically-linked (non-plugin) workspace package at generation
-time; anything else aborts the manifest build. The wave-6 plugins call RPCs
-the Zig backend may not implement yet; upstream's degradation rules turn
-unknown methods into bad-request shapes and the panels idle — boot stays clean.
-
-**zharness deviation (16 rows, not 15):** `dsh-client-ui-workspace` was added
-to the roster after integration testing — the conversation hero's workspace
-picker slot is registered by that package, and without it the composer stays
-permanently gated behind "Choose workspace" (the slot renders nothing and no
-selection can be made). The original 15-row trim is preserved in git history;
-the picker is a load-bearing UI piece, not an optional feature plugin.
-
-Current graph rev: `cdf63c698b20` (changes whenever any lib/client.js changes).
-
-Wave-6 vendor deviations (new packages, package.json trims, tooling changes)
-are recorded in `webui/VENDOR-PATCHES.md`.
+Plugins whose Host-facing RPC zharness does not implement follow upstream's
+degradation rules: unknown methods answer bad-request envelopes and the
+panels idle. The graph itself mirrors `ClientModuleRegistry.compose()`:
+framedHash bundle revs, bootstrap/application combo batches partitioned at the
+3 KiB URL limit, graph rev = shortHash(JSON.stringify({entries, batches})).
 
 ## Integrator notes (Zig side — WIRED)
 
@@ -205,3 +199,35 @@ are recorded in `webui/VENDOR-PATCHES.md`.
   entries live, zero console errors / page errors / failed requests;
   roundtrip-smoke PASS — composer unlocked, user bubble + assistant turn
   rendered; settings page opens with zero console errors.
+
+## Verification achieved (2026-09-17, v0.1.6 re-vendor)
+
+- `tsc -b tsconfig.vendor.json`: clean across 9 vendor + 229 closure packages
+  (leaf host/client references).
+- Per-package tsdown loop: 98 configs + 3 util lib entries + vendor-libs
+  (9 frameworks), zero failures.
+- vite build: succeeds; `dist/` regenerated with the v0.1.6 shell.
+- `gen-boot-manifest.mjs`: 56 rows / 2 combo batches, graph rev `92b7b7e42bcf`;
+  inject closure check green.
+- Live-server boot smoke (`zharness serve --port 3210`, headless Chromium):
+  **PASS** — 56/56 entries activate, loader reaches `live` mode, UI mounts
+  (sidebar, workspaces, settings, composer), zero console errors, zero failed
+  requests, zero page errors.
+- Zig-side additions verified by the live smoke: `/plugins/??…` combo route,
+  `/api/remote.mux` WS (accept + structured `unavailable` stream errors),
+  slash-form RPC normalization (`namespace/method` → handlers),
+  `dynamicCordisRunner.inventory` / `.syncInspectManifest`, and the
+  `/open-in-app/apps` empty catalog.
+
+### Known gaps (next phase)
+
+- **Remote streams**: `/api/remote.mux` accepts and degrades; the real
+  `session.follow` / `session.control` / `$events` stream providers (prompt
+  streaming + live transcript over the new protocol) are not implemented —
+  the legacy `/api/events.mux` hub still drives the current prompt path.
+- Fixture roundtrip (`roundtrip-smoke.py` against `serve-fixture.mjs`) is
+  partial: the v0.1.6 composer gates on workspace selection and the fixture
+  carrier does not yet model the new workspace/session controller RPCs.
+- `zharness.general` settings rows and the models page render against the
+  renamed settings contract; panel-level review against the live backend is
+  still pending.

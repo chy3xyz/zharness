@@ -1905,8 +1905,67 @@ pub fn sharedDynamicLifecycle() !*dyn_lifecycle.Lifecycle {
 /// browser. Answers {"code":"<clientCode>"} for the given packageId; a
 /// host-only or unknown package carries null code so the page logs and skips.
 /// Page-global read under the lifecycle lock (spec §6: no session).
-fn hDynamicGetClientCode(alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8) !UnaryResponse {
+/// dynamicCordisRunner.inventory: one row per stable Plugin in the shared
+/// lifecycle registry (upstream DynamicCordisInventoryRow shape), grouped by
+/// plugin with its package revisions and current run.
+fn hDynamicInventory(alloc: std.mem.Allocator, rpc_id: []const u8) !UnaryResponse {
     const lc = try sharedDynamicLifecycle();
+    var value: std.ArrayList(u8) = .empty;
+    errdefer value.deinit(alloc);
+    try value.append(alloc, '[');
+    {
+        lc.lock.lock();
+        defer lc.lock.unlock();
+        var first_plugin = true;
+        var it = lc.reg.plugins.iterator();
+        while (it.next()) |entry| {
+            const p = entry.value_ptr.*;
+            if (!first_plugin) try value.append(alloc, ',');
+            first_plugin = false;
+            try value.appendSlice(alloc, "{\"pluginId\":");
+            try jsonx.appendJsonString(alloc, &value, p.plugin_id);
+            try value.appendSlice(alloc, ",\"agentId\":");
+            try jsonx.appendJsonString(alloc, &value, p.session_id);
+            try value.appendSlice(alloc, ",\"packages\":[");
+            var first_pkg = true;
+            for (p.package_order.items) |pkg_id| {
+                const pkg = p.packages.get(pkg_id) orelse continue;
+                if (!first_pkg) try value.append(alloc, ',');
+                first_pkg = false;
+                try value.appendSlice(alloc, "{\"packageId\":");
+                try jsonx.appendJsonString(alloc, &value, pkg.package_id);
+                try value.appendSlice(alloc, ",\"name\":");
+                try jsonx.appendJsonString(alloc, &value, pkg.name);
+                try value.appendSlice(alloc, ",\"purpose\":");
+                try jsonx.appendJsonString(alloc, &value, pkg.purpose);
+                try value.appendSlice(alloc, if (pkg.hostCode != null) ",\"hasHostHalf\":true" else ",\"hasHostHalf\":false");
+                try value.appendSlice(alloc, if (pkg.clientCode != null) ",\"hasClientHalf\":true" else ",\"hasClientHalf\":false");
+                try value.append(alloc, '}');
+            }
+            try value.append(alloc, ']');
+            if (p.current_package_id) |cur| {
+                try value.appendSlice(alloc, ",\"currentPackageId\":");
+                try jsonx.appendJsonString(alloc, &value, cur);
+            }
+            if (p.next_package_id) |next| {
+                try value.appendSlice(alloc, ",\"nextPackageId\":");
+                try jsonx.appendJsonString(alloc, &value, next);
+            }
+            if (p.run) |r| {
+                try value.appendSlice(alloc, ",\"activeRun\":{\"pluginRunId\":");
+                try jsonx.appendJsonString(alloc, &value, r.pluginRunId);
+                try value.appendSlice(alloc, ",\"packageId\":");
+                try jsonx.appendJsonString(alloc, &value, r.packageId);
+                try value.append(alloc, '}');
+            }
+            try value.append(alloc, '}');
+        }
+    }
+    try value.append(alloc, ']');
+    return okValue(alloc, rpc_id, value.items);
+}
+
+fn hDynamicGetClientCode(alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8) !UnaryResponse {    const lc = try sharedDynamicLifecycle();
     const plugin_id = try reqString(alloc, payload, "pluginId");
     const package_id = try reqString(alloc, payload, "packageId");
     const run_id = try optString(alloc, payload, "pluginRunId");
@@ -2023,8 +2082,18 @@ pub fn dispatch(
     alloc: std.mem.Allocator,
     env: *const Envelope,
 ) anyerror!UnaryResponse {
-    const m = env.method;
+    const m_raw = env.method;
     const p = env.payload_raw;
+    // Wire-form normalization: the v0.1.6 typert gateway composes endpoints as
+    // `namespace/method` while the v0.1.1 surface used `namespace.method`.
+    // Match on the dot form so both eras hit the same handlers.
+    const m = if (std.mem.indexOfScalar(u8, m_raw, '/') != null) blk: {
+        const norm = try alloc.dupe(u8, m_raw);
+        for (norm) |*ch| {
+            if (ch.* == '/') ch.* = '.';
+        }
+        break :blk norm;
+    } else m_raw;
 
     // sessions domain
     if (std.mem.eql(u8, m, "session.list")) {
@@ -2091,6 +2160,8 @@ pub fn dispatch(
 
     // model selection domain (Tier-1: vendored ui-model-selection)
     if (std.mem.eql(u8, m, "session.models")) return run(alloc, env, models_rpc.handleSessionModels(deps, alloc, env.rpc_id, p));
+    // v0.1.6 rename: model catalog over the same provider matrix.
+    if (std.mem.eql(u8, m, "session.modelCatalog")) return run(alloc, env, models_rpc.handleSessionModels(deps, alloc, env.rpc_id, p));
     if (std.mem.eql(u8, m, "session.selectModel")) return run(alloc, env, models_rpc.handleSessionSelectModel(deps, alloc, env.rpc_id, p));
 
     // skills domain (Tier-1: vendored ui-skill; fresh disk scan per call)
@@ -2144,7 +2215,14 @@ pub fn dispatch(
     // dynamic cordis domain (P3 runtime: browser-half host endpoints)
     if (std.mem.eql(u8, m, "dynamic.getClientCode")) return run(alloc, env, hDynamicGetClientCode(alloc, env.rpc_id, p));
     if (std.mem.eql(u8, m, "dynamic.invoke")) return run(alloc, env, hDynamicInvoke(deps, alloc, env.rpc_id, p));
+    // v0.1.6 dynamicCordisRunner surface (upstream cordis-host-runner): the
+    // inventory is backed by the shared lifecycle registry; the client inspect
+    // manifest sync is accepted and mirrored as a no-op.
+    if (std.mem.eql(u8, m, "dynamicCordisRunner.inventory")) return run(alloc, env, hDynamicInventory(alloc, env.rpc_id));
+    if (std.mem.eql(u8, m, "dynamicCordisRunner.syncInspectManifest")) return run(alloc, env, okValue(alloc, env.rpc_id, "null"));
 
+    if (std.c.getenv("ZH_DEBUG_RPC") != null)
+        std.debug.print("[rpc] unknown method: {s}\n", .{m});
     return badRequest(alloc, env.rpc_id, "unknown method");
 }
 
@@ -2179,6 +2257,11 @@ pub fn handleApiRequest(
     res: *httpd.Responder,
 ) anyerror!void {
     if (!std.mem.startsWith(u8, req.path, "/api/")) {
+        // Host route for the ui-open-in-app plugin: zharness registers no
+        // external applications, so the catalog is always empty.
+        if (std.mem.eql(u8, req.path, "/open-in-app/apps")) {
+            return res.send(.ok, .json, "{\"apps\":[]}");
+        }
         return res.send(.not_found, .text, "not found");
     }
 
@@ -2197,6 +2280,20 @@ pub fn handleApiRequest(
             return events_ws.serveMuxStream(alloc, &conn);
         }
         return events_ws.serveHostStream(alloc, &conn);
+    }
+
+    // Gateway multiplexed Remote-stream socket (upstream stream-protocol.ts).
+    // v1 accepts the socket and degrades every stream open to `unavailable`.
+    if (std.mem.eql(u8, req.path, "/api/remote.mux")) {
+        const upg = httpd.WsUpgrade.fromRequest(req) catch {
+            return res.send(.bad_request, .text, "websocket upgrade required");
+        };
+        var conn = res.startWebSocket(&upg) catch |e| switch (e) {
+            error.HandshakeWriteFailed => return error.WriteFailed,
+            error.SocketSetupFailed => return error.SocketSetupFailed,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        return events_ws.serveRemoteMux(alloc, &conn);
     }
 
     // Envelope-less upstream download channel (session-export): the GUI

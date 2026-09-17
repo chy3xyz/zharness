@@ -9,7 +9,7 @@
 import { useEffect, useState } from 'react'
 import clsx from 'clsx'
 import type { InjectFace, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import type { SettingsScope } from '@deepseek-ai/dsh-client-runtime/client'
+import type { SettingsScope } from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { ZharnessGeneralKey } from './locales.ts'
 // Type-only: pulls the settings slot declarations into this program.
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'

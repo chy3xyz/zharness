@@ -289,6 +289,49 @@ pub fn serveHostStream(alloc: std.mem.Allocator, conn: *httpd.WsConn) anyerror!v
 
 const WhichHub = enum { mux, host };
 
+/// Bidirectional pump for GET /api/remote.mux — the Gateway multiplexed
+/// Remote-stream socket (upstream stream-protocol.ts). v1 accepts the socket
+/// and answers every logical `open` with a structured `unavailable` stream
+/// error so the client's degradation rules apply cleanly; `cancel` is
+/// ignored. The session.follow/session.control stream providers land with the
+/// journal integration.
+pub fn serveRemoteMux(alloc: std.mem.Allocator, conn: *httpd.WsConn) anyerror!void {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    while (true) {
+        const opcode = conn.readMessage(&buf) catch |e| switch (e) {
+            error.ConnectionClosed => return,
+            else => return e,
+        };
+        switch (opcode) {
+            .text, .binary => {
+                const stream_id = jsonx.getStringAlloc(alloc, buf.items, "streamId") catch null;
+                defer if (stream_id) |s| alloc.free(s);
+                const kind = jsonx.getRaw(buf.items, "type");
+                const is_open = kind != null and jsonx.isString(kind.?) and
+                    std.mem.eql(u8, jsonx.decodeString(alloc, kind.?) catch "", "open");
+                if (is_open) {
+                    if (stream_id) |sid| {
+                        var id_json: std.ArrayList(u8) = .empty;
+                        defer id_json.deinit(alloc);
+                        jsonx.appendJsonString(alloc, &id_json, sid) catch continue;
+                        const frame = std.fmt.allocPrint(
+                            alloc,
+                            "{{\"type\":\"error\",\"streamId\":{s},\"error\":{{\"code\":\"unavailable\",\"message\":\"zharness: remote stream endpoints are not implemented yet\",\"details\":{{}}}}}}",
+                            .{id_json.items},
+                        ) catch continue;
+                        defer alloc.free(frame);
+                        conn.writeText(frame) catch return;
+                    }
+                }
+                // 'cancel' and unknown kinds: no response required.
+            },
+            else => {},
+        }
+    }
+}
+
 fn pumpStream(which: WhichHub, hub: *FrameHub, alloc: std.mem.Allocator, conn: *httpd.WsConn, sub: *Sub) anyerror!void {
     _ = which;
     _ = hub;

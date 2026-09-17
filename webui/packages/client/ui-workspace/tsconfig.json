@@ -2,14 +2,18 @@
   "extends": "../../../tsconfig.base.client.json",
   "compilerOptions": {
     "rootDir": "src",
-    "outDir": "lib/types",
-    "noImplicitAny": false,
-    "skipLibCheck": true
+    "outDir": "lib/types"
   },
   "include": [
     "src"
   ],
   "references": [
+    {
+      "path": "../../api/session-controller/tsconfig.client.json"
+    },
+    {
+      "path": "../../api/workspace-controller/tsconfig.client.json"
+    },
     {
       "path": "../locale"
     },
@@ -26,7 +30,16 @@
       "path": "../connection/tsconfig.client.json"
     },
     {
-      "path": "../runtime"
+      "path": "../../api/remotes/tsconfig.client.json"
+    },
+    {
+      "path": "../store"
+    },
+    {
+      "path": "../../core/session"
+    },
+    {
+      "path": "../../schedule/schedule"
     },
     {
       "path": "../ui-sidebar"
@@ -35,7 +48,16 @@
       "path": "../ui-conversation"
     },
     {
-      "path": "../../runtime-diagnostics/invariants"
+      "path": "../ui-layout"
+    },
+    {
+      "path": "../ui-renderer"
+    },
+    {
+      "path": "../ui-session"
+    },
+    {
+      "path": "../../util/workspace-path"
     }
   ]
 }

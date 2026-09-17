@@ -8,9 +8,9 @@
  * tsc-emitted lib/types JavaScript. apps/web's vite build resolves these
  * through their exports maps (`./lib/index.js`) into the static seed chunk.
  *
- * Run from webui/dsh (this file lives inside the vendored tree because tsdown
+ * Run from webui (this file lives inside the vendored tree because tsdown
  * resolves `workspace` globs relative to the config file directory):
- *   pnpm exec tsdown --config ../tools/tsdown.vendor-libs.ts
+ *   pnpm exec tsdown --config tsdown.vendor-libs.ts
  */
 export default {
   workspace: [
@@ -21,6 +21,8 @@ export default {
     'vendor/include',
     'vendor/timer',
     'vendor/loader',
+    'vendor/logger-console',
+    'vendor/hmr',
   ],
   entry: ['lib/types/{index,invariant,startup}.js'],
   outDir: 'lib',

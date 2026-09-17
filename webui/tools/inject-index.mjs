@@ -21,6 +21,8 @@ function renderRow(row) {
     }
     case "script": return { p: row.placement, m: `<script>${row.text}</script>` }
     case "script-src": return { p: row.placement, m: `<script src="${escAttr(row.src)}"></script>` }
+    // Advisory preload for an external classic script (upstream injections.ts).
+    case "script-preload": return { p: "head", m: `<link rel="preload" as="script" href="${escAttr(row.src)}">` }
     case "style": return { p: "head", m: `<style>${row.text}</style>` }
     case "html": return { p: row.placement, m: row.html }
     default: throw new Error(`unknown injection row ${JSON.stringify(row).slice(0, 80)}`)

@@ -81,8 +81,10 @@ extern "c" fn ftell(f: *FILE) clong;
 
 const seek_end: c_int = 2; // SEEK_END
 
-/// Upper bound on any served file (~5 MB). Larger files answer 413.
-pub const max_file_bytes: usize = 5 * 1024 * 1024;
+/// Upper bound on any served file (~16 MB; upstream v0.1.6 bundles reach
+/// ~7 MB, e.g. ui-sidebar-documentpreview's embedded document engine).
+/// Larger files answer 413.
+pub const max_file_bytes: usize = 16 * 1024 * 1024;
 
 /// Default filesystem root for the URL space, resolved against the process
 /// CWD. The vendored DeepSeek Harness GUI lives under webui/dist.
@@ -212,13 +214,19 @@ pub fn contentTypeFor(rel_path: []const u8) []const u8 {
 pub fn handle(ctx: ?*anyopaque, alloc: std.mem.Allocator, req: *const httpd.Request, res: *httpd.Responder) anyerror!void {
     const opts: *const Ctx = if (ctx) |p| @ptrCast(@alignCast(p)) else &default_ctx;
 
+    // Combo route (`/plugins/??a/client.js,b/client.js&rev=X`): the boot graph
+    // addresses plugin bundles through concatenated combo scripts; mirror the
+    // host's ClientModuleRegistry buildComboScript semantics.
+    if (std.mem.startsWith(u8, req.target, "/plugins/??"))
+        return handleCombo(opts, alloc, req, res);
+
+    if (!req.isGetLike()) return sendError(res, .method_not_allowed, "method not allowed");
+
     // Unclaimed URLs belong to the JSON API.
     if (!claims(req.path)) {
         if (opts.fallback) |fb| return fb.call(fb.ctx, alloc, req, res);
         return sendError(res, .not_found, "not found");
     }
-
-    if (!req.isGetLike()) return sendError(res, .method_not_allowed, "method not allowed");
 
     const resolved = resolvePath(alloc, opts.root, req.path) catch |e| switch (e) {
         error.Forbidden => return sendError(res, .forbidden, "forbidden"),
@@ -244,6 +252,136 @@ fn sendError(res: *httpd.Responder, status: httpd.Status, msg: []const u8) void 
     const body = std.fmt.bufPrint(&buf, "{{\"ok\":false,\"error\":\"{s}\"}}", .{msg}) catch
         "{\"ok\":false,\"error\":\"error\"}";
     res.send(status, .json, body) catch {};
+}
+
+// ── combo route (mirrors client-modules buildComboScript semantics) ─────────
+
+/// Upper bound on a composed combo body (a URL-length-partitioned batch can
+/// carry dozens of bundles; 64 MiB is far above any real build).
+const combo_max_bytes: usize = 64 * 1024 * 1024;
+
+/// One parsed combo resource: `@deepseek-ai/<pkg>/client.js[.map]`.
+const ComboResource = struct {
+    /// Filesystem path under the static root (caller-freed).
+    path: []u8,
+    /// True for `<pkg>/client.js.map` requests.
+    is_map: bool,
+};
+
+/// Parse one combo resource into a root-joined file path. Pure validation:
+/// the package prefix must be `@deepseek-ai/`, the payload must end in
+/// `/client.js` (optionally `.map`), and no segment may be empty, ".", "..",
+/// NUL, or backslash. Caller frees the returned path.
+fn comboResourcePath(alloc: std.mem.Allocator, root: []const u8, resource: []const u8) ResolveError!ComboResource {
+    const decoded = try httpd.percentDecode(alloc, resource);
+    var rel = decoded;
+    var is_map = false;
+    if (std.mem.endsWith(u8, rel, ".map")) {
+        is_map = true;
+        rel = rel[0 .. rel.len - 4];
+    }
+    const suffix = "/client.js";
+    if (!std.mem.endsWith(u8, rel, suffix)) return error.InvalidPath;
+    const pkg = rel[0 .. rel.len - suffix.len];
+    if (!std.mem.startsWith(u8, pkg, "@deepseek-ai/")) return error.InvalidPath;
+    try validateSegments(pkg);
+    const path = std.fmt.allocPrint(alloc, "{s}/plugins/{s}/client.js{s}", .{
+        root, pkg, if (is_map) ".map" else "",
+    }) catch return error.OutOfMemory;
+    return .{ .path = path, .is_map = is_map };
+}
+
+/// Serve `/plugins/??<res1>,<res2>,…&rev=<rev>`. Script bodies concatenate each
+/// referenced bundle with upstream's prepareSource semantics (strip the
+/// trailing `//# sourceURL=`/`//# sourceMappingURL=` trailers, guarantee a
+/// final newline, join with `;\n`) and stamp the combo map URL. Single `.map`
+/// requests serve the map file raw; multi-map combos answer 404 (devtools-only
+/// degradation — upstream composes an indexed map there).
+fn handleCombo(opts: *const Ctx, alloc: std.mem.Allocator, req: *const httpd.Request, res: *httpd.Responder) anyerror!void {
+    if (!req.isGetLike()) return sendError(res, .method_not_allowed, "method not allowed");
+    const rest = req.target["/plugins/??".len..];
+    const list = if (std.mem.indexOf(u8, rest, "&rev=")) |i| rest[0..i] else rest;
+    if (list.len == 0) return sendError(res, .not_found, "not found");
+
+    var total: usize = 0;
+    var map_count: usize = 0;
+    var js_count: usize = 0;
+    var bodies: std.ArrayList([]u8) = .empty;
+    defer {
+        for (bodies.items) |b| alloc.free(b);
+        bodies.deinit(alloc);
+    }
+
+    var it = std.mem.splitScalar(u8, list, ',');
+    while (it.next()) |resource| {
+        if (resource.len == 0) return sendError(res, .not_found, "not found");
+        const combo = comboResourcePath(alloc, opts.root, resource) catch |e| switch (e) {
+            error.Forbidden => return sendError(res, .forbidden, "forbidden"),
+            error.InvalidPath => return sendError(res, .not_found, "not found"),
+            error.NotStaticSpace, error.OutOfMemory => return e,
+        };
+        defer alloc.free(combo.path);
+        const raw = readFileCapped(alloc, combo.path) catch |e| switch (e) {
+            error.OpenFailed => return sendError(res, .not_found, "not found"),
+            error.StreamTooLong => return sendError(res, .payload_too_large, "file too large"),
+            error.OutOfMemory => return e,
+        };
+        total += raw.len;
+        if (total > combo_max_bytes) return sendError(res, .payload_too_large, "combo too large");
+        if (combo.is_map) {
+            map_count += 1;
+            bodies.append(alloc, raw) catch return error.OutOfMemory;
+        } else {
+            js_count += 1;
+            const prepared = prepareSource(alloc, raw) catch return error.OutOfMemory;
+            alloc.free(raw);
+            bodies.append(alloc, prepared) catch return error.OutOfMemory;
+        }
+    }
+
+    // Map requests: raw bytes for a single map; composed indexed maps are a
+    // devtools-only nicety upstream builds — 404 keeps the surface honest.
+    if (map_count > 0) {
+        if (js_count > 0 or map_count > 1) return sendError(res, .not_found, "not found");
+        return res.sendRawType(.ok, "application/json; charset=utf-8", bodies.items[0]);
+    }
+
+    // Script composition: `source += prepareSource(...).source + ";\n"` per
+    // resource, then the stamped combo-map trailer.
+    const map_url = std.fmt.allocPrint(alloc, "/plugins/??{s}.map", .{list}) catch return error.OutOfMemory;
+    defer alloc.free(map_url);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    for (bodies.items) |b| {
+        out.appendSlice(alloc, b) catch return error.OutOfMemory;
+        out.appendSlice(alloc, ";\n") catch return error.OutOfMemory;
+    }
+    out.appendSlice(alloc, "//# sourceMappingURL=") catch return error.OutOfMemory;
+    out.appendSlice(alloc, map_url) catch return error.OutOfMemory;
+    out.append(alloc, '\n') catch return error.OutOfMemory;
+    try res.sendRawType(.ok, "text/javascript; charset=utf-8", out.items);
+}
+
+/// Strip the trailing `//# sourceURL=`/`//# sourceMappingURL=` trailer lines
+/// and guarantee one final newline (mirrors client-modules prepareSource).
+fn prepareSource(alloc: std.mem.Allocator, bundle: []const u8) ![]u8 {
+    var source = bundle;
+    while (true) {
+        const trimmed = std.mem.trimEnd(u8, source, "\r\n");
+        const nl = std.mem.lastIndexOfScalar(u8, trimmed, '\n');
+        const last_line = if (nl) |i| trimmed[i + 1 ..] else trimmed;
+        if (std.mem.startsWith(u8, std.mem.trimStart(u8, last_line, " \t"), "//# ")) {
+            source = if (nl) |i| trimmed[0..i] else "";
+            continue;
+        }
+        source = trimmed;
+        break;
+    }
+    const out = try alloc.dupe(u8, source);
+    if (out.len == 0 or out[out.len - 1] != '\n') {
+        return std.mem.concat(alloc, u8, &.{ out, "\n" });
+    }
+    return out;
 }
 
 const ReadError = error{ OpenFailed, StreamTooLong, OutOfMemory };

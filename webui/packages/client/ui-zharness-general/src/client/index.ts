@@ -4,7 +4,10 @@
  * through the shared settings scope and writing scalar overrides through it.
  * Export discipline: packages/client/AGENTS.md.
  */
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+import type { Context as ClientContext } from '@deepseek-ai/cordis'
+// Type-only: pulls the SlotRegistry service merge (ctx.slots) into this
+// program (the old dsh-client-runtime ClientContext carried it).
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 // Type-only: pulls ctx.locale into this program.
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 import { AgentGeneralRow, type AgentGeneralRowInjected } from './AgentGeneralRow.tsx'
