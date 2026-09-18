@@ -1158,6 +1158,7 @@ fn cmdServe(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts, port_
         .promptSession = apxPromptSession,
         .cancelSession = apxCancelSession,
         .renameSession = apxRenameSession,
+        .openPath = apxOpenPath,
         .pluginInventoryList = apxPluginInventoryList,
         .searchSessions = search_rpc.searchSessionsFn,
     };
@@ -1317,6 +1318,31 @@ fn apxSessionHistory(
 }
 
 /// session.create → empty transcript file on disk.
+/// host.openPath seam: open a file/directory with the OS launcher (`open` on
+/// macOS). The path is shell-quoted (single-quote escaping) before popen.
+fn apxOpenPath(ctx: ?*anyopaque, alloc: std.mem.Allocator, path: []const u8) anyerror!void {
+    _ = ctx;
+    const launcher = switch (@import("builtin").os.tag) {
+        .macos => "open",
+        else => "xdg-open",
+    };
+    var cmd: std.ArrayList(u8) = .empty;
+    defer cmd.deinit(alloc);
+    try cmd.appendSlice(alloc, launcher);
+    try cmd.appendSlice(alloc, " '");
+    for (path) |ch| {
+        if (ch == '\'') {
+            try cmd.appendSlice(alloc, "'\\''");
+        } else {
+            try cmd.append(alloc, ch);
+        }
+    }
+    try cmd.appendSlice(alloc, "'");
+    try cmd.append(alloc, 0);
+    const pipe = clib.popen(@ptrCast(cmd.items.ptr), "r") orelse return error.OpenFailed;
+    _ = clib.pclose(pipe);
+}
+
 fn apxCreateSession(
     ctx: ?*anyopaque,
     alloc: std.mem.Allocator,

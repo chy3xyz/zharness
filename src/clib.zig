@@ -8,8 +8,8 @@ const std = @import("std");
 
 pub const FILE = std.c.FILE;
 
-extern fn popen(command: [*:0]const u8, mode: [*:0]const u8) ?*FILE;
-extern fn pclose(stream: *FILE) c_int;
+pub extern fn popen(command: [*:0]const u8, mode: [*:0]const u8) ?*FILE;
+pub extern fn pclose(stream: *FILE) c_int;
 
 /// Read one line from stdin (fd 0) without the trailing newline. Caller owns
 /// the returned slice. Returns `null` at EOF with no data read. Uses the
