@@ -2328,6 +2328,8 @@ pub fn dispatch(
 
     // plugin inventory (Plugins-settings inventory tab; upstream wire method
     // keeps its slash form — the typert gateway composes namespace/method)
+    // v0.1.6 gateway sends slash-form; accept the normalized dot form too.
+    if (std.mem.eql(u8, m, "pluginInventory.list")) return run(alloc, env, hPluginInventoryList(deps, alloc, env.rpc_id, p));
     if (std.mem.eql(u8, m, "pluginInventory/list")) return run(alloc, env, hPluginInventoryList(deps, alloc, env.rpc_id, p));
 
     // dynamic cordis domain (P3 runtime: browser-half host endpoints)

@@ -36,7 +36,7 @@ const wasm_loader = @import("../../pluginabi/wasm_loader.zig");
 const builtin_catalog = @import("../../pluginabi/builtin_catalog.zig");
 
 /// One inventory row already projected into wire vocabulary.
-const Entry = struct {
+pub const Entry = struct {
     entry_id: []const u8,
     module_name: []const u8,
     enabled: bool,
@@ -50,6 +50,33 @@ const Entry = struct {
 /// `home` is injected explicitly (not read from the environment) so callers
 /// — and tests — can isolate the scanned set. Pass the real user home for
 /// production; pass a temp dir to assert empty/controlled inventories.
+/// Append one entry per id in the boot manifest's top-level `"roster":[…]`
+/// array — the vendored dsh client plugins the GUI loads (v0.1.6). Malformed
+/// content degrades to zero entries; the tab simply shows the native rows.
+pub fn appendRosterEntries(alloc: std.mem.Allocator, entries: *std.ArrayList(Entry), manifest: []const u8) !void {
+    const roster_key = "\"roster\"";
+    const rki = std.mem.indexOf(u8, manifest, roster_key) orelse return;
+    var pos = rki + roster_key.len;
+    while (pos < manifest.len and (manifest[pos] == ' ' or manifest[pos] == ':' or manifest[pos] == '\n' or manifest[pos] == '\r' or manifest[pos] == '\t')) : (pos += 1) {}
+    if (pos >= manifest.len or manifest[pos] != '[') return;
+    pos += 1;
+    while (pos < manifest.len) {
+        while (pos < manifest.len and (manifest[pos] == ' ' or manifest[pos] == ',' or manifest[pos] == '\n' or manifest[pos] == '\r')) : (pos += 1) {}
+        if (pos >= manifest.len or manifest[pos] != '"') break;
+        const start = pos + 1;
+        const end = std.mem.indexOfScalarPos(u8, manifest, start, '"') orelse break;
+        const id = manifest[start..end];
+        pos = end + 1;
+        if (id.len == 0) continue;
+        try entries.append(alloc, .{
+            .entry_id = try alloc.dupe(u8, id),
+            .module_name = try alloc.dupe(u8, id),
+            .enabled = true,
+            .fiber_phase = "active",
+        });
+    }
+}
+
 pub fn listValue(alloc: std.mem.Allocator, io: std.Io, cwd: []const u8, home: []const u8) ![]u8 {
     var entries: std.ArrayList(Entry) = .empty;
     errdefer entries.deinit(alloc);
@@ -67,6 +94,14 @@ pub fn listValue(alloc: std.mem.Allocator, io: std.Io, cwd: []const u8, home: []
             .fiber_phase = b.fiber_phase,
         });
     }
+
+    // Vendored dsh client plugins (v0.1.6): the boot manifest's roster names
+    // every client plugin the GUI loads — they ARE the plugin inventory the
+    // settings tab is about. Served as active loader entries.
+    if (std.Io.Dir.readFileAlloc(.cwd(), io, "webui/build-artifacts/boot-manifest.json", alloc, .limited(4 * 1024 * 1024))) |manifest| {
+        defer alloc.free(manifest);
+        try appendRosterEntries(alloc, &entries, manifest);
+    } else |_| {}
 
     var reg = loader.PluginRegistry.init(alloc);
     defer reg.deinit();
