@@ -145,6 +145,7 @@ class UiWorkspaceService extends Service implements UiWorkspace {
     const navigation = AbortSignal.any([this.ctx.layout.beginNavigation(), this.lifetime.signal])
     const isCurrent = (): boolean => !navigation.aborted
     const sessionId = await this.connectWorkspace(workspaceId)
+    console.error('ZDEBUG openWorkspace resolved sessionId=', sessionId, 'current=', isCurrent())
     if (!isCurrent()) return
     beforeOpen?.(sessionId)
     if (isCurrent()) this.openSession(sessionId)

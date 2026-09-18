@@ -929,6 +929,11 @@ fn sessionCreateAndAnnounce(deps: *const ApiProxyDeps, alloc: std.mem.Allocator,
     const proj_frame = std.fmt.allocPrint(alloc, "{{\"type\":\"projection\",\"sessionId\":{s},\"key\":\"modelSelection\",\"value\":{{\"lastUsed\":{{\"provider\":\"deepseek\",\"model\":\"deepseek-v4-flash\"}},\"pending\":null}},\"seq\":1}}", .{ sid_j2.items }) catch return resp;
     defer alloc.free(proj_frame);
     remote_mux.publishControlRaw(proj_frame);
+
+    // Workspace membership: the created session joins the single workspace;
+    // workspace.follow streams receive the refreshed upsert so the picker
+    // chip resolves and the composer binds.
+    remote_mux.publishWorkspaceUpsertFromDir(alloc);
     return resp;
 }
 
@@ -2278,6 +2283,11 @@ pub fn dispatch(
     if (std.mem.eql(u8, m, "agentPreset.list")) return run(alloc, env, presets_rpc.handleList(deps, alloc, env.rpc_id));
     if (std.mem.eql(u8, m, "agentPreset.select")) return run(alloc, env, presets_rpc.handleSelect(deps, alloc, env.rpc_id, p));
     // v0.1.6 client namespaces (plural) — same handlers, alias dispatch.
+    // Permission-preset catalog (vendored ui-permission-presets): zharness
+    // exposes its sandbox levels as the selectable presets; `custom` derives
+    // client-side when live settings diverge.
+    if (std.mem.eql(u8, m, "permissionPresets.catalog"))
+        return run(alloc, env, okValue(alloc, env.rpc_id, try perms_rpc.catalogJson(alloc)));
     if (std.mem.eql(u8, m, "agentPresets.list")) return run(alloc, env, presets_rpc.handleList(deps, alloc, env.rpc_id));
     if (std.mem.eql(u8, m, "agentPresets.select")) return run(alloc, env, presets_rpc.handleSelect(deps, alloc, env.rpc_id, p));
     if (std.mem.eql(u8, m, "subagents.list")) {

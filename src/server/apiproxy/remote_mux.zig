@@ -185,7 +185,9 @@ pub fn sendWorkspaceBaseline(alloc: std.mem.Allocator, s: *Stream) void {
     var path_json: std.ArrayList(u8) = .empty;
     defer path_json.deinit(alloc);
     jsonx.appendJsonString(alloc, &path_json, path) catch return;
-    const value = std.fmt.allocPrint(alloc, "{{\"type\":\"baseline\",\"value\":{{\"items\":[{{\"workspaceId\":\"ws-zharness\",\"path\":{s},\"title\":\"zharness\",\"sessionIds\":[],\"createdAt\":\"2026-01-01T00:00:00.000Z\",\"updatedAt\":\"2026-01-01T00:00:00.000Z\"}}],\"archivedSessionIds\":[]}}}}", .{path_json.items}) catch return;
+    const ids_json = sessionIdsJson(alloc) catch return;
+    defer alloc.free(ids_json);
+    const value = std.fmt.allocPrint(alloc, "{{\"type\":\"baseline\",\"value\":{{\"items\":[{{\"workspaceId\":\"ws-zharness\",\"path\":{s},\"title\":\"zharness\",\"sessionIds\":{s},\"createdAt\":\"2026-01-01T00:00:00.000Z\",\"updatedAt\":\"2026-01-01T00:00:00.000Z\"}}],\"archivedSessionIds\":[]}}}}", .{ path_json.items, ids_json }) catch return;
     defer alloc.free(value);
     sendItem(alloc, s, value);
 }
@@ -226,6 +228,96 @@ pub fn publishControlRaw(frame_json: []const u8) void {
         const item = std.fmt.allocPrint(c_alloc, "{{\"type\":\"item\",\"streamId\":{s},\"value\":{s}}}", .{ id_json.items, frame_json }) catch continue;
         defer c_alloc.free(item);
         s.conn.writeText(item) catch {};
+    }
+}
+
+/// Publish one workspace.follow increment frame to every workspace stream.
+/// `value_json` is the WorkspaceFollowIncrement object verbatim.
+pub fn publishWorkspaceIncrement(alloc: std.mem.Allocator, value_json: []const u8) void {
+    _ = alloc;
+    var id_json: std.ArrayList(u8) = .empty;
+    defer id_json.deinit(c_alloc);
+
+    lock();
+    defer unlock();
+    for (g_streams.items) |s| {
+        if (s.kind != .workspace) continue;
+        id_json.clearRetainingCapacity();
+        jsonx.appendJsonString(c_alloc, &id_json, s.stream_id) catch continue;
+        const frame = std.fmt.allocPrint(c_alloc, "{{\"type\":\"item\",\"streamId\":{s},\"value\":{s}}}", .{ id_json.items, value_json }) catch continue;
+        defer c_alloc.free(frame);
+        s.conn.writeText(frame) catch {};
+    }
+}
+
+// ── workspace membership (single-cwd host model) ────────────────────────────
+
+const CDirIterator = struct {
+    dir: ?*std.c.DIR,
+
+    fn init(path: []const u8) ?CDirIterator {
+        var buf: [512]u8 = undefined;
+        if (path.len > buf.len - 1) return null;
+        @memcpy(buf[0..path.len], path);
+        buf[path.len] = 0;
+        const d = std.c.opendir(@ptrCast(&buf)) orelse return null;
+        return .{ .dir = d };
+    }
+    fn deinit(self: *CDirIterator) void {
+        if (self.dir) |d| _ = std.c.closedir(d);
+        self.dir = null;
+    }
+    fn next(self: *CDirIterator) ?[]const u8 {
+        const entry = std.c.readdir(self.dir orelse return null) orelse return null;
+        return std.mem.span(@as([*:0]const u8, @ptrCast(entry)));
+    }
+};
+
+/// Session ids (JSON array) for the workspace view: every session file under
+/// `<cwd>/.zharness/sessions` (index.json excluded). Caller owns the memory.
+fn sessionIdsJson(alloc: std.mem.Allocator) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '[');
+    var it = CDirIterator.init(".zharness/sessions") orelse {
+        try out.append(alloc, ']');
+        return out.toOwnedSlice(alloc);
+    };
+    defer it.deinit();
+    var first = true;
+    while (it.next()) |name| {
+        if (!std.mem.endsWith(u8, name, ".json")) continue;
+        if (std.mem.eql(u8, name, "index.json")) continue;
+        if (!first) try out.append(alloc, ',');
+        first = false;
+        const stem = name[0 .. name.len - 5];
+        try out.append(alloc, '"');
+        try out.appendSlice(alloc, stem);
+        try out.append(alloc, '"');
+    }
+    try out.append(alloc, ']');
+    return out.toOwnedSlice(alloc);
+}
+
+/// workspace.follow upsert increment: the synthesized workspace with its
+/// CURRENT member list. Broadcast after every session.create so connected
+/// pages see workspace.sessionIds grow (the picker/composer gate reads it).
+pub fn publishWorkspaceUpsertFromDir(alloc: std.mem.Allocator) void {
+    const ids = sessionIdsJson(alloc) catch return;
+    defer alloc.free(ids);
+
+    var id_json: std.ArrayList(u8) = .empty;
+    defer id_json.deinit(c_alloc);
+
+    lock();
+    defer unlock();
+    for (g_streams.items) |s| {
+        if (s.kind != .workspace) continue;
+        id_json.clearRetainingCapacity();
+        jsonx.appendJsonString(c_alloc, &id_json, s.stream_id) catch continue;
+        const frame = std.fmt.allocPrint(c_alloc, "{{\"type\":\"item\",\"streamId\":{s},\"value\":{{\"type\":\"upsert\",\"workspace\":{{\"workspaceId\":\"ws-zharness\",\"path\":\".\",\"title\":\"zharness\",\"sessionIds\":{s},\"createdAt\":\"2026-01-01T00:00:00.000Z\",\"updatedAt\":\"2026-01-01T00:00:00.000Z\"}}}}}}", .{ id_json.items, ids }) catch continue;
+        defer c_alloc.free(frame);
+        s.conn.writeText(frame) catch {};
     }
 }
 

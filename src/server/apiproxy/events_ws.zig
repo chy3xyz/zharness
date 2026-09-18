@@ -420,6 +420,10 @@ pub fn serveRemoteMux(alloc: std.mem.Allocator, conn: *httpd.WsConn) anyerror!vo
                     owned.appendSlice(alloc, stream_id) catch continue;
                     owned.append(alloc, 0) catch continue;
                     remote_mux.sendWorkspaceBaseline(alloc, s);
+                    // Follow-up increment: the sessions directory grew since
+                    // boot (or the baseline was pre-creation); re-scan and
+                    // push the upsert so workspace.sessionIds is current.
+                    remote_mux.publishWorkspaceUpsertFromDir(alloc);
                 } else {
                     sendStreamError(alloc, conn, stream_id, "unavailable", "zharness: remote stream endpoint is not implemented yet");
                 }

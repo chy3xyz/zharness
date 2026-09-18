@@ -137,6 +137,26 @@ pub fn appendNamespaceViewJson(alloc: std.mem.Allocator, out: *std.ArrayList(u8)
 // ── write-path helpers (called from the router intercepts) ─────────────────
 
 /// Validate one defaultPreset candidate against the table.
+/// PermissionPresetsCatalog JSON ({options:[{value,name,description?},…]})
+/// over the preset table, in declaration order (upstream optionOf shape).
+pub fn catalogJson(alloc: std.mem.Allocator) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"options\":[");
+    for (&table, 0..) |*r, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try out.appendSlice(alloc, "{\"value\":");
+        try jsonx.appendJsonString(alloc, &out, r.id);
+        try out.appendSlice(alloc, ",\"name\":");
+        try jsonx.appendJsonString(alloc, &out, r.id);
+        try out.appendSlice(alloc, ",\"description\":");
+        try jsonx.appendJsonString(alloc, &out, r.description);
+        try out.append(alloc, '}');
+    }
+    try out.appendSlice(alloc, "]}");
+    return out.toOwnedSlice(alloc);
+}
+
 pub fn validPreset(id: []const u8) bool {
     return sandboxForPreset(id) != null;
 }
