@@ -269,7 +269,9 @@ const CDirIterator = struct {
     }
     fn next(self: *CDirIterator) ?[]const u8 {
         const entry = std.c.readdir(self.dir orelse return null) orelse return null;
-        return std.mem.span(@as([*:0]const u8, @ptrCast(entry)));
+        // macOS dirent: d_name sits at a non-zero offset inside the struct.
+        const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&entry.*.name)), 0);
+        return name;
     }
 };
 
@@ -305,6 +307,8 @@ fn sessionIdsJson(alloc: std.mem.Allocator) ![]u8 {
 pub fn publishWorkspaceUpsertFromDir(alloc: std.mem.Allocator) void {
     const ids = sessionIdsJson(alloc) catch return;
     defer alloc.free(ids);
+    if (std.c.getenv("ZH_DEBUG_RPC") != null)
+        std.debug.print("[ws-upsert] sessionIds={s}\n", .{ids});
 
     var id_json: std.ArrayList(u8) = .empty;
     defer id_json.deinit(c_alloc);

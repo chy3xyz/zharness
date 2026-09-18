@@ -366,7 +366,7 @@ pub const Responder = struct {
         self.responded = true;
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(self.alloc);
-        try out.print(self.alloc, "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{
+        try out.print(self.alloc, "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n", .{
             status.code(), status.reason(), content_type, body.len,
         });
         try out.appendSlice(self.alloc, body);
