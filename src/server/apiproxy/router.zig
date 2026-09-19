@@ -85,6 +85,12 @@ pub const RpcCode = enum {
     workspace_not_found,
     workspace_invalid_path,
     directory_picker_unavailable,
+    /// directoryPicker/createDirectory named an existing directory —
+    /// upstream `directory-picker/exists`.
+    directory_picker_exists,
+    /// directoryPicker/createDirectory mkdir failed — upstream
+    /// `directory-picker/create-failed`.
+    directory_picker_create_failed,
     /// settings write rejected (validation / read-only credential) —
     /// upstream `settings-rejected` (settings.ts SettingsApi docs).
     settings_rejected,
@@ -111,6 +117,8 @@ pub const RpcCode = enum {
             .workspace_not_found => "workspace-not-found",
             .workspace_invalid_path => "workspace-invalid-path",
             .directory_picker_unavailable => "directory-picker-unavailable",
+            .directory_picker_exists => "directory-picker/exists",
+            .directory_picker_create_failed => "directory-picker/create-failed",
             .settings_rejected => "settings-rejected",
             .settings_conflict => "settings-conflict",
             .model_unavailable => "model-unavailable",
@@ -489,7 +497,7 @@ pub fn errValue(
 }
 
 /// bad-request error with empty issues array (payload validation failures).
-fn badRequest(alloc: std.mem.Allocator, rpc_id: []const u8, message: []const u8) !UnaryResponse {
+pub fn badRequest(alloc: std.mem.Allocator, rpc_id: []const u8, message: []const u8) !UnaryResponse {
     return errValue(alloc, rpc_id, .bad_request, message, "{\"issues\":[]}");
 }
 
@@ -623,7 +631,7 @@ pub fn parseEnvelope(alloc: std.mem.Allocator, body: []const u8) EnvelopeError!?
 const PayloadError = error{ PayloadInvalid, OutOfMemory };
 
 /// Required non-empty JSON string field, decoded into `alloc`.
-fn reqString(alloc: std.mem.Allocator, payload: []const u8, key: []const u8) PayloadError![]const u8 {
+pub fn reqString(alloc: std.mem.Allocator, payload: []const u8, key: []const u8) PayloadError![]const u8 {
     const raw = jsonx.getRaw(payload, key) orelse return error.PayloadInvalid;
     if (!jsonx.isString(raw)) return error.PayloadInvalid;
     return jsonx.decodeString(alloc, raw[1 .. raw.len - 1]) catch return error.OutOfMemory;
@@ -752,24 +760,81 @@ fn wsListDefault(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: []
     return okValue(alloc, rpc_id, value.items);
 }
 
+/// Deterministic workspace id for an adopted directory path (stable across
+/// restarts so the persisted list can re-register under the same ids).
+pub fn workspaceIdFor(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
+    return std.fmt.allocPrint(alloc, "ws-{x:0>16}", .{std.hash.Wyhash.hash(0, path)});
+}
+
 fn wsCreateDefault(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8) !UnaryResponse {
     const path = (try optString(alloc, payload, "path")) orelse return error.PayloadInvalid;
+    var ws_id: []const u8 = default_workspace_id;
+    var ws_path: []const u8 = deps.cwd;
     if (!std.mem.eql(u8, path, deps.cwd)) {
-        // v1 has exactly one adoptable directory: the server cwd.
-        var d: std.ArrayList(u8) = .empty;
-        defer d.deinit(alloc);
-        try d.appendSlice(alloc, "{\"path\":");
-        try jsonx.appendJsonString(alloc, &d, path);
-        try d.appendSlice(alloc, "}");
-        return errValue(alloc, rpc_id, .workspace_invalid_path, "only the server cwd can be adopted in v1", d.items);
+        // Adopt an existing directory as an additional (organizational)
+        // workspace: sessions keep running at the server root, but the
+        // picker/sidebar group under the chosen directory.
+        if (path.len == 0 or path[0] != '/') {
+            var d: std.ArrayList(u8) = .empty;
+            defer d.deinit(alloc);
+            try d.appendSlice(alloc, "{\"path\":");
+            try jsonx.appendJsonString(alloc, &d, path);
+            try d.appendSlice(alloc, "}");
+            return errValue(alloc, rpc_id, .workspace_invalid_path, "workspace path must be absolute", d.items);
+        }
+        const dp = @import("directory_picker_rpc.zig");
+        if (!dp.isDirectory(path)) {
+            var d: std.ArrayList(u8) = .empty;
+            defer d.deinit(alloc);
+            try d.appendSlice(alloc, "{\"path\":");
+            try jsonx.appendJsonString(alloc, &d, path);
+            try d.appendSlice(alloc, "}");
+            return errValue(alloc, rpc_id, .workspace_invalid_path, "workspace directory does not exist", d.items);
+        }
+        ws_id = try workspaceIdFor(alloc, path);
+        ws_path = path;
+        remote_mux.addExtraWorkspace(ws_id, path, basename(path)) catch {};
+        persistAdoptedWorkspace(deps, alloc, path) catch {};
     }
     var value: std.ArrayList(u8) = .empty;
     errdefer value.deinit(alloc);
     const now = nowMs();
     try value.appendSlice(alloc, "{\"workspace\":");
-    try appendWorkspaceViewJson(alloc, &value, default_workspace_id, deps.cwd, basename(deps.cwd), &.{}, now, now);
-    try value.appendSlice(alloc, ",\"created\":false}");
+    try appendWorkspaceViewJson(alloc, &value, ws_id, ws_path, basename(ws_path), &.{}, now, now);
+    try value.appendSlice(alloc, ",\"created\":");
+    try value.appendSlice(alloc, if (std.mem.eql(u8, ws_id, default_workspace_id)) "false" else "true");
+    try value.append(alloc, '}');
     return okValue(alloc, rpc_id, value.items);
+}
+
+/// Persist one adopted workspace path into config.toml
+/// ([workspaces] adopted = ["…", …]) so restarts restore the list.
+fn persistAdoptedWorkspace(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, path: []const u8) !void {
+    const store = settingsStoreOf(deps.home) orelse return;
+    const doc = store.readDoc(alloc) catch return;
+    var adopted: std.ArrayList(u8) = .empty;
+    defer adopted.deinit(alloc);
+    try adopted.append(alloc, '[');
+    if (doc) |d| {
+        const entries = config.parseTomlFlat(alloc, d) catch null;
+        if (entries) |list| {
+            for (list) |e| {
+                if (!std.mem.eql(u8, e.section, "workspaces") or !std.mem.eql(u8, e.key, "adopted")) continue;
+                if (e.val != .str) continue;
+                if (adopted.items.len > 1) try adopted.append(alloc, ',');
+                try jsonx.appendJsonString(alloc, &adopted, e.val.str);
+            }
+        }
+    }
+    if (adopted.items.len > 1) try adopted.append(alloc, ',');
+    try jsonx.appendJsonString(alloc, &adopted, path);
+    try adopted.append(alloc, ']');
+    var revision: u64 = 0;
+    commitCustomKv(store, alloc, .{
+        .section = "workspaces",
+        .key = "adopted",
+        .value = .{ .raw = adopted.items },
+    }, &revision, null) catch {};
 }
 
 fn wsViewDefault(deps: *const ApiProxyDeps, alloc: std.mem.Allocator) ![]u8 {
@@ -2377,6 +2442,8 @@ pub fn dispatch(
     // workspace domain (built-in single-workspace defaults)
     if (std.mem.eql(u8, m, "workspace.list")) return run(alloc, env, wsListDefault(deps, alloc, env.rpc_id));
     if (std.mem.eql(u8, m, "workspace.create")) return run(alloc, env, wsCreateDefault(deps, alloc, env.rpc_id, p));
+    if (std.mem.eql(u8, m, "directoryPicker.list")) return run(alloc, env, @import("directory_picker_rpc.zig").handleList(deps, alloc, env.rpc_id, p));
+    if (std.mem.eql(u8, m, "directoryPicker.createDirectory")) return run(alloc, env, @import("directory_picker_rpc.zig").handleCreateDirectory(deps, alloc, env.rpc_id, p));
     if (std.mem.eql(u8, m, "workspace.rename")) return run(alloc, env, wsRenameDefault(deps, alloc, env.rpc_id, p));
     if (std.mem.eql(u8, m, "workspace.delete")) return run(alloc, env, wsDeleteDefault(alloc, env.rpc_id, p));
     if (std.mem.eql(u8, m, "workspace.insertBefore")) return run(alloc, env, wsInsertBeforeDefault(alloc, env.rpc_id, p));

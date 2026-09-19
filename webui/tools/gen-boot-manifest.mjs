@@ -73,6 +73,9 @@ const ROSTER = [
   '@deepseek-ai/dsh-client-ui-chat',
   '@deepseek-ai/dsh-client-ui-tool',
   '@deepseek-ai/dsh-client-ui-workspace',
+  // workspace picker's 新增工作区 flow (browse capability: backed by
+  // directoryPicker/list + directoryPicker/createDirectory on the server)
+  '@deepseek-ai/dsh-client-ui-directory-picker-browse',
   '@deepseek-ai/dsh-client-ui-input-trigger',
   // zharness: General-page rows over the agent namespace (config.toml knobs)
   '@deepseek-ai/dsh-client-ui-zharness-general',

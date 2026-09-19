@@ -624,6 +624,25 @@ fn obsEmit(kind: agent.AgentLoop.EventKind, payload: []const u8) void {
 
 // ── loop extensions: skills / memory / plan / goal (dev.md §XIII–XVII) ─────
 
+/// Re-register the workspaces adopted in earlier runs: config.toml
+/// [workspaces] adopted = ["<abs path>", …] → remote.mux baseline rows
+/// under deterministic ws-<hash> ids.
+fn restoreAdoptedWorkspaces(alloc: std.mem.Allocator, home: []const u8) !void {
+    if (home.len == 0) return;
+    const cfg_path = try std.fmt.allocPrint(alloc, "{s}/.zharness/config.toml", .{home});
+    defer alloc.free(cfg_path);
+    const doc = std.Io.Dir.readFileAlloc(.cwd(), g_io orelse return, cfg_path, alloc, .unlimited) catch return;
+    defer alloc.free(doc);
+    const entries = (config.parseTomlFlat(alloc, doc) catch return) orelse return;
+    for (entries) |e| {
+        if (!std.mem.eql(u8, e.section, "workspaces") or !std.mem.eql(u8, e.key, "adopted")) continue;
+        if (e.val != .str) continue;
+        const id = try apiproxy.workspaceIdFor(alloc, e.val.str);
+        defer alloc.free(id);
+        remote_mux.addExtraWorkspace(id, e.val.str, std.fs.path.basename(e.val.str)) catch continue;
+    }
+}
+
 fn homeDir() ?[]const u8 {
     const p = std.c.getenv("HOME") orelse return null;
     const h = std.mem.span(p);
@@ -1258,6 +1277,10 @@ fn cmdServe(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts, port_
     apx_state.* = .{ .alloc = alloc, .cfg = cfg, .opts = opts, .ov = ov };
     g_apx_state = apx_state;
     _ = search_rpc.installDefault(cfg.cwd) catch {};
+
+    // Restore workspaces adopted in earlier runs (config.toml
+    // [workspaces] adopted = ["…"]) into the remote.mux workspace baseline.
+    restoreAdoptedWorkspaces(alloc, homeDir() orelse "") catch {};
 
     // dsh apiproxy surface (spec §4): unary RPC + WS event streams.
     const apx_deps = try alloc.create(apiproxy.ApiProxyDeps);

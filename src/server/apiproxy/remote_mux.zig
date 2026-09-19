@@ -200,6 +200,8 @@ pub fn publishControl(alloc: std.mem.Allocator, value_json: []const u8) void {
 
 /// Send the workspace.follow opening baseline: one synthesized Workspace
 /// covering the server cwd (zharness has a single implicit workspace).
+/// Send the workspace.follow opening baseline: the root workspace (server
+/// cwd, every session) plus directories adopted through workspace.create.
 pub fn sendWorkspaceBaseline(alloc: std.mem.Allocator, s: *Stream) void {
     // CWD via getcwd(3): std.process lost getCwdAlloc in this toolchain
     // generation and events_ws carries no Io handle.
@@ -215,9 +217,63 @@ pub fn sendWorkspaceBaseline(alloc: std.mem.Allocator, s: *Stream) void {
     jsonx.appendJsonString(alloc, &path_json, path) catch return;
     const ids_json = sessionIdsJson(alloc) catch return;
     defer alloc.free(ids_json);
-    const value = std.fmt.allocPrint(alloc, "{{\"type\":\"baseline\",\"value\":{{\"items\":[{{\"workspaceId\":\"ws-zharness\",\"path\":{s},\"title\":\"zharness\",\"sessionIds\":{s},\"createdAt\":\"2026-01-01T00:00:00.000Z\",\"updatedAt\":\"2026-01-01T00:00:00.000Z\"}}],\"archivedSessionIds\":[]}}}}", .{ path_json.items, ids_json }) catch return;
+
+    lock();
+    defer unlock();
+    var items: std.ArrayList(u8) = .empty;
+    defer items.deinit(alloc);
+    items.appendSlice(alloc, "[{") catch return;
+    items.appendSlice(alloc, "\"workspaceId\":\"ws-zharness\",\"path\":") catch return;
+    items.appendSlice(alloc, path_json.items) catch return;
+    items.appendSlice(alloc, ",\"title\":\"zharness\",\"sessionIds\":") catch return;
+    items.appendSlice(alloc, ids_json) catch return;
+    items.appendSlice(alloc, ",\"createdAt\":\"2026-01-01T00:00:00.000Z\",\"updatedAt\":\"2026-01-01T00:00:00.000Z\"}") catch return;
+    for (g_extra_ws.items) |e| {
+        var p_json: std.ArrayList(u8) = .empty;
+        defer p_json.deinit(alloc);
+        jsonx.appendJsonString(alloc, &p_json, e.path) catch continue;
+        items.appendSlice(alloc, ",{\"workspaceId\":") catch return;
+        jsonx.appendJsonString(alloc, &items, e.id) catch return;
+        items.appendSlice(alloc, ",\"path\":") catch return;
+        items.appendSlice(alloc, p_json.items) catch return;
+        items.appendSlice(alloc, ",\"title\":") catch return;
+        jsonx.appendJsonString(alloc, &items, e.title) catch return;
+        items.appendSlice(alloc, ",\"sessionIds\":[],\"createdAt\":\"2026-01-01T00:00:00.000Z\",\"updatedAt\":\"2026-01-01T00:00:00.000Z\"}") catch return;
+    }
+    items.appendSlice(alloc, "],\"archivedSessionIds\":[]") catch return;
+
+    const value = std.fmt.allocPrint(alloc, "{{\"type\":\"baseline\",\"value\":{{\"items\":{s},\"archivedSessionIds\":[]}}}}", .{items.items}) catch return;
     defer alloc.free(value);
     sendItem(alloc, s, value);
+}
+
+/// One workspace adopted at runtime through workspace.create (beyond the
+/// single root workspace). Process-lifetime rows; registered at boot from
+/// config.toml's persisted adopted list and appended by the router.
+const ExtraWs = struct { id: []u8, path: []u8, title: []u8 };
+var g_extra_ws: std.ArrayListUnmanaged(ExtraWs) = .empty;
+
+/// Register an adopted workspace (idempotent by path). Called with the
+/// server's config lock held by callers — no dedicated lock here.
+pub fn addExtraWorkspace(id: []const u8, path: []const u8, title: []const u8) !void {
+    for (g_extra_ws.items) |e| {
+        if (std.mem.eql(u8, e.path, path)) return;
+    }
+    try g_extra_ws.append(c_alloc, .{
+        .id = try c_alloc.dupe(u8, id),
+        .path = try c_alloc.dupe(u8, path),
+        .title = try c_alloc.dupe(u8, title),
+    });
+}
+
+/// Snapshot of the adopted list for boot restoration ({id,path} pairs are
+/// recomputed by callers — this only reports the persisted paths).
+pub fn extraWorkspacePaths(alloc: std.mem.Allocator) ![][]const u8 {
+    lock();
+    defer unlock();
+    const out = try alloc.alloc([]const u8, g_extra_ws.items.len);
+    for (g_extra_ws.items, 0..) |e, i| out[i] = e.path;
+    return out;
 }
 
 /// Forward one Gateway-internal event/waterfall frame value to every
