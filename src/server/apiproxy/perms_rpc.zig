@@ -47,17 +47,17 @@ pub const table = [_]Row{
     .{
         .id = "read-only",
         .sandbox_mode = "native",
-        .description = "OS-native confinement for inspection-only sessions; no writes.",
+        .description = "Read-only, no writes",
     },
     .{
         .id = "workspace-write",
         .sandbox_mode = "process",
-        .description = "Write inside the workspace and permitted temporary directories; wider retries require approval.",
+        .description = "Writes inside the workspace only",
     },
     .{
         .id = "danger-full-access",
         .sandbox_mode = "none",
-        .description = "Full file access without approval prompts.",
+        .description = "Full access, no approvals",
     },
 };
 
@@ -122,7 +122,7 @@ pub fn currentPresetOf(entries: ?[]const config.TomlEntry) []const u8 {
 /// The top-level uid names the ROOT ref (Schemastery's fromJSON returns
 /// refs[uid]); a uid absent from refs rehydrates to undefined.
 const schema_permission =
-    \\{"uid":5,"refs":{"1":{"type":"const","meta":{"required":true,"description":"OS-native confinement for inspection-only sessions; no writes."},"value":"read-only"},"2":{"type":"const","meta":{"required":true,"description":"Write inside the workspace and permitted temporary directories; wider retries require approval."},"value":"workspace-write"},"3":{"type":"const","meta":{"required":true,"description":"Full file access without approval prompts."},"value":"danger-full-access"},"4":{"type":"union","meta":{"default":"workspace-write"},"list":[1,2,3]},"5":{"type":"object","meta":{"default":{}},"dict":{"defaultPreset":4}}}}
+    \\{"uid":5,"refs":{"1":{"type":"const","meta":{"required":true,"description":"Read-only, no writes"},"value":"read-only"},"2":{"type":"const","meta":{"required":true,"description":"Writes inside the workspace only"},"value":"workspace-write"},"3":{"type":"const","meta":{"required":true,"description":"Full access, no approvals"},"value":"danger-full-access"},"4":{"type":"union","meta":{"default":"workspace-write"},"list":[1,2,3]},"5":{"type":"object","meta":{"default":{}},"dict":{"defaultPreset":4}}}}
 ;
 
 pub fn appendNamespaceViewJson(alloc: std.mem.Allocator, out: *std.ArrayList(u8), revision: u64, current: []const u8) !void {
