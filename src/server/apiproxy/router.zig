@@ -1565,7 +1565,12 @@ fn hCredentialsDescribe(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, rpc
     if (!isJsonArrayRaw(refs_raw)) return error.PayloadInvalid;
     var value: std.ArrayList(u8) = .empty;
     errdefer value.deinit(alloc);
-    try value.appendSlice(alloc, "{\"credentials\":{");
+    // Browser-wire shape: the vendored credentials Remote face declares
+    // describe(refs) → Record<string, CredentialInfo> — a BARE map. (The
+    // {credentials:…} wrapper belongs to the upstream host's own RPC layer,
+    // which the browser never sees; wrapping here left every row looking
+    // unconfigured, so the Models page re-prompted for a saved key.)
+    try value.append(alloc, '{');
     const inner = refs_raw[1 .. refs_raw.len - 1];
     var it = std.mem.splitScalar(u8, inner, ',');
     var first = true;
@@ -1594,7 +1599,7 @@ fn hCredentialsDescribe(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, rpc
         try value.appendSlice(alloc, if (st.writable) "true" else "false");
         try value.append(alloc, '}');
     }
-    try value.appendSlice(alloc, "}}");
+    try value.append(alloc, '}');
     return okValue(alloc, rpc_id, value.items);
 }
 
