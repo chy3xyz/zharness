@@ -82,6 +82,9 @@ fn jsonEsc(alloc: std.mem.Allocator, s: []const u8) ?[]u8 {
 // follow stream's cursor continuity holds.
 
 var g_tool_call_seq = std.atomic.Value(u64).init(1);
+/// Unique-per-message id counter: the client fold keys message identity by
+/// id, so repeated ids collapse distinct turns into one node.
+var g_msg_n = std.atomic.Value(u64).init(1);
 var g_current_call_id: [32]u8 = undefined;
 var g_current_call_id_len: usize = 0;
 var g_current_step: u64 = 0;
@@ -324,8 +327,8 @@ fn onEvent(kind: agent.AgentLoop.EventKind, payload: []const u8) void {
                 // so the client can merge streaming chunks with the final message.
                 const msg_data = std.fmt.allocPrint(
                     gpaAlloc(),
-                    "{{\"turn\":1,\"step\":{d},\"message\":{{\"id\":\"a-live\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":{s}}}],\"source\":{{\"kind\":\"model\"}}}},\"stream\":[]}}",
-                    .{ g_current_step, t },
+                    "{{\"turn\":1,\"step\":{d},\"message\":{{\"id\":\"a-{d}\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":{s}}}],\"source\":{{\"kind\":\"model\"}}}},\"stream\":[]}}",
+                    .{ g_current_step, g_msg_n.fetchAdd(1, .monotonic), t },
                 ) catch return;
                 defer gpaAlloc().free(msg_data);
                 const msg_seq = muxPublishEvent("assistant/message", true, msg_data);
@@ -1607,14 +1610,16 @@ fn runDetachedForGui(alloc: std.mem.Allocator, base_cfg: *config.Config, ov: Ser
     }
 
     // Canonical live-turn prefix (fixture order): turn/start then the user
-    // bubble carrying the actual prompt text.
+    // bubble carrying the actual prompt text. Message ids are unique per
+    // event — the client fold treats a repeated id as the SAME message being
+    // replaced, so constant ids collapse every turn into the first node.
     _ = muxPublishEvent("turn/start", false, "{\"turn\":1}");
     if (jsonEsc(gpaAlloc(), prompt)) |t| {
         defer gpaAlloc().free(t);
         const data = std.fmt.allocPrint(
             gpaAlloc(),
-            "{{\"id\":\"u-live\",\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":{s}}}],\"source\":{{\"kind\":\"user\"}}}}",
-            .{t},
+            "{{\"id\":\"u-{d}\",\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":{s}}}],\"source\":{{\"kind\":\"user\"}}}}",
+            .{ g_msg_n.fetchAdd(1, .monotonic), t },
         ) catch null;
         if (data) |d| {
             defer gpaAlloc().free(d);

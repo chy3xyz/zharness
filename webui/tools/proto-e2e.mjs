@@ -1,10 +1,12 @@
-// Protocol-level end-to-end probe: create a session, open session.follow
-// on /api/remote.mux, send a prompt, and print every journal event.
-// Run from webui/apps/web (resolves ws): node ../tools/proto-e2e.mjs
+// Protocol-level end-to-end probe: create a session (or reuse argv[2]),
+// open session.follow on /api/remote.mux, send a prompt (argv[3] or default),
+// and print every journal event.
 import { createRequire } from 'node:module'
 const require = createRequire(new URL('../apps/web/package.json', import.meta.url))
 const { WebSocket } = require('ws')
 const BASE = 'http://127.0.0.1:3080'
+const REUSE_SESSION = process.argv[2] ?? ''
+const PROMPT = process.argv[3] ?? '用一句话介绍你自己'
 let rpcId = 0
 async function rpc(method, payload) {
   const res = await fetch(`${BASE}/api/${method}`, {
@@ -14,9 +16,10 @@ async function rpc(method, payload) {
   return res.json()
 }
 // 1. create session under the workspace
-const created = await rpc('session/create', { request: { workspaceId: 'ws-zharness' } })
-const sessionId = created?.result?.value?.sessionId
-console.log('created:', sessionId)
+const sessionId = REUSE_SESSION
+  ? REUSE_SESSION
+  : (await rpc('session/create', { request: { workspaceId: 'ws-zharness' } }))?.result?.value?.sessionId
+console.log('session:', sessionId)
 if (!sessionId) process.exit(1)
 
 // 2. open follow stream
@@ -26,7 +29,7 @@ ws.on('open', () => {
   ws.send(JSON.stringify({ type: 'open', streamId: 'f1', endpoint: 'session/follow', payload: { args: { request: { address: { kind: 'session', sessionId } } } } }))
   // 3. prompt
   setTimeout(async () => {
-    const r = await rpc('session.prompt', { sessionId, mode: 'queue', content: [{ type: 'text', text: '用一句话介绍你自己' }] })
+    const r = await rpc('session.prompt', { sessionId, mode: 'queue', content: [{ type: 'text', text: PROMPT }] })
     console.log('prompt:', JSON.stringify(r.result ?? r.error)?.slice(0, 100))
   }, 400)
 })
