@@ -182,6 +182,9 @@ pub const PromptRequest = struct {
     /// through verbatim so the backend sees exactly what the browser sent.
     content_json: []const u8,
     client_time_zone: ?[]const u8 = null,
+    /// Browser submission identity; the durable user/message must echo it as
+    /// `source.rpcId` or the client never retires its local echo bubble.
+    request_id: ?[]const u8 = null,
 };
 
 pub const PromptAck = struct {
@@ -1071,6 +1074,7 @@ fn hSessionPrompt(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: [
         .mode = mode,
         .content_json = jsonx.getRaw(payload, "content").?,
         .client_time_zone = tz,
+        .request_id = try optString(alloc, payload, "requestId"),
     });
     var value: std.ArrayList(u8) = .empty;
     errdefer value.deinit(alloc);

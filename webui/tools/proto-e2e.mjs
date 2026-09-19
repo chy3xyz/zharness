@@ -29,7 +29,7 @@ ws.on('open', () => {
   ws.send(JSON.stringify({ type: 'open', streamId: 'f1', endpoint: 'session/follow', payload: { args: { request: { address: { kind: 'session', sessionId } } } } }))
   // 3. prompt
   setTimeout(async () => {
-    const r = await rpc('session.prompt', { sessionId, mode: 'queue', content: [{ type: 'text', text: PROMPT }] })
+    const r = await rpc('session.prompt', { requestId: `probe-rid-${++rpcId}`, sessionId, mode: 'queue', content: [{ type: 'text', text: PROMPT }] })
     console.log('prompt:', JSON.stringify(r.result ?? r.error)?.slice(0, 100))
   }, 400)
 })

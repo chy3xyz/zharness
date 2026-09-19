@@ -87,10 +87,41 @@ var g_tool_call_seq = std.atomic.Value(u64).init(1);
 var g_msg_n = std.atomic.Value(u64).init(1);
 /// Per-prompt turn number: the client groups the transcript into turn blocks
 /// keyed by the events' turn field, so every prompt must open the NEXT turn
-/// (steps restart at 0 within each turn). Hardcoding turn:1 merged every
-/// prompt into the first group and misplaced its messages.
-var g_turn_n = std.atomic.Value(u64).init(0);
+/// of ITS session (steps restart at 0 within each turn). Hardcoding turn:1
+/// merged every prompt into the first group and misplaced its messages.
+var g_turn_lens: [16]usize = @splat(0);
+var g_turn_turns: [16]u64 = @splat(0);
+var g_turn_sids: [16][128]u8 = @splat(std.mem.zeroes([128]u8));
 var g_current_turn: u64 = 0;
+
+/// Next turn number for `sid` (1-based). Runs hold g_run_mutex, so the table
+/// needs no extra lock; session ids are short and slots are reused LRU-0.
+fn nextTurnFor(sid: []const u8) u64 {
+    var slot: usize = 0;
+    var found = false;
+    for (g_turn_lens, 0..) |len, i| {
+        if (len != 0 and std.mem.eql(u8, g_turn_sids[i][0..len], sid)) {
+            slot = i;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        for (g_turn_lens, 0..) |len, i| {
+            if (len == 0) {
+                slot = i;
+                found = true;
+                break;
+            }
+        }
+    }
+    const n = g_turn_turns[slot] + 1;
+    const copy_len = @min(sid.len, g_turn_sids[slot].len);
+    @memcpy(g_turn_sids[slot][0..copy_len], sid[0..copy_len]);
+    g_turn_lens[slot] = copy_len;
+    g_turn_turns[slot] = n;
+    return n;
+}
 var g_current_call_id: [32]u8 = undefined;
 var g_current_call_id_len: usize = 0;
 var g_current_step: u64 = 0;
@@ -1566,9 +1597,14 @@ fn apxPromptSession(ctx: ?*anyopaque, alloc: std.mem.Allocator, req: apiproxy.Pr
     // The session id must outlive the REQUEST: req slices die with the
     // connection arena while the detached run is still emitting frames.
     const sid_copy: []const u8 = st.alloc.dupe(u8, req.session_id) catch return error.OutOfMemory;
+    const rpc_copy: ?[]const u8 = if (req.request_id) |rid|
+        st.alloc.dupe(u8, rid) catch return error.OutOfMemory
+    else
+        null;
 
-    const th = std.Thread.spawn(.{}, runDetachedForGui, .{ st.alloc, st.cfg, st.ov, st.opts, sid_copy, prompt_copy, pi }) catch |e| {
+    const th = std.Thread.spawn(.{}, runDetachedForGui, .{ st.alloc, st.cfg, st.ov, st.opts, sid_copy, prompt_copy, pi, rpc_copy }) catch |e| {
         st.alloc.free(sid_copy);
+        if (rpc_copy) |rid| st.alloc.free(rid);
         return e;
     };
     th.detach();
@@ -1579,7 +1615,8 @@ fn apxPromptSession(ctx: ?*anyopaque, alloc: std.mem.Allocator, req: apiproxy.Pr
 /// user/message before the loop and assistant/turn-end after (success or
 /// failure). The session id parks BEFORE the first frame — muxPublish drops
 /// everything while no run session is parked.
-fn runDetachedForGui(alloc: std.mem.Allocator, base_cfg: *config.Config, ov: ServeOverrides, opts: LoopOpts, session_id: []const u8, prompt: []const u8, pi: *attachments.PromptImages) void {
+fn runDetachedForGui(alloc: std.mem.Allocator, base_cfg: *config.Config, ov: ServeOverrides, opts: LoopOpts, session_id: []const u8, prompt: []const u8, pi: *attachments.PromptImages, request_id: ?[]const u8) void {
+    defer if (request_id) |rid| alloc.free(rid);
     // ServeState outlives every detached run (serveBlocking never returns).
     g_run_mutex.lock();
     defer g_run_mutex.unlock();
@@ -1618,19 +1655,28 @@ fn runDetachedForGui(alloc: std.mem.Allocator, base_cfg: *config.Config, ov: Ser
 
     // Canonical live-turn prefix (fixture order): turn/start then the user
     // bubble carrying the actual prompt text. Each prompt opens the NEXT turn
-    // (the client groups the transcript into turn blocks) and steps restart
-    // at 0 within it; message ids stay unique per event.
-    g_current_turn = g_turn_n.fetchAdd(1, .monotonic) + 1;
+    // of its session (the client groups the transcript into turn blocks) and
+    // steps restart at 0 within it; message ids stay unique per event.
+    g_current_turn = nextTurnFor(session_id);
     g_current_step = 0;
     const turn_data = std.fmt.allocPrint(gpaAlloc(), "{{\"turn\":{d}}}", .{g_current_turn}) catch return;
     defer gpaAlloc().free(turn_data);
     _ = muxPublishEvent("turn/start", false, turn_data);
     if (jsonEsc(gpaAlloc(), prompt)) |t| {
         defer gpaAlloc().free(t);
+        // source.rpcId echoes the browser submission identity — the client
+        // retires its local echo bubble only on this match; without it the
+        // bubble duplicates once the durable message lands.
+        const source_json = if (request_id) |rid| blk: {
+            const rid_j = jsonEsc(gpaAlloc(), rid) orelse break :blk null;
+            defer gpaAlloc().free(rid_j);
+            break :blk std.fmt.allocPrint(gpaAlloc(), "{{\"kind\":\"user\",\"rpcId\":{s}}}", .{rid_j}) catch null;
+        } else null;
+        defer if (source_json) |sj| gpaAlloc().free(sj);
         const data = std.fmt.allocPrint(
             gpaAlloc(),
-            "{{\"id\":\"u-{d}\",\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":{s}}}],\"source\":{{\"kind\":\"user\"}}}}",
-            .{ g_msg_n.fetchAdd(1, .monotonic), t },
+            "{{\"id\":\"u-{d}\",\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":{s}}}],\"source\":{s}}}",
+            .{ g_msg_n.fetchAdd(1, .monotonic), t, source_json orelse "{\"kind\":\"user\"}" },
         ) catch null;
         if (data) |d| {
             defer gpaAlloc().free(d);
