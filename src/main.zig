@@ -77,11 +77,10 @@ fn jsonEsc(alloc: std.mem.Allocator, s: []const u8) ?[]u8 {
 // ── live SessionEvent envelopes (vendored-GUI mux fold) ─────────────────────
 // The client validates every session/event frame against the strict
 // sessionEventSchema ({type,seq,time,data} — sessions.schema.ts), so the
-// bridge publishes full envelopes, never bare data payloads. Seq starts above
-// any seq the transcript-adapter history can produce (message indices), so a
-// live frame can never be dropped as a replay overlap after a reload.
+// bridge publishes full envelopes, never bare data payloads. Journal seqs
+// allocate from remote_mux.nextJournalSeq() (from 0, consecutive) so the
+// follow stream's cursor continuity holds.
 
-var g_live_seq = std.atomic.Value(u64).init(1 << 20);
 var g_tool_call_seq = std.atomic.Value(u64).init(1);
 var g_current_call_id: [32]u8 = undefined;
 var g_current_call_id_len: usize = 0;
@@ -89,39 +88,45 @@ var g_current_step: u64 = 0;
 
 /// Publish ONE strict-envelope SessionEvent for the parked run session.
 /// `surface_append` adds the fixture-parity `"surfaceOp":"append"` marker
-/// carried by whole-message events (user/message, assistant/message).
-fn muxPublishEvent(ev_type: []const u8, surface_append: bool, data_json: []const u8) void {
+/// carried by whole-message events (user/message, assistant/message,
+/// tool/result). Returns the journal seq allocated for the event so the
+/// assistant-stream `end` frame can cite the durable settlement.
+fn muxPublishEvent(ev_type: []const u8, surface_append: bool, data_json: []const u8) u64 {
     if (std.c.getenv("ZH_DEBUG_FRAME") != null) {
         std.debug.print("[mux:{s}] {s}\n", .{ ev_type, data_json[0..@min(data_json.len, 200)] });
     }
     const A = gpaAlloc();
-    const tj = jsonEsc(A, ev_type) orelse return;
+    const tj = jsonEsc(A, ev_type) orelse return 0;
     defer A.free(tj);
-    const io = g_io orelse return;
-    const seq = g_live_seq.fetchAdd(1, .monotonic);
-    const ms = std.Io.Timestamp.now(io, .real).toMilliseconds();
+    const seq = remote_mux.nextJournalSeq();
+    const ms = nowMsFallback();
     const line = if (surface_append)
-        std.fmt.allocPrint(A, "{{\"type\":{s},\"seq\":{d},\"time\":{d},\"surfaceOp\":\"append\",\"data\":{s}}}", .{ tj, seq, ms, data_json }) catch return
+        std.fmt.allocPrint(A, "{{\"type\":{s},\"seq\":{d},\"time\":{d},\"surfaceOp\":\"append\",\"data\":{s}}}", .{ tj, seq, ms, data_json }) catch return seq
     else
-        std.fmt.allocPrint(A, "{{\"type\":{s},\"seq\":{d},\"time\":{d},\"data\":{s}}}", .{ tj, seq, ms, data_json }) catch return;
+        std.fmt.allocPrint(A, "{{\"type\":{s},\"seq\":{d},\"time\":{d},\"data\":{s}}}", .{ tj, seq, ms, data_json }) catch return seq;
     defer A.free(line);
-    followPublishLine(A, ev_type, line);
+    followPublishLine(A, ev_type, seq, line);
     muxPublish(line);
+    return seq;
+}
+
+fn nowMsFallback() i64 {
+    const io = g_io orelse return 0;
+    return std.Io.Timestamp.now(io, .real).toMilliseconds();
 }
 
 /// Mirror one live frame onto the remote.mux session.follow streams (the
 /// v0.1.6 GUI's journal transport). `line` is already the SessionWireEvent
-/// wire shape. Transformations for vocabulary drift the legacy publishers
-/// carry:
-///   - assistant/chunk -> assistant/live-chunk, data gains "attemptId"
+/// wire shape; `seq` is the `remote_mux.nextJournalSeq()` value it carries.
+/// Transformation for vocabulary drift the legacy publishers carry:
 ///   - step/start|end gain "turn":1 when the publisher omitted it
-/// Only the journal vocabulary routes; other frame types stay legacy-only.
-fn followPublishLine(alloc: std.mem.Allocator, ev_type: []const u8, line: []const u8) void {
+/// assistant/chunk never routes here — live deltas go through the
+/// assistant-stream presentation channel (followAssistant* below).
+fn followPublishLine(alloc: std.mem.Allocator, ev_type: []const u8, seq: u64, line: []const u8) void {
     const sid = g_mux_run_session orelse return;
     const known = [_][]const u8{
-        "turn/start",   "turn/end",         "step/start",      "step/end",
-        "user/message", "assistant/message", "assistant/chunk", "tool/call",
-        "tool/result",
+        "turn/start",   "turn/end",          "step/start", "step/end",
+        "user/message", "assistant/message", "tool/call",  "tool/result",
     };
     var routed = false;
     for (known) |k| {
@@ -133,22 +138,88 @@ fn followPublishLine(alloc: std.mem.Allocator, ev_type: []const u8, line: []cons
     if (!routed) return;
 
     var out: []const u8 = line;
-    if (std.mem.eql(u8, ev_type, "assistant/chunk")) {
-        const t = std.mem.indexOf(u8, out, "\"assistant/chunk\"") orelse return;
-        const with_type = std.fmt.allocPrint(alloc, "{s}\"assistant/live-chunk\"{s}", .{ out[0..t], out[t + "\"assistant/chunk\"".len ..] }) catch return;
-        defer alloc.free(with_type);
-        const marker = "\"data\":{";
-        const didx = std.mem.indexOf(u8, with_type, marker) orelse return;
-        out = std.fmt.allocPrint(alloc, "{s}\"attemptId\":\"attempt-live\",{s}", .{ with_type[0 .. didx + marker.len], with_type[didx + marker.len ..] }) catch return;
-    } else if (std.mem.eql(u8, ev_type, "step/start") or std.mem.eql(u8, ev_type, "step/end")) {
+    if (std.mem.eql(u8, ev_type, "step/start") or std.mem.eql(u8, ev_type, "step/end")) {
         const marker = "\"data\":{";
         const didx = std.mem.indexOf(u8, out, marker) orelse return;
         const data = out[didx + "\"data\":".len ..];
-        if (apix_jsonx.getRaw(data, "turn") != null) return; // publisher already carries turn
+        if (apix_jsonx.getRaw(data, "turn") != null) {
+            remote_mux.publishLine(sid, seq, out);
+            return;
+        }
         out = std.fmt.allocPrint(alloc, "{s}\"turn\":1,{s}", .{ out[0 .. didx + marker.len], out[didx + marker.len ..] }) catch return;
     }
-    remote_mux.publishLine(sid, out);
+    remote_mux.publishLine(sid, seq, out);
     if (out.ptr != line.ptr) alloc.free(out);
+}
+
+// ── assistant-stream live presentation frames ───────────────────────────────
+// The v0.1.6 GUI folds model token deltas from the session.follow
+// `assistant-stream` notification channel, not the journal: a `start` frame
+// opens the attempt, dense-indexed `chunk` frames stream deltas, and an `end`
+// frame releases the durable assistant/message settlement. Revisions allocate
+// from remote_mux's counter; the follow snapshot baseline carries the current
+// value, so the client's revision+1 check holds across reconnects.
+
+const asst_attempt_id = "attempt-live";
+var g_asst_active = false;
+var g_asst_start_step: u64 = 0;
+var g_asst_chunk_index: u64 = 0;
+
+fn followAssistantFrame(frame_json: []const u8) void {
+    const sid = g_mux_run_session orelse return;
+    remote_mux.publishAssistantLine(sid, frame_json);
+}
+
+/// Open the live attempt on the first chunk of a turn. `step` is captured so
+/// the settlement check (attempt.step === assistant/message data.step) can
+/// detect mid-turn tool rounds, which bump the step after streaming began.
+fn followAssistantStart() void {
+    if (g_asst_active) return;
+    g_asst_active = true;
+    g_asst_start_step = g_current_step;
+    g_asst_chunk_index = 0;
+    const frame = std.fmt.allocPrint(gpaAlloc(), "{{\"type\":\"start\",\"attemptId\":\"" ++ asst_attempt_id ++ "\",\"revision\":{d},\"startedAfterSeq\":{d},\"turn\":1,\"step\":{d}}}", .{ remote_mux.nextAssistantRevision(), remote_mux.cursor(), g_asst_start_step }) catch return;
+    defer gpaAlloc().free(frame);
+    followAssistantFrame(frame);
+}
+
+fn followAssistantChunk(kind: model.StreamKind, text_json: []const u8) void {
+    if (g_mux_run_session == null) return;
+    followAssistantStart();
+    const idx = g_asst_chunk_index;
+    g_asst_chunk_index += 1;
+    const ctype: []const u8 = switch (kind) {
+        .text => "text-delta",
+        .reasoning => "reasoning-delta",
+    };
+    const frame = std.fmt.allocPrint(gpaAlloc(), "{{\"type\":\"chunk\",\"attemptId\":\"" ++ asst_attempt_id ++ "\",\"revision\":{d},\"index\":{d},\"time\":{d},\"chunk\":{{\"type\":\"{s}\",\"index\":0,\"text\":{s}}}}}", .{ remote_mux.nextAssistantRevision(), idx, nowMsFallback(), ctype, text_json }) catch return;
+    defer gpaAlloc().free(frame);
+    followAssistantFrame(frame);
+}
+
+/// Close the live attempt after the durable assistant/message committed at
+/// `seq` (already published — the reducer stages the settlement on the
+/// journal entry and releases it on this frame).
+fn followAssistantEndCommitted(seq: u64) void {
+    if (!g_asst_active) return;
+    g_asst_active = false;
+    const n = g_asst_chunk_index;
+    g_asst_chunk_index = 0;
+    const frame = std.fmt.allocPrint(gpaAlloc(), "{{\"type\":\"end\",\"attemptId\":\"" ++ asst_attempt_id ++ "\",\"revision\":{d},\"index\":{d},\"outcome\":{{\"kind\":\"committed\",\"eventType\":\"assistant/message\",\"seq\":{d}}}}}", .{ remote_mux.nextAssistantRevision(), n, seq }) catch return;
+    defer gpaAlloc().free(frame);
+    followAssistantFrame(frame);
+}
+
+/// Close the live attempt with no settlement (run error, or the step moved
+/// mid-turn so the committed message cannot join this attempt).
+fn followAssistantEndAbandoned() void {
+    if (!g_asst_active) return;
+    g_asst_active = false;
+    const n = g_asst_chunk_index;
+    g_asst_chunk_index = 0;
+    const frame = std.fmt.allocPrint(gpaAlloc(), "{{\"type\":\"end\",\"attemptId\":\"" ++ asst_attempt_id ++ "\",\"revision\":{d},\"index\":{d},\"outcome\":{{\"kind\":\"abandoned\"}}}}", .{ remote_mux.nextAssistantRevision(), n }) catch return;
+    defer gpaAlloc().free(frame);
+    followAssistantFrame(frame);
 }
 
 /// Publish a SessionEvent whose data embeds exactly one JSON-escaped string.
@@ -161,7 +232,7 @@ fn muxPublishEventEsc(
     const A = gpaAlloc();
     const data = std.fmt.allocPrint(A, data_fmt, .{escaped}) catch return;
     defer A.free(data);
-    muxPublishEvent(ev_type, surface_append, data);
+    _ = muxPublishEvent(ev_type, surface_append, data);
 }
 
 fn muxPublishEventStepEsc(
@@ -174,7 +245,7 @@ fn muxPublishEventStepEsc(
     const A = gpaAlloc();
     const data = std.fmt.allocPrint(A, data_fmt, .{ step, escaped }) catch return;
     defer A.free(data);
-    muxPublishEvent(ev_type, surface_append, data);
+    _ = muxPublishEvent(ev_type, surface_append, data);
 }
 
 fn onEvent(kind: agent.AgentLoop.EventKind, payload: []const u8) void {
@@ -190,9 +261,9 @@ fn onEvent(kind: agent.AgentLoop.EventKind, payload: []const u8) void {
                 // which suppresses the "Interrupted" markers from previous steps.
                 const A = gpaAlloc();
                 const step_n = g_tool_call_seq.load(.monotonic);
-                const data = std.fmt.allocPrint(A, "{{\"step\":{d}}}", .{ step_n }) catch return;
+                const data = std.fmt.allocPrint(A, "{{\"step\":{d}}}", .{step_n}) catch return;
                 defer A.free(data);
-                muxPublishEvent("step/start", false, data);
+                _ = muxPublishEvent("step/start", false, data);
             },
             // NOTE: .thinking and .text streaming deltas are published by
             // onStreamDelta (the ChatClient's stream_sink), NOT here. The
@@ -217,42 +288,56 @@ fn onEvent(kind: agent.AgentLoop.EventKind, payload: []const u8) void {
                 g_current_call_id_len = (std.fmt.bufPrint(&g_current_call_id, "call-{d}", .{n}) catch return).len;
                 const call_j = jsonEsc(A, g_current_call_id[0..g_current_call_id_len]) orelse break :blk;
                 defer A.free(call_j);
-                const data = std.fmt.allocPrint(A,
+                const data = std.fmt.allocPrint(
+                    A,
                     "{{\"turn\":1,\"step\":{d},\"callId\":{s},\"name\":{s},\"arguments\":{s}}}",
                     .{ n, call_j, name_j, args_j2 },
                 ) catch break :blk;
                 defer A.free(data);
                 if (std.c.getenv("ZH_DEBUG_FRAME") != null) std.debug.print("[frame:tool_call] {s}\n", .{data});
-    muxPublishEvent("tool/call", false, data);
+                _ = muxPublishEvent("tool/call", false, data);
             },
             .tool_result => if (jsonEsc(gpaAlloc(), payload)) |o| {
                 defer gpaAlloc().free(o);
                 const A = gpaAlloc();
                 const call_j = jsonEsc(A, g_current_call_id[0..g_current_call_id_len]) orelse return;
                 defer A.free(call_j);
-                const data = std.fmt.allocPrint(A,
+                const data = std.fmt.allocPrint(
+                    A,
                     "{{\"turn\":1,\"step\":{d},\"message\":{{\"id\":{s},\"role\":\"user\",\"content\":[{{\"type\":\"tool-result\",\"toolCallId\":{s},\"content\":[{{\"type\":\"text\",\"text\":{s}}}]}}],\"source\":{{\"kind\":\"tool\",\"callId\":{s}}}}}}}",
                     .{ g_current_step, call_j, call_j, o, call_j },
                 ) catch return;
                 defer A.free(data);
                 if (std.c.getenv("ZH_DEBUG_FRAME") != null) std.debug.print("[frame:tool_result] {s}\n", .{data});
-                muxPublishEvent("tool/result", false, data);
+                // tool/result is a surface type: surfaceOp marks it as an
+                // append so the transcript fold renders the tool card.
+                _ = muxPublishEvent("tool/result", true, data);
             },
             .done => if (jsonEsc(gpaAlloc(), payload)) |t| {
                 defer gpaAlloc().free(t);
                 // Publish step/end before the final assistant/message so the
                 // client knows this turn/step is complete.
-                const end_data = std.fmt.allocPrint(gpaAlloc(), "{{\"step\":{d}}}", .{ g_current_step }) catch return;
+                const end_data = std.fmt.allocPrint(gpaAlloc(), "{{\"step\":{d}}}", .{g_current_step}) catch return;
                 defer gpaAlloc().free(end_data);
-                muxPublishEvent("step/end", false, end_data);
+                _ = muxPublishEvent("step/end", false, end_data);
                 // Assistant message uses the same step as the tool call/result
                 // so the client can merge streaming chunks with the final message.
-                const msg_data = std.fmt.allocPrint(gpaAlloc(),
-                    "{{\"turn\":1,\"step\":{d},\"message\":{{\"id\":\"a-live\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":{s}}}],\"source\":{{\"kind\":\"model\"}}}}}}",
+                const msg_data = std.fmt.allocPrint(
+                    gpaAlloc(),
+                    "{{\"turn\":1,\"step\":{d},\"message\":{{\"id\":\"a-live\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":{s}}}],\"source\":{{\"kind\":\"model\"}}}},\"stream\":[]}}",
                     .{ g_current_step, t },
                 ) catch return;
                 defer gpaAlloc().free(msg_data);
-                muxPublishEvent("assistant/message", true, msg_data);
+                const msg_seq = muxPublishEvent("assistant/message", true, msg_data);
+                // Close the live streaming attempt: the reducer staged the
+                // settlement above only when the attempt's step still matches,
+                // so a mid-turn tool round (step bumped after streaming began)
+                // abandons instead of citing a seq the reducer never staged.
+                if (g_asst_active and g_asst_start_step == g_current_step) {
+                    followAssistantEndCommitted(msg_seq);
+                } else {
+                    followAssistantEndAbandoned();
+                }
             },
             else => {},
         }
@@ -269,6 +354,7 @@ fn onEvent(kind: agent.AgentLoop.EventKind, payload: []const u8) void {
             // Surface model failures on the vendored-GUI fold: the loop logs
             // and returns success, so without this capture the turn would end
             // 'completed' with no assistant content and no UI failure row.
+            followAssistantEndAbandoned();
             if (g_mux_run_session != null) {
                 if (g_mux_run_error) |old| gpaAlloc().free(old);
                 g_mux_run_error = gpaAlloc().dupe(u8, payload) catch null;
@@ -287,23 +373,14 @@ fn onStreamDelta(kind: model.StreamKind, delta: []const u8) void {
         .text => std.debug.print("{s}", .{delta}),
         .reasoning => std.debug.print("\x1b[2m{s}\x1b[0m", .{delta}),
     }
-    // Stream deltas to the GUI in real time (not just after the response
-    // completes). The muxPublishEvent path handles session parking and
-    // envelope wrapping.
+    // Stream deltas to the GUI in real time via the assistant-stream
+    // presentation channel (start/chunk/end frames on session.follow). The
+    // durable journal settlement is published by the .done handler.
     if (g_mux_run_session != null) {
         const A = gpaAlloc();
         const dj = jsonEsc(A, delta) orelse return;
         defer A.free(dj);
-        const chunk_type: []const u8 = switch (kind) {
-            .text => "text-delta",
-            .reasoning => "reasoning-delta",
-        };
-        const data = std.fmt.allocPrint(A,
-            "{{\"turn\":1,\"step\":{d},\"chunk\":{{\"type\":\"{s}\",\"index\":0,\"text\":{s}}}}}",
-            .{ g_current_step, chunk_type, dj },
-        ) catch return;
-        defer A.free(data);
-        muxPublishEvent("assistant/chunk", false, data);
+        followAssistantChunk(kind, dj);
     }
 }
 
@@ -1255,11 +1332,11 @@ fn apxListSessions(ctx: ?*anyopaque, alloc: std.mem.Allocator) anyerror![]apipro
                             const trunc = @min(clean.len, 40);
                             if (trunc > 0) title = try alloc.dupe(u8, clean[0..trunc]);
                         }
-                            // Validate UTF-8: replace with session id if invalid
-                            if (!std.unicode.utf8ValidateSlice(title.?)) {
-                                alloc.free(title.?);
-                                title = try alloc.dupe(u8, id);
-                            }
+                        // Validate UTF-8: replace with session id if invalid
+                        if (!std.unicode.utf8ValidateSlice(title.?)) {
+                            alloc.free(title.?);
+                            title = try alloc.dupe(u8, id);
+                        }
                     }
                 }
             }
@@ -1270,7 +1347,8 @@ fn apxListSessions(ctx: ?*anyopaque, alloc: std.mem.Allocator) anyerror![]apipro
         }
         const title_src: []const u8 = title orelse id;
         defer if (title) |t| alloc.free(t);
-        const proj = try std.fmt.allocPrint(alloc,
+        const proj = try std.fmt.allocPrint(
+            alloc,
             "{{\"asOfSeq\":-1,\"values\":{{\"title\":\"{s}\"}}}}",
             .{title_src},
         );
@@ -1500,7 +1578,7 @@ fn runDetachedForGui(alloc: std.mem.Allocator, base_cfg: *config.Config, ov: Ser
 
     // Hot config: re-read config.toml for THIS run (settings edits hot-apply).
     var run_cfg = loadRunConfig(alloc, base_cfg, ov) catch {
-        muxPublishEvent("turn/end", false, "{\"turn\":1,\"reason\":{\"kind\":\"error\",\"error\":{\"message\":\"config reload failed\"}}}");
+        _ = muxPublishEvent("turn/end", false, "{\"turn\":1,\"reason\":{\"kind\":\"error\",\"error\":{\"message\":\"config reload failed\"}}}");
         pi.deinit(alloc);
         alloc.destroy(pi);
         return;
@@ -1530,7 +1608,7 @@ fn runDetachedForGui(alloc: std.mem.Allocator, base_cfg: *config.Config, ov: Ser
 
     // Canonical live-turn prefix (fixture order): turn/start then the user
     // bubble carrying the actual prompt text.
-    muxPublishEvent("turn/start", false, "{\"turn\":1}");
+    _ = muxPublishEvent("turn/start", false, "{\"turn\":1}");
     if (jsonEsc(gpaAlloc(), prompt)) |t| {
         defer gpaAlloc().free(t);
         const data = std.fmt.allocPrint(
@@ -1540,16 +1618,16 @@ fn runDetachedForGui(alloc: std.mem.Allocator, base_cfg: *config.Config, ov: Ser
         ) catch null;
         if (data) |d| {
             defer gpaAlloc().free(d);
-            muxPublishEvent("user/message", true, d);
-    muxPublishEvent("step/start", false, "{\"turn\":1,\"step\":0}");
+            _ = muxPublishEvent("user/message", true, d);
+            _ = muxPublishEvent("step/start", false, "{\"turn\":1,\"step\":0}");
         }
     }
 
     hostPublishFmtSession(session_id, true);
     _ = agentRunOnce(alloc, &run_cfg, run_opts, prompt, session_id) catch {
         if (g_mux_run_error == null) g_mux_run_error = gpaAlloc().dupe(u8, "run failed") catch null;
-        muxPublishEvent("step/end", false, "{\"turn\":1,\"step\":0}");
-        muxPublishEvent("turn/end", false, "{{\"turn\":1,\"reason\":{{\"kind\":\"error\",\"error\":{{\"message\":\"run failed\"}}}}}}");
+        _ = muxPublishEvent("step/end", false, "{\"turn\":1,\"step\":0}");
+        _ = muxPublishEvent("turn/end", false, "{{\"turn\":1,\"reason\":{{\"kind\":\"error\",\"error\":{{\"message\":\"run failed\"}}}}}}");
         if (jsonEsc(gpaAlloc(), session_id)) |sid| {
             defer gpaAlloc().free(sid);
             const line = std.fmt.allocPrint(gpaAlloc(), "{{\"sessionId\":{s},\"message\":\"run failed\"}}", .{sid}) catch null;
@@ -1574,7 +1652,7 @@ fn runDetachedForGui(alloc: std.mem.Allocator, base_cfg: *config.Config, ov: Ser
             const data = std.fmt.allocPrint(gpaAlloc(), "{{\"turn\":1,\"reason\":{{\"kind\":\"error\",\"error\":{{\"message\":{s}}}}}}}", .{msg_json}) catch null;
             if (data) |d| {
                 defer gpaAlloc().free(d);
-                muxPublishEvent("turn/end", false, d);
+                _ = muxPublishEvent("turn/end", false, d);
             }
             if (jsonEsc(gpaAlloc(), session_id)) |sid| {
                 defer gpaAlloc().free(sid);
@@ -1586,8 +1664,8 @@ fn runDetachedForGui(alloc: std.mem.Allocator, base_cfg: *config.Config, ov: Ser
             }
         }
     } else {
-    muxPublishEvent("step/end", false, "{\"turn\":1,\"step\":0}");
-        muxPublishEvent("turn/end", false, "{\"turn\":1,\"reason\":{\"kind\":\"completed\"}}");
+        _ = muxPublishEvent("step/end", false, "{\"turn\":1,\"step\":0}");
+        _ = muxPublishEvent("turn/end", false, "{\"turn\":1,\"reason\":{\"kind\":\"completed\"}}");
     }
     hostPublishFmtSession(session_id, false);
     if (job_reg != null) {

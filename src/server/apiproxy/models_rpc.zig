@@ -246,6 +246,7 @@ pub fn selectInto(
 ) SelectError!void {
     if (providers.Provider.fromString(provider) == null) return error.UnknownProvider;
     if (model.len == 0) return error.BadValueType;
+    if (reasoning_effort) |re| if (!validReasoningEffort(re)) return error.BadValueType;
 
     var kvs: std.ArrayList(config.ConfigKv) = .empty;
     defer kvs.deinit(alloc);
@@ -322,6 +323,14 @@ fn appendSelectionJsonStr(alloc: std.mem.Allocator, out: *std.ArrayList(u8), s: 
     try out.appendSlice(alloc, tmp.items);
 }
 
+/// DeepSeek API's documented reasoning_effort variants. Values outside this
+/// set make the provider reject the whole request body.
+pub fn validReasoningEffort(v: []const u8) bool {
+    const variants = [_][]const u8{ "none", "minimal", "low", "medium", "high", "xhigh", "max" };
+    for (variants) |want| if (std.mem.eql(u8, v, want)) return true;
+    return false;
+}
+
 pub fn handleSessionSelectModel(deps: *const router.ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8) !router.UnaryResponse {
     const sid_raw = jsonx.getRaw(payload, "sessionId") orelse return error.PayloadInvalid;
     if (!jsonx.isString(sid_raw)) return error.PayloadInvalid;
@@ -334,7 +343,11 @@ pub fn handleSessionSelectModel(deps: *const router.ApiProxyDeps, alloc: std.mem
     const effort: ?[]const u8 = blk: {
         const er = jsonx.getRaw(payload, "reasoningEffort") orelse break :blk null;
         if (!jsonx.isString(er)) return error.PayloadInvalid;
-        break :blk jsonx.decodeString(alloc, er[1 .. er.len - 1]) catch return error.OutOfMemory;
+        const decoded = jsonx.decodeString(alloc, er[1 .. er.len - 1]) catch return error.OutOfMemory;
+        // The GUI sends enum keys, not wire values ("reasoningEffort" once
+        // landed in config.toml and the API rejected every request). Only the
+        // documented variants may persist; anything else is dropped.
+        break :blk if (validReasoningEffort(decoded)) decoded else null;
     };
 
     const store = router.settingsStoreOf(deps.home) orelse

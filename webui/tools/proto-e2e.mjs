@@ -2,7 +2,7 @@
 // on /api/remote.mux, send a prompt, and print every journal event.
 // Run from webui/apps/web (resolves ws): node ../tools/proto-e2e.mjs
 import { createRequire } from 'node:module'
-const require = createRequire(import.meta.url)
+const require = createRequire(new URL('../apps/web/package.json', import.meta.url))
 const { WebSocket } = require('ws')
 const BASE = 'http://127.0.0.1:3080'
 let rpcId = 0
@@ -38,7 +38,11 @@ ws.on('message', (d) => {
       events.push(`${e.type}#${e.seq}`)
       console.log('EVT', e.type, JSON.stringify(e.data)?.slice(0, 110))
     } else if (f.type === 'item') {
-      console.log('ITEM', f.value?.type ?? '?')
+      if (f.value?.type === 'assistant-stream') {
+        console.log('ASTREAM', JSON.stringify(f.value.frame)?.slice(0, 140))
+      } else {
+        console.log('ITEM', f.value?.type ?? '?')
+      }
     } else if (f.type === 'error') {
       console.log('STREAM-ERR', JSON.stringify(f.error)?.slice(0, 120))
     }

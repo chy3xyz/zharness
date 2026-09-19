@@ -52,7 +52,6 @@ fn unlock() void {
     g_locked.store(false, .release);
 }
 var g_streams: std.ArrayListUnmanaged(*Stream) = .empty;
-var g_seq: u64 = 0;
 
 pub const Kind = enum { follow, control, workspace, events };
 
@@ -108,50 +107,79 @@ fn sendItem(alloc: std.mem.Allocator, s: *Stream, value_json: []const u8) void {
     s.conn.writeText(frame) catch {};
 }
 
-/// Current journal cursor (monotonic; zharness keeps no durable seq store in
-/// this generation, so live frames number from 1 per process).
-pub fn cursor() u64 {
+/// Current journal cursor (last seq handed to a routed entry; -1 before the
+/// first). Reconnect snapshots replay the live window through this cursor, so
+/// the client's `follows = right === left + 1` continuity holds across
+/// reconnects instead of re-opening at -1 behind already-published entries.
+pub fn cursor() i64 {
     lock();
     defer unlock();
-    return g_seq;
+    return g_last_seq;
 }
 
-/// Publish one durable-shaped journal event to every follow stream bound to
-/// `session_id`. `data_json` is embedded verbatim (must be JSON-safe).
-pub fn publishEvent(alloc: std.mem.Allocator, session_id: []const u8, event_type: []const u8, data_json: []const u8) void {
-    var type_json: std.ArrayList(u8) = .empty;
-    defer type_json.deinit(alloc);
-    jsonx.appendJsonString(alloc, &type_json, event_type) catch return;
+/// Next durable journal seq. Client journal streams require consecutive seqs
+/// from the snapshot cursor, so EVERY routed journal event allocates here and
+/// non-journal frames (assistant-stream notifications, legacy $events) never
+/// touch this counter.
+var g_journal_seq = std.atomic.Value(u64).init(0);
 
-    lock();
-    g_seq += 1;
-    const seq = g_seq;
-    unlock();
+pub fn nextJournalSeq() u64 {
+    return g_journal_seq.fetchAdd(1, .monotonic);
+}
 
-    const event = std.fmt.allocPrint(alloc, "{{\"type\":{s},\"seq\":{d},\"time\":{d},\"data\":{s}}}", .{ type_json.items, seq, nowMs(), data_json }) catch return;
-    defer alloc.free(event);
-    const entry = std.fmt.allocPrint(alloc, "{{\"type\":\"event\",\"event\":{s}}}", .{event}) catch return;
-    defer alloc.free(entry);
+/// Live window of routed journal entries (wrapped SessionEventEntry values,
+/// oldest first, tagged by owning session) replayed by reconnect snapshots.
+const win_cap = 512;
+var g_win: [win_cap]?[]const u8 = @splat(null);
+var g_win_sid: [win_cap]?[]u8 = @splat(null);
+var g_win_seq: [win_cap]u64 = @splat(0);
+var g_win_next: usize = 0;
+var g_win_count: usize = 0;
+var g_last_seq: i64 = -1;
 
-    lock();
-    defer unlock();
-    for (g_streams.items) |s| {
-        if (s.control) continue;
-        if (s.session_id.len != 0 and !std.mem.eql(u8, s.session_id, session_id)) continue;
-        sendItem(alloc, s, entry.items);
-    }
+/// Assistant-stream presentation revision. Snapshot baselines carry the
+/// current value; every assistant-stream frame allocates the next one, so the
+/// client's `revision === last + 1` check holds across reconnects.
+var g_assistant_rev = std.atomic.Value(u64).init(0);
+
+pub fn assistantRevision() u64 {
+    return g_assistant_rev.load(.monotonic);
+}
+
+pub fn nextAssistantRevision() u64 {
+    return g_assistant_rev.fetchAdd(1, .monotonic) + 1;
 }
 
 /// Send the follow opening snapshot for `session_id` on a freshly opened
-/// stream. Records stay empty (cold reads go through session.history /
-/// session.page); the cursor reports the live-frame sequence origin.
+/// stream. Replays the in-memory live window for this session (records +
+/// matching cursor) so reconnects stay continuous; a cold session opens at
+/// cursor -1 with no records. Older history pages still go through
+/// session.history / session.page.
 pub fn sendSnapshot(alloc: std.mem.Allocator, s: *Stream, session_id: []const u8) void {
     var id_json: std.ArrayList(u8) = .empty;
     defer id_json.deinit(alloc);
     jsonx.appendJsonString(alloc, &id_json, session_id) catch return;
-    const head = std.fmt.allocPrint(alloc, "{{\"type\":\"snapshot\",\"header\":{{\"version\":1,\"id\":{s},\"createdAt\":{d},\"isSeeded\":false}},\"cursor\":-1,\"records\":[],\"hasMore\":false,\"assistantStream\":{{\"revision\":0,\"attempts\":[]}},\"projections\":{{\"asOfSeq\":-1,\"values\":{{\"modelSelection\":{{\"lastUsed\":null,\"pending\":null}}}}}},", .{ id_json.items, nowMs() }) catch return;
-    defer alloc.free(head);
-    const value = std.fmt.allocPrint(alloc, "{s}\"projections\":{{\"asOfSeq\":0,\"values\":{{}}}}}}", .{head}) catch return;
+
+    lock();
+    var records: std.ArrayList(u8) = .empty;
+    defer records.deinit(alloc);
+    var cur: i64 = -1;
+    if (g_win_count > 0) {
+        const oldest = g_win_next - g_win_count + win_cap;
+        var i: usize = 0;
+        while (i < g_win_count) : (i += 1) {
+            const slot = (oldest + i) % win_cap;
+            const sid = g_win_sid[slot] orelse continue;
+            if (!std.mem.eql(u8, sid, session_id)) continue;
+            if (records.items.len != 0) records.appendSlice(alloc, ",") catch break;
+            records.appendSlice(alloc, g_win[slot] orelse continue) catch break;
+            cur = @intCast(g_win_seq[slot]);
+        }
+    }
+    const rev = g_assistant_rev.load(.monotonic);
+    unlock();
+
+    const value = std.fmt.allocPrint(alloc, "{{\"type\":\"snapshot\",\"header\":{{\"version\":1,\"id\":{s},\"createdAt\":{d},\"isSeeded\":false}},\"cursor\":{d},\"records\":[{s}],\"hasMore\":false,\"assistantStream\":{{\"revision\":{d}}},\"projections\":{{\"asOfSeq\":-1,\"values\":{{\"modelSelection\":{{\"lastUsed\":null,\"pending\":null}}}}}}}}", .{ id_json.items, nowMs(), cur, records.items, rev }) catch return;
     defer alloc.free(value);
     sendItem(alloc, s, value);
 }
@@ -331,23 +359,60 @@ pub fn streamCount() usize {
     return g_streams.items.len;
 }
 
-/// Publish one PRE-BUILT event envelope line (the exact SessionWireEvent
-/// JSON produced by main.zig's muxPublishEvent) to every follow stream bound
-/// to `session_id`. Called from the run thread per live frame; item frames
-/// are built and written per stream under the lock (FrameHub.publishFrame
+/// Publish one PRE-BUILT SessionWireEvent envelope line (the exact event JSON
+/// the caller built with its `nextJournalSeq()` seq) to every follow stream
+/// bound to `session_id`. The value is wrapped in the client's
+/// SessionEventEntry shape {type:'event', event:<envelope>} — the journal
+/// transport asserts event lives one level down — recorded in the reconnect
+/// window, and sent per stream under the lock (FrameHub.publishFrame
 /// precedent — WsConn writes tolerate the foreign thread).
-pub fn publishLine(session_id: []const u8, value_json: []const u8) void {
-    var id_json: std.ArrayList(u8) = .empty;
-    defer id_json.deinit(c_alloc);
+pub fn publishLine(session_id: []const u8, seq: u64, value_json: []const u8) void {
+    const entry = std.fmt.allocPrint(c_alloc, "{{\"type\":\"event\",\"event\":{s}}}", .{value_json}) catch return;
+    defer c_alloc.free(entry);
 
     lock();
     defer unlock();
+    g_last_seq = @intCast(seq);
+    const slot = g_win_next;
+    if (g_win[slot]) |old| c_alloc.free(old);
+    if (g_win_sid[slot]) |old| c_alloc.free(old);
+    g_win[slot] = c_alloc.dupe(u8, entry) catch null;
+    g_win_sid[slot] = c_alloc.dupe(u8, session_id) catch null;
+    g_win_seq[slot] = seq;
+    g_win_next = (slot + 1) % win_cap;
+    if (g_win_count < win_cap) g_win_count += 1;
+
+    var id_json: std.ArrayList(u8) = .empty;
+    defer id_json.deinit(c_alloc);
     for (g_streams.items) |s| {
         if (s.kind != .follow) continue;
         if (s.session_id.len != 0 and !std.mem.eql(u8, s.session_id, session_id)) continue;
         id_json.clearRetainingCapacity();
         jsonx.appendJsonString(c_alloc, &id_json, s.stream_id) catch continue;
-        const frame = std.fmt.allocPrint(c_alloc, "{{\"type\":\"item\",\"streamId\":{s},\"value\":{s}}}", .{ id_json.items, value_json }) catch continue;
+        const frame = std.fmt.allocPrint(c_alloc, "{{\"type\":\"item\",\"streamId\":{s},\"value\":{s}}}", .{ id_json.items, entry }) catch continue;
+        defer c_alloc.free(frame);
+        s.conn.writeText(frame) catch {};
+    }
+}
+
+/// Publish one assistant-stream presentation frame ({type:'start'|'chunk'|
+/// 'end', ...} JSON built by the caller with its `nextAssistantRevision()`
+/// revision) to every follow stream bound to `session_id`. Transient by
+/// design: never enters the journal window or the seq counter.
+pub fn publishAssistantLine(session_id: []const u8, frame_json: []const u8) void {
+    const value = std.fmt.allocPrint(c_alloc, "{{\"type\":\"assistant-stream\",\"frame\":{s}}}", .{frame_json}) catch return;
+    defer c_alloc.free(value);
+
+    lock();
+    defer unlock();
+    var id_json: std.ArrayList(u8) = .empty;
+    defer id_json.deinit(c_alloc);
+    for (g_streams.items) |s| {
+        if (s.kind != .follow) continue;
+        if (s.session_id.len != 0 and !std.mem.eql(u8, s.session_id, session_id)) continue;
+        id_json.clearRetainingCapacity();
+        jsonx.appendJsonString(c_alloc, &id_json, s.stream_id) catch continue;
+        const frame = std.fmt.allocPrint(c_alloc, "{{\"type\":\"item\",\"streamId\":{s},\"value\":{s}}}", .{ id_json.items, value }) catch continue;
         defer c_alloc.free(frame);
         s.conn.writeText(frame) catch {};
     }

@@ -515,13 +515,18 @@ pub const ChatClient = struct {
         try body.appendSlice(self.alloc, "],\"tools\":[");
         try body.appendSlice(self.alloc, req.tools_json);
         try body.appendSlice(self.alloc, "],\"tool_choice\":\"auto\"");
+        // Persisted garbage (the GUI once stored "reasoningEffort") must not
+        // reject the whole request server-side: only documented variants go out.
+        var effort_sent = false;
         if (req.reasoning_effort) |eff| {
-            try body.appendSlice(self.alloc, ",\"reasoning_effort\":\"");
-            try body.appendSlice(self.alloc, eff);
-            try body.appendSlice(self.alloc, "\"}");
-        } else {
-            try body.appendSlice(self.alloc, "}");
+            if (validEffort(eff)) {
+                try body.appendSlice(self.alloc, ",\"reasoning_effort\":\"");
+                try body.appendSlice(self.alloc, eff);
+                try body.appendSlice(self.alloc, "\"}");
+                effort_sent = true;
+            }
         }
+        if (!effort_sent) try body.appendSlice(self.alloc, "}");
         return body.toOwnedSlice(self.alloc);
     }
 
@@ -649,6 +654,15 @@ pub const ChatClient = struct {
         return out.toOwnedSlice(alloc);
     }
 };
+
+/// DeepSeek API's documented reasoning_effort variants. Values outside this
+/// set make the provider reject the whole request body, so anything else
+/// persisted in config (e.g. a GUI enum key) is silently omitted.
+pub fn validEffort(v: []const u8) bool {
+    const variants = [_][]const u8{ "none", "minimal", "low", "medium", "high", "xhigh", "max" };
+    for (variants) |want| if (std.mem.eql(u8, v, want)) return true;
+    return false;
+}
 
 pub fn extractField(obj: []const u8, field: []const u8) ?[]const u8 {
     var buf: [128]u8 = undefined;

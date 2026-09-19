@@ -200,8 +200,7 @@ export function ConversationContent({
         onPick: (workspaceId) => {
           setPickerOpen(false)
           setPendingWorkspaceId(workspaceId)
-          void selectWorkspace(workspaceId).catch((reason: unknown) => {
-            console.error('ZDEBUG selectWorkspace rejected:', reason instanceof Error ? reason.message : String(reason))
+          void selectWorkspace(workspaceId).catch(() => {
             setPendingWorkspaceId(current => current === workspaceId ? undefined : current)
           })
         },
