@@ -222,9 +222,11 @@ pub fn appendNamespaceViewJson(alloc: std.mem.Allocator, out: *std.ArrayList(u8)
 
 /// Schemastery envelope ({uid,refs}) for {default:string,
 /// modeSelectionEnabled:boolean} — same hand-serialized style as
-/// apiproxy/settings.zig's envelopes.
+/// apiproxy/settings.zig's envelopes. uid names the ROOT ref (the object);
+/// Schemastery's fromJSON returns refs[uid], so a uid missing from refs
+/// rehydrates to undefined.
 const schema_agent_presets =
-    \\{"uid":11,"refs":{"1":{"type":"string","meta":{}},"2":{"type":"boolean","meta":{"default":false}},"3":{"type":"object","meta":{"default":{"default":"standard","modeSelectionEnabled":false}},"dict":{"default":1,"modeSelectionEnabled":2}}}}
+    \\{"uid":3,"refs":{"1":{"type":"string","meta":{}},"2":{"type":"boolean","meta":{"default":false}},"3":{"type":"object","meta":{"default":{"default":"standard","modeSelectionEnabled":false}},"dict":{"default":1,"modeSelectionEnabled":2}}}}
 ;
 
 // ── handlers (wired from router.dispatch) ──────────────────────────────────

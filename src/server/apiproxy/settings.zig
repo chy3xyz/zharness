@@ -179,6 +179,12 @@ const schema_locale =
 /// Kept in sync when webui/ is re-vendored.
 pub const onboarding_notice_version = "2026-08-13.1";
 
+/// Verbatim-object schema for the ui-onboarding namespace (uid names the
+/// ROOT ref; an unconstrained object accepts the welcome-notice payload).
+const schema_onboarding =
+    \\{"uid":1,"refs":{"1":{"type":"object","meta":{},"dict":{}}}}
+;
+
 // ── effective-config projection ─────────────────────────────────────────────
 
 /// One scalar field slot shared by the value/user-layer builders and write
@@ -294,8 +300,11 @@ pub fn appendNamespaceView(
         Store.ns_llm_deepseek => schema_llm_deepseek,
         Store.ns_theme => schema_ui_theme,
         Store.ns_locale => schema_locale,
-        // The welcome scope binds a verbatim-object decoder; no envelope.
-        Store.ns_onboarding => null,
+        // Verbatim object (welcomeNoticeVersion + future ack fields): an
+        // unconstrained object envelope so the mirror can rehydrate it — a
+        // null schema throws in Schemastery's fromJSON and the namespace
+        // degrades to "cannot vouch".
+        Store.ns_onboarding => schema_onboarding,
         else => unreachable,
     };
     // Hot semantics: the server re-reads config.toml before every run, so
