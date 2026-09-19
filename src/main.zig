@@ -85,6 +85,12 @@ var g_tool_call_seq = std.atomic.Value(u64).init(1);
 /// Unique-per-message id counter: the client fold keys message identity by
 /// id, so repeated ids collapse distinct turns into one node.
 var g_msg_n = std.atomic.Value(u64).init(1);
+/// Per-prompt turn number: the client groups the transcript into turn blocks
+/// keyed by the events' turn field, so every prompt must open the NEXT turn
+/// (steps restart at 0 within each turn). Hardcoding turn:1 merged every
+/// prompt into the first group and misplaced its messages.
+var g_turn_n = std.atomic.Value(u64).init(0);
+var g_current_turn: u64 = 0;
 var g_current_call_id: [32]u8 = undefined;
 var g_current_call_id_len: usize = 0;
 var g_current_step: u64 = 0;
@@ -149,7 +155,7 @@ fn followPublishLine(alloc: std.mem.Allocator, ev_type: []const u8, seq: u64, li
             remote_mux.publishLine(sid, seq, out);
             return;
         }
-        out = std.fmt.allocPrint(alloc, "{s}\"turn\":1,{s}", .{ out[0 .. didx + marker.len], out[didx + marker.len ..] }) catch return;
+        out = std.fmt.allocPrint(alloc, "{s}\"turn\":{d},{s}", .{ out[0 .. didx + marker.len], g_current_turn, out[didx + marker.len ..] }) catch return;
     }
     remote_mux.publishLine(sid, seq, out);
     if (out.ptr != line.ptr) alloc.free(out);
@@ -181,7 +187,7 @@ fn followAssistantStart() void {
     g_asst_active = true;
     g_asst_start_step = g_current_step;
     g_asst_chunk_index = 0;
-    const frame = std.fmt.allocPrint(gpaAlloc(), "{{\"type\":\"start\",\"attemptId\":\"" ++ asst_attempt_id ++ "\",\"revision\":{d},\"startedAfterSeq\":{d},\"turn\":1,\"step\":{d}}}", .{ remote_mux.nextAssistantRevision(), remote_mux.cursor(), g_asst_start_step }) catch return;
+    const frame = std.fmt.allocPrint(gpaAlloc(), "{{\"type\":\"start\",\"attemptId\":\"" ++ asst_attempt_id ++ "\",\"revision\":{d},\"startedAfterSeq\":{d},\"turn\":{d},\"step\":{d}}}", .{ remote_mux.nextAssistantRevision(), remote_mux.cursor(), g_current_turn, g_asst_start_step }) catch return;
     defer gpaAlloc().free(frame);
     followAssistantFrame(frame);
 }
@@ -263,8 +269,7 @@ fn onEvent(kind: agent.AgentLoop.EventKind, payload: []const u8) void {
                 // Publish step/start event so the client knows a new turn/step has begun,
                 // which suppresses the "Interrupted" markers from previous steps.
                 const A = gpaAlloc();
-                const step_n = g_tool_call_seq.load(.monotonic);
-                const data = std.fmt.allocPrint(A, "{{\"step\":{d}}}", .{step_n}) catch return;
+                const data = std.fmt.allocPrint(A, "{{\"step\":{d}}}", .{g_current_step}) catch return;
                 defer A.free(data);
                 _ = muxPublishEvent("step/start", false, data);
             },
@@ -287,14 +292,14 @@ fn onEvent(kind: agent.AgentLoop.EventKind, payload: []const u8) void {
                 // model payload). The client renders them as a readable code block.
                 const args_j2 = raw_args;
                 const n = g_tool_call_seq.fetchAdd(1, .monotonic);
-                g_current_step = n;
+                g_current_step += 1;
                 g_current_call_id_len = (std.fmt.bufPrint(&g_current_call_id, "call-{d}", .{n}) catch return).len;
                 const call_j = jsonEsc(A, g_current_call_id[0..g_current_call_id_len]) orelse break :blk;
                 defer A.free(call_j);
                 const data = std.fmt.allocPrint(
                     A,
-                    "{{\"turn\":1,\"step\":{d},\"callId\":{s},\"name\":{s},\"arguments\":{s}}}",
-                    .{ n, call_j, name_j, args_j2 },
+                    "{{\"turn\":{d},\"step\":{d},\"callId\":{s},\"name\":{s},\"arguments\":{s}}}",
+                    .{ g_current_turn, g_current_step, call_j, name_j, args_j2 },
                 ) catch break :blk;
                 defer A.free(data);
                 if (std.c.getenv("ZH_DEBUG_FRAME") != null) std.debug.print("[frame:tool_call] {s}\n", .{data});
@@ -307,8 +312,8 @@ fn onEvent(kind: agent.AgentLoop.EventKind, payload: []const u8) void {
                 defer A.free(call_j);
                 const data = std.fmt.allocPrint(
                     A,
-                    "{{\"turn\":1,\"step\":{d},\"message\":{{\"id\":{s},\"role\":\"user\",\"content\":[{{\"type\":\"tool-result\",\"toolCallId\":{s},\"content\":[{{\"type\":\"text\",\"text\":{s}}}]}}],\"source\":{{\"kind\":\"tool\",\"callId\":{s}}}}}}}",
-                    .{ g_current_step, call_j, call_j, o, call_j },
+                    "{{\"turn\":{d},\"step\":{d},\"message\":{{\"id\":{s},\"role\":\"user\",\"content\":[{{\"type\":\"tool-result\",\"toolCallId\":{s},\"content\":[{{\"type\":\"text\",\"text\":{s}}}]}}],\"source\":{{\"kind\":\"tool\",\"callId\":{s}}}}}}}",
+                    .{ g_current_turn, g_current_step, call_j, call_j, o, call_j },
                 ) catch return;
                 defer A.free(data);
                 if (std.c.getenv("ZH_DEBUG_FRAME") != null) std.debug.print("[frame:tool_result] {s}\n", .{data});
@@ -327,8 +332,8 @@ fn onEvent(kind: agent.AgentLoop.EventKind, payload: []const u8) void {
                 // so the client can merge streaming chunks with the final message.
                 const msg_data = std.fmt.allocPrint(
                     gpaAlloc(),
-                    "{{\"turn\":1,\"step\":{d},\"message\":{{\"id\":\"a-{d}\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":{s}}}],\"source\":{{\"kind\":\"model\"}}}},\"stream\":[]}}",
-                    .{ g_current_step, g_msg_n.fetchAdd(1, .monotonic), t },
+                    "{{\"turn\":{d},\"step\":{d},\"message\":{{\"id\":\"a-{d}\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":{s}}}],\"source\":{{\"kind\":\"model\"}}}},\"stream\":[]}}",
+                    .{ g_current_turn, g_current_step, g_msg_n.fetchAdd(1, .monotonic), t },
                 ) catch return;
                 defer gpaAlloc().free(msg_data);
                 const msg_seq = muxPublishEvent("assistant/message", true, msg_data);
@@ -1581,7 +1586,9 @@ fn runDetachedForGui(alloc: std.mem.Allocator, base_cfg: *config.Config, ov: Ser
 
     // Hot config: re-read config.toml for THIS run (settings edits hot-apply).
     var run_cfg = loadRunConfig(alloc, base_cfg, ov) catch {
-        _ = muxPublishEvent("turn/end", false, "{\"turn\":1,\"reason\":{\"kind\":\"error\",\"error\":{\"message\":\"config reload failed\"}}}");
+        const end_data = std.fmt.allocPrint(gpaAlloc(), "{{\"turn\":{d},\"reason\":{{\"kind\":\"error\",\"error\":{{\"message\":\"config reload failed\"}}}}}}", .{@max(g_current_turn, 1)}) catch return;
+        defer gpaAlloc().free(end_data);
+        _ = muxPublishEvent("turn/end", false, end_data);
         pi.deinit(alloc);
         alloc.destroy(pi);
         return;
@@ -1610,10 +1617,14 @@ fn runDetachedForGui(alloc: std.mem.Allocator, base_cfg: *config.Config, ov: Ser
     }
 
     // Canonical live-turn prefix (fixture order): turn/start then the user
-    // bubble carrying the actual prompt text. Message ids are unique per
-    // event — the client fold treats a repeated id as the SAME message being
-    // replaced, so constant ids collapse every turn into the first node.
-    _ = muxPublishEvent("turn/start", false, "{\"turn\":1}");
+    // bubble carrying the actual prompt text. Each prompt opens the NEXT turn
+    // (the client groups the transcript into turn blocks) and steps restart
+    // at 0 within it; message ids stay unique per event.
+    g_current_turn = g_turn_n.fetchAdd(1, .monotonic) + 1;
+    g_current_step = 0;
+    const turn_data = std.fmt.allocPrint(gpaAlloc(), "{{\"turn\":{d}}}", .{g_current_turn}) catch return;
+    defer gpaAlloc().free(turn_data);
+    _ = muxPublishEvent("turn/start", false, turn_data);
     if (jsonEsc(gpaAlloc(), prompt)) |t| {
         defer gpaAlloc().free(t);
         const data = std.fmt.allocPrint(
@@ -1624,15 +1635,21 @@ fn runDetachedForGui(alloc: std.mem.Allocator, base_cfg: *config.Config, ov: Ser
         if (data) |d| {
             defer gpaAlloc().free(d);
             _ = muxPublishEvent("user/message", true, d);
-            _ = muxPublishEvent("step/start", false, "{\"turn\":1,\"step\":0}");
+            const step_data = std.fmt.allocPrint(gpaAlloc(), "{{\"turn\":{d},\"step\":0}}", .{g_current_turn}) catch return;
+            defer gpaAlloc().free(step_data);
+            _ = muxPublishEvent("step/start", false, step_data);
         }
     }
 
     hostPublishFmtSession(session_id, true);
     _ = agentRunOnce(alloc, &run_cfg, run_opts, prompt, session_id) catch {
         if (g_mux_run_error == null) g_mux_run_error = gpaAlloc().dupe(u8, "run failed") catch null;
-        _ = muxPublishEvent("step/end", false, "{\"turn\":1,\"step\":0}");
-        _ = muxPublishEvent("turn/end", false, "{{\"turn\":1,\"reason\":{{\"kind\":\"error\",\"error\":{{\"message\":\"run failed\"}}}}}}");
+        const step_data = std.fmt.allocPrint(gpaAlloc(), "{{\"turn\":{d},\"step\":0}}", .{g_current_turn}) catch return;
+        defer gpaAlloc().free(step_data);
+        _ = muxPublishEvent("step/end", false, step_data);
+        const end_data = std.fmt.allocPrint(gpaAlloc(), "{{\"turn\":{d},\"reason\":{{\"kind\":\"error\",\"error\":{{\"message\":\"run failed\"}}}}}}", .{g_current_turn}) catch return;
+        defer gpaAlloc().free(end_data);
+        _ = muxPublishEvent("turn/end", false, end_data);
         if (jsonEsc(gpaAlloc(), session_id)) |sid| {
             defer gpaAlloc().free(sid);
             const line = std.fmt.allocPrint(gpaAlloc(), "{{\"sessionId\":{s},\"message\":\"run failed\"}}", .{sid}) catch null;
@@ -1654,7 +1671,7 @@ fn runDetachedForGui(alloc: std.mem.Allocator, base_cfg: *config.Config, ov: Ser
         const msg_json = jsonEsc(gpaAlloc(), msg) orelse "";
         defer if (msg_json.len > 0) gpaAlloc().free(msg_json);
         if (msg_json.len > 0) {
-            const data = std.fmt.allocPrint(gpaAlloc(), "{{\"turn\":1,\"reason\":{{\"kind\":\"error\",\"error\":{{\"message\":{s}}}}}}}", .{msg_json}) catch null;
+            const data = std.fmt.allocPrint(gpaAlloc(), "{{\"turn\":{d},\"reason\":{{\"kind\":\"error\",\"error\":{{\"message\":{s}}}}}}}", .{ g_current_turn, msg_json }) catch null;
             if (data) |d| {
                 defer gpaAlloc().free(d);
                 _ = muxPublishEvent("turn/end", false, d);
@@ -1669,8 +1686,12 @@ fn runDetachedForGui(alloc: std.mem.Allocator, base_cfg: *config.Config, ov: Ser
             }
         }
     } else {
-        _ = muxPublishEvent("step/end", false, "{\"turn\":1,\"step\":0}");
-        _ = muxPublishEvent("turn/end", false, "{\"turn\":1,\"reason\":{\"kind\":\"completed\"}}");
+        const step_data = std.fmt.allocPrint(gpaAlloc(), "{{\"turn\":{d},\"step\":{d}}}", .{ g_current_turn, g_current_step }) catch return;
+        defer gpaAlloc().free(step_data);
+        _ = muxPublishEvent("step/end", false, step_data);
+        const end_data = std.fmt.allocPrint(gpaAlloc(), "{{\"turn\":{d},\"reason\":{{\"kind\":\"completed\"}}}}", .{g_current_turn}) catch return;
+        defer gpaAlloc().free(end_data);
+        _ = muxPublishEvent("turn/end", false, end_data);
     }
     hostPublishFmtSession(session_id, false);
     if (job_reg != null) {
