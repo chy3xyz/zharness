@@ -1,0 +1,36 @@
+.root {
+  display: inline-flex;
+}
+
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dsw-alias-label-tertiary);
+  cursor: pointer;
+}
+
+.button:hover,
+.button:focus-visible {
+  color: var(--dsw-alias-label-secondary);
+  background: var(--dsw-alias-fill-tertiary);
+}
+
+.button[data-active] {
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-fill-secondary);
+}
+
+.button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.icon {
+  flex: none;
+}

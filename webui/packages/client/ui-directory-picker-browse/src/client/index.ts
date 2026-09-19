@@ -14,6 +14,10 @@ import type {} from '@deepseek-ai/dsh-client-ui-workspace/client'
 // Type-only: pulls the SlotRegistry service merge (ctx.slots).
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type { BrowseFlowInjected } from './flow.ts'
+
+/** Re-exports for sibling consumers of the raw browser (files-browser header action). */
+export { DirectoryBrowser, type DirectoryBrowserProps } from './DirectoryBrowser.tsx'
+export type { DirectoryEntry, DirectoryListing } from '@deepseek-ai/dsh-api-remotes/client'
 import { BrowseDirectoryFlow } from './flow.ts'
 
 /** Locale namespace owning the browser dialog's copy. */
