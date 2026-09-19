@@ -59,6 +59,19 @@ pub fn defaultPresetOf(entries: ?[]const config.TomlEntry) []const u8 {
     return default_preset_name;
 }
 
+/// Resolve the document mode-selection flag (falls back to false).
+pub fn modeSelectionOf(entries: ?[]const config.TomlEntry) bool {
+    const list = entries orelse return false;
+    for (list) |e| {
+        if (std.mem.eql(u8, e.section, "general") and
+            std.mem.eql(u8, e.key, "mode_selection_enabled") and e.val == .boolean)
+        {
+            return e.val.boolean;
+        }
+    }
+    return false;
+}
+
 /// Persist the default preset through the settings Store under the shared
 /// fenced commit. Revision counter is module-global (restart resets, same
 /// documented posture as Store.revisions).
@@ -174,7 +187,7 @@ pub fn appendPresetEntryJson(alloc: std.mem.Allocator, out: *std.ArrayList(u8), 
     try out.append(alloc, '}');
 }
 
-pub fn listValue(alloc: std.mem.Allocator, default_name: []const u8) ![]u8 {
+pub fn listValue(alloc: std.mem.Allocator, default_name: []const u8, mode_selection_enabled: bool) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     try out.appendSlice(alloc, "{\"presets\":[");
@@ -184,27 +197,34 @@ pub fn listValue(alloc: std.mem.Allocator, default_name: []const u8) ![]u8 {
         try appendPresetEntryJson(alloc, &out, s, default_name, &first);
     }
     // Deployment facts: no user-writable root, no native opener.
-    try out.appendSlice(alloc, "],\"authorable\":false,\"hasDocument\":false}");
+    try out.appendSlice(alloc, "],\"authorable\":false,\"hasDocument\":false,\"modeSelectionEnabled\":");
+    try out.appendSlice(alloc, if (mode_selection_enabled) "true" else "false");
+    try out.append(alloc, '}');
     return out.toOwnedSlice(alloc);
 }
 
 /// settings namespace view for the intercepted "agent-presets" ns
 /// (settingsNamespaceViewSchema shape).
-pub fn appendNamespaceViewJson(alloc: std.mem.Allocator, out: *std.ArrayList(u8), revision: u64, current_default: []const u8) !void {
+pub fn appendNamespaceViewJson(alloc: std.mem.Allocator, out: *std.ArrayList(u8), revision: u64, current_default: []const u8, mode_selection_enabled: bool) !void {
     try out.appendSlice(alloc, "{\"ns\":\"agent-presets\",\"schema\":" ++ schema_agent_presets ++
         ",\"value\":{\"default\":");
     try jsonx.appendJsonString(alloc, out, current_default);
+    try out.appendSlice(alloc, ",\"modeSelectionEnabled\":");
+    try out.appendSlice(alloc, if (mode_selection_enabled) "true" else "false");
     try out.appendSlice(alloc, "},\"user\":{\"default\":");
     try jsonx.appendJsonString(alloc, out, current_default);
+    try out.appendSlice(alloc, ",\"modeSelectionEnabled\":");
+    try out.appendSlice(alloc, if (mode_selection_enabled) "true" else "false");
     try out.appendSlice(alloc, "},\"applies\":\"live\",\"secrets\":[],\"revision\":");
     try jsonx.appendInt(alloc, out, @intCast(revision));
     try out.append(alloc, '}');
 }
 
-/// Schemastery envelope ({uid,refs}) for {default:string} — same hand-
-/// serialized style as apiproxy/settings.zig's envelopes.
+/// Schemastery envelope ({uid,refs}) for {default:string,
+/// modeSelectionEnabled:boolean} — same hand-serialized style as
+/// apiproxy/settings.zig's envelopes.
 const schema_agent_presets =
-    \\{"uid":11,"refs":{"1":{"type":"string","meta":{}},"2":{"type":"object","meta":{"default":{"default":"standard"}},"dict":{"default":1}}}}
+    \\{"uid":11,"refs":{"1":{"type":"string","meta":{}},"2":{"type":"boolean","meta":{"default":false}},"3":{"type":"object","meta":{"default":{"default":"standard","modeSelectionEnabled":false}},"dict":{"default":1,"modeSelectionEnabled":2}}}}
 ;
 
 // ── handlers (wired from router.dispatch) ──────────────────────────────────
@@ -217,8 +237,9 @@ fn docEntries(deps: *const router.ApiProxyDeps, alloc: std.mem.Allocator) ?[]con
 }
 
 pub fn handleList(deps: *const router.ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: []const u8) !router.UnaryResponse {
-    const def = defaultPresetOf(docEntries(deps, alloc));
-    const value = try listValue(alloc, def);
+    const entries = docEntries(deps, alloc);
+    const def = defaultPresetOf(entries);
+    const value = try listValue(alloc, def, modeSelectionOf(entries));
     return router.okValue(alloc, rpc_id, value);
 }
 

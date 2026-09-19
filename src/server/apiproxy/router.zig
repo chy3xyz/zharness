@@ -1730,7 +1730,9 @@ fn docEntriesForHome(home: []const u8, alloc: std.mem.Allocator) ?[]config.TomlE
 }
 
 /// One pseudo-settings namespace descriptor: a single string field with a
-/// validated value domain, persisted under one [general] key.
+/// validated value domain, persisted under one [general] key. An optional
+/// second BOOLEAN field (agent-presets' modeSelectionEnabled) persists under
+/// kv_key2.
 const CustomNsSpec = struct {
     ns_name: []const u8,
     field: []const u8,
@@ -1744,8 +1746,14 @@ const CustomNsSpec = struct {
     revision_counter: *const fn () *u64,
     /// Effective current value from document entries ⊕ default.
     currentOf: *const fn (?[]const config.TomlEntry) []const u8,
-    /// Render the namespace view ({ns…} object).
-    view: *const fn (std.mem.Allocator, *std.ArrayList(u8), u64, []const u8) anyerror!void,
+    /// Render the namespace view ({ns…} object); the trailing param is the
+    /// second field's effective value when the spec declares one.
+    view: *const fn (std.mem.Allocator, *std.ArrayList(u8), u64, []const u8, ?bool) anyerror!void,
+    /// Optional second field (boolean only) and its TOML landing spot.
+    field2: ?[]const u8 = null,
+    kv_key2: ?[]const u8 = null,
+    /// Effective current value of field2 from document entries ⊕ default.
+    currentOf2: ?*const fn (?[]const config.TomlEntry) bool = null,
 };
 
 const custom_specs = [_]CustomNsSpec{
@@ -1758,6 +1766,9 @@ const custom_specs = [_]CustomNsSpec{
         .revision_counter = presetsRevision,
         .currentOf = presetsCurrent,
         .view = presetsView,
+        .field2 = "modeSelectionEnabled",
+        .kv_key2 = "mode_selection_enabled",
+        .currentOf2 = presetsModeSelectionOf,
     },
     .{
         .ns_name = "permission",
@@ -1780,8 +1791,20 @@ fn presetsRevision() *u64 {
 fn presetsCurrent(entries: ?[]const config.TomlEntry) []const u8 {
     return presets_rpc.defaultPresetOf(entries);
 }
-fn presetsView(alloc: std.mem.Allocator, out: *std.ArrayList(u8), rev: u64, cur: []const u8) anyerror!void {
-    try presets_rpc.appendNamespaceViewJson(alloc, out, rev, cur);
+/// [general] mode_selection_enabled ⊕ false — the new-session preset picker.
+fn presetsModeSelectionOf(entries: ?[]const config.TomlEntry) bool {
+    const list = entries orelse return false;
+    for (list) |e| {
+        if (std.mem.eql(u8, e.section, "general") and
+            std.mem.eql(u8, e.key, "mode_selection_enabled") and e.val == .boolean)
+        {
+            return e.val.boolean;
+        }
+    }
+    return false;
+}
+fn presetsView(alloc: std.mem.Allocator, out: *std.ArrayList(u8), rev: u64, cur: []const u8, mode_enabled: ?bool) anyerror!void {
+    try presets_rpc.appendNamespaceViewJson(alloc, out, rev, cur, mode_enabled orelse false);
 }
 fn permsValidate(v: []const u8) bool {
     return perms_rpc.validPreset(v);
@@ -1798,7 +1821,8 @@ fn permsRevision() *u64 {
 fn permsCurrent(entries: ?[]const config.TomlEntry) []const u8 {
     return perms_rpc.currentPresetOf(entries);
 }
-fn permsView(alloc: std.mem.Allocator, out: *std.ArrayList(u8), rev: u64, cur: []const u8) anyerror!void {
+fn permsView(alloc: std.mem.Allocator, out: *std.ArrayList(u8), rev: u64, cur: []const u8, mode_enabled: ?bool) anyerror!void {
+    _ = mode_enabled;
     try perms_rpc.appendNamespaceViewJson(alloc, out, rev, cur);
 }
 
@@ -1825,6 +1849,7 @@ fn customNamespaceWrite(
         return internalError(alloc, rpc_id, "settings are not implemented on this host");
 
     var final_val: ?config.TomlValue = null;
+    var final_val2: ?config.TomlValue = null;
     var touched = false;
 
     switch (mode) {
@@ -1837,9 +1862,13 @@ fn customNamespaceWrite(
             var it = jsonx.MemberIter.init(body);
             while (it.next()) |m| {
                 const key = jsonx.decodeString(alloc, m.key) catch return error.OutOfMemory;
-                if (!std.mem.eql(u8, key, spec.field)) return mapOpError(error.UnknownField);
-                final_val = parseTomlValueRaw(alloc, m.value) catch |e| return e;
-                touched = true;
+                if (std.mem.eql(u8, key, spec.field)) {
+                    final_val = parseTomlValueRaw(alloc, m.value) catch |e| return e;
+                    touched = true;
+                } else if (spec.field2 != null and std.mem.eql(u8, key, spec.field2.?)) {
+                    final_val2 = parseTomlValueRaw(alloc, m.value) catch |e| return e;
+                    touched = true;
+                } else return mapOpError(error.UnknownField);
             }
         },
         // ops carry [{op:"set"|"unset", path:["<field>"], value?}].
@@ -1864,13 +1893,19 @@ fn customNamespaceWrite(
                 const path_raw = jsonx.getRaw(op, "path") orelse return error.PayloadInvalid;
                 if (!isJsonArrayRaw(path_raw)) return error.PayloadInvalid;
                 const first = firstPathSegment(alloc, path_raw) orelse return error.PayloadInvalid;
-                if (!std.mem.eql(u8, first, spec.field)) return mapOpError(error.UnknownField);
-
-                final_val = if (is_set)
-                    parseTomlValueRaw(alloc, jsonx.getRaw(op, "value") orelse return error.PayloadInvalid) catch |e| return e
-                else
-                    null;
-                touched = true;
+                if (std.mem.eql(u8, first, spec.field)) {
+                    final_val = if (is_set)
+                        parseTomlValueRaw(alloc, jsonx.getRaw(op, "value") orelse return error.PayloadInvalid) catch |e| return e
+                    else
+                        null;
+                    touched = true;
+                } else if (spec.field2 != null and std.mem.eql(u8, first, spec.field2.?)) {
+                    final_val2 = if (is_set)
+                        parseTomlValueRaw(alloc, jsonx.getRaw(op, "value") orelse return error.PayloadInvalid) catch |e| return e
+                    else
+                        null;
+                    touched = true;
+                } else return mapOpError(error.UnknownField);
             }
         },
     }
@@ -1897,24 +1932,30 @@ fn customNamespaceWrite(
             // for the permission namespace; identity for agent-presets).
             final_val = .{ .str = spec.map_value(v.str) };
         }
-        commitCustomKv(store, alloc, .{
+        if (final_val2) |v| {
+            if (v != .boolean) return errValue(
+                alloc,
+                rpc_id,
+                .settings_rejected,
+                "value type does not match the namespace schema",
+                "{\"issues\":[]}",
+            );
+        }
+        if (final_val != null) commitCustomKv(store, alloc, .{
             .section = "general",
             .key = spec.kv_key,
             .value = final_val,
         }, spec.revision_counter(), expectedRevisionOf(payload)) catch |e| switch (e) {
-            error.RevisionConflict => {
-                var d: std.ArrayList(u8) = .empty;
-                defer d.deinit(alloc);
-                const want = expectedRevisionOf(payload) orelse -1;
-                try d.appendSlice(alloc, "{\"ns\":");
-                try jsonx.appendJsonString(alloc, &d, spec.ns_name);
-                try d.appendSlice(alloc, ",\"expected\":");
-                try jsonx.appendInt(alloc, &d, want);
-                try d.appendSlice(alloc, ",\"actual\":");
-                try jsonx.appendInt(alloc, &d, @intCast(spec.revision_counter().*));
-                try d.append(alloc, '}');
-                return errValue(alloc, rpc_id, .settings_conflict, "settings were changed elsewhere; reload and retry", d.items);
-            },
+            error.RevisionConflict => return revisionConflictResponse(alloc, rpc_id, spec, payload),
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return internalError(alloc, rpc_id, "failed to persist config.toml"),
+        };
+        if (final_val2 != null) commitCustomKv(store, alloc, .{
+            .section = "general",
+            .key = spec.kv_key2.?,
+            .value = final_val2,
+        }, spec.revision_counter(), expectedRevisionOf(payload)) catch |e| switch (e) {
+            error.RevisionConflict => return revisionConflictResponse(alloc, rpc_id, spec, payload),
             error.OutOfMemory => return error.OutOfMemory,
             else => return internalError(alloc, rpc_id, "failed to persist config.toml"),
         };
@@ -1924,8 +1965,22 @@ fn customNamespaceWrite(
     var view: std.ArrayList(u8) = .empty;
     errdefer view.deinit(alloc);
     const entries = docEntriesForHome(deps.home, alloc);
-    try spec.view(alloc, &view, spec.revision_counter().*, spec.currentOf(entries));
+    try spec.view(alloc, &view, spec.revision_counter().*, spec.currentOf(entries), if (spec.currentOf2) |f| f(entries) else null);
     return okValue(alloc, rpc_id, view.items);
+}
+
+fn revisionConflictResponse(alloc: std.mem.Allocator, rpc_id: []const u8, spec: *const CustomNsSpec, payload: []const u8) !UnaryResponse {
+    var d: std.ArrayList(u8) = .empty;
+    defer d.deinit(alloc);
+    const want = expectedRevisionOf(payload) orelse -1;
+    try d.appendSlice(alloc, "{\"ns\":");
+    try jsonx.appendJsonString(alloc, &d, spec.ns_name);
+    try d.appendSlice(alloc, ",\"expected\":");
+    try jsonx.appendInt(alloc, &d, want);
+    try d.appendSlice(alloc, ",\"actual\":");
+    try jsonx.appendInt(alloc, &d, @intCast(spec.revision_counter().*));
+    try d.append(alloc, '}');
+    return errValue(alloc, rpc_id, .settings_conflict, "settings were changed elsewhere; reload and retry", d.items);
 }
 
 /// Splice the two pseudo-namespace views into a settings.describe VALUE so
@@ -1948,7 +2003,7 @@ fn augmentDescribeValue(
 
     var preset_view: std.ArrayList(u8) = .empty;
     defer preset_view.deinit(alloc);
-    try presets_rpc.appendNamespaceViewJson(alloc, &preset_view, presets_rpc.revisionPtr().*, presets_rpc.defaultPresetOf(entries));
+    try presets_rpc.appendNamespaceViewJson(alloc, &preset_view, presets_rpc.revisionPtr().*, presets_rpc.defaultPresetOf(entries), presets_rpc.modeSelectionOf(entries));
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
