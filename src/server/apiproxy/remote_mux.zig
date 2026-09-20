@@ -27,6 +27,11 @@ const jsonx = @import("jsonx.zig");
 const c_alloc = std.heap.c_allocator;
 
 extern "c" fn clock_gettime(clk_id: c_int, tp: *std.c.timespec) c_int;
+extern "c" fn fopen(path: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
+extern "c" fn fread(buf: [*]u8, size: usize, n: usize, f: *anyopaque) usize;
+extern "c" fn fseek(f: *anyopaque, off: c_long, whence: c_int) c_int;
+extern "c" fn ftell(f: *anyopaque) c_long;
+extern "c" fn fclose(f: *anyopaque) c_int;
 
 /// Wall-clock milliseconds (CLOCK_REALTIME = 0), the std.time.milliTimestamp
 /// equivalent for this toolchain generation.
@@ -215,20 +220,26 @@ pub fn sendWorkspaceBaseline(alloc: std.mem.Allocator, s: *Stream) void {
     var path_json: std.ArrayList(u8) = .empty;
     defer path_json.deinit(alloc);
     jsonx.appendJsonString(alloc, &path_json, path) catch return;
-    const ids_json = sessionIdsJson(alloc) catch return;
-    defer alloc.free(ids_json);
 
     lock();
     defer unlock();
     var items: std.ArrayList(u8) = .empty;
     defer items.deinit(alloc);
-    items.appendSlice(alloc, "[{") catch return;
-    items.appendSlice(alloc, "\"workspaceId\":\"ws-zharness\",\"path\":") catch return;
-    items.appendSlice(alloc, path_json.items) catch return;
-    items.appendSlice(alloc, ",\"title\":\"zharness\",\"sessionIds\":") catch return;
-    items.appendSlice(alloc, ids_json) catch return;
-    items.appendSlice(alloc, ",\"createdAt\":\"2026-01-01T00:00:00.000Z\",\"updatedAt\":\"2026-01-01T00:00:00.000Z\"}") catch return;
+    // Root workspace row with its own member list (sessions with no
+    // membership entry, or recorded at the root path).
+    {
+        const ids_json = sessionIdsJson(alloc, null) catch return;
+        defer alloc.free(ids_json);
+        items.appendSlice(alloc, "[{") catch return;
+        items.appendSlice(alloc, "\"workspaceId\":\"ws-zharness\",\"path\":") catch return;
+        items.appendSlice(alloc, path_json.items) catch return;
+        items.appendSlice(alloc, ",\"title\":\"zharness\",\"sessionIds\":") catch return;
+        items.appendSlice(alloc, ids_json) catch return;
+        items.appendSlice(alloc, ",\"createdAt\":\"2026-01-01T00:00:00.000Z\",\"updatedAt\":\"2026-01-01T00:00:00.000Z\"}") catch return;
+    }
     for (g_extra_ws.items) |e| {
+        const ids_json = sessionIdsJson(alloc, e.path) catch continue;
+        defer alloc.free(ids_json);
         var p_json: std.ArrayList(u8) = .empty;
         defer p_json.deinit(alloc);
         jsonx.appendJsonString(alloc, &p_json, e.path) catch continue;
@@ -238,7 +249,9 @@ pub fn sendWorkspaceBaseline(alloc: std.mem.Allocator, s: *Stream) void {
         items.appendSlice(alloc, p_json.items) catch return;
         items.appendSlice(alloc, ",\"title\":") catch return;
         jsonx.appendJsonString(alloc, &items, e.title) catch return;
-        items.appendSlice(alloc, ",\"sessionIds\":[],\"createdAt\":\"2026-01-01T00:00:00.000Z\",\"updatedAt\":\"2026-01-01T00:00:00.000Z\"}") catch return;
+        items.appendSlice(alloc, ",\"sessionIds\":") catch return;
+        items.appendSlice(alloc, ids_json) catch return;
+        items.appendSlice(alloc, ",\"createdAt\":\"2026-01-01T00:00:00.000Z\",\"updatedAt\":\"2026-01-01T00:00:00.000Z\"}") catch return;
     }
     items.appendSlice(alloc, "],\"archivedSessionIds\":[]") catch return;
 
@@ -274,6 +287,23 @@ pub fn extraWorkspacePaths(alloc: std.mem.Allocator) ![][]const u8 {
     const out = try alloc.alloc([]const u8, g_extra_ws.items.len);
     for (g_extra_ws.items, 0..) |e, i| out[i] = e.path;
     return out;
+}
+
+/// Resolve a workspace id onto its directory. The root id maps to the server
+/// cwd; adopted ids map to their recorded path. Caller owns the memory.
+pub fn workspacePathFor(alloc: std.mem.Allocator, id: []const u8) ?[]u8 {
+    if (std.mem.eql(u8, id, "ws-zharness")) {
+        var buf: [4096]u8 = undefined;
+        const n = std.c.getcwd(&buf, buf.len);
+        if (n == null) return null;
+        return alloc.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(&buf)))) catch null;
+    }
+    lock();
+    defer unlock();
+    for (g_extra_ws.items) |e| {
+        if (std.mem.eql(u8, e.id, id)) return alloc.dupe(u8, e.path) catch null;
+    }
+    return null;
 }
 
 /// Forward one Gateway-internal event/waterfall frame value to every
@@ -359,9 +389,59 @@ const CDirIterator = struct {
     }
 };
 
-/// Session ids (JSON array) for the workspace view: every session file under
-/// `<cwd>/.zharness/sessions` (index.json excluded). Caller owns the memory.
-fn sessionIdsJson(alloc: std.mem.Allocator) ![]u8 {
+/// The workspace-membership map (`<cwd>/.zharness/sessions/workspaces.json`,
+/// `"sid":"cwd",…`) or null. c_alloc-backed; caller frees.
+fn membershipMap() ?[]u8 {
+    const path = std.fmt.allocPrint(c_alloc, ".zharness/sessions/workspaces.json", .{}) catch return null;
+    defer c_alloc.free(path);
+    const f = fopen(@ptrCast(path.ptr), "rb") orelse return null;
+    defer _ = fclose(f);
+    _ = fseek(f, 0, 2);
+    const len: usize = @intCast(@max(ftell(f), 0));
+    _ = fseek(f, 0, 0);
+    if (len == 0 or len > (1 << 20)) return null;
+    const raw = c_alloc.alloc(u8, len) catch return null;
+    const got = fread(raw.ptr, 1, len, f);
+    return raw[0..got];
+}
+
+/// The workspace path recorded for `sid` in the membership map, or null.
+fn membershipFor(map: []const u8, sid: []const u8) ?[]const u8 {
+    var key_buf: [96]u8 = undefined;
+    if (sid.len + 2 > key_buf.len) return null;
+    key_buf[0] = '"';
+    @memcpy(key_buf[1 .. sid.len + 1], sid);
+    key_buf[sid.len + 1] = '"';
+    const key = key_buf[0 .. sid.len + 2];
+    const pos = std.mem.indexOf(u8, map, key) orelse return null;
+    var v = pos + key.len;
+    while (v < map.len and (map[v] == ' ' or map[v] == ':')) : (v += 1) {
+        if (map[v] == ':') {
+            v += 1;
+            break;
+        }
+    }
+    while (v < map.len and map[v] == ' ') : (v += 1) {}
+    if (v >= map.len or map[v] != '"') return null;
+    const end = std.mem.indexOfScalarPos(u8, map, v + 1, '"') orelse return null;
+    return map[v + 1 .. end];
+}
+
+/// Whether session file `name` belongs to the workspace at `ws_path` (null ⇒
+/// the root workspace: sessions with no membership entry or the root path).
+fn sessionBelongsTo(name: []const u8, ws_path: ?[]const u8) bool {
+    const stem = name[0 .. name.len - 5];
+    const map = membershipMap() orelse return ws_path == null;
+    defer c_alloc.free(map);
+    const recorded = membershipFor(map, stem) orelse return ws_path == null;
+    if (ws_path) |p| return std.mem.eql(u8, recorded, p);
+    return false;
+}
+
+/// Session ids (JSON array) for the workspace at `ws_path` (null ⇒ the root
+/// workspace): every session file under `.zharness/sessions` whose membership
+/// maps to that path. Caller owns the memory.
+fn sessionIdsJson(alloc: std.mem.Allocator, ws_path: ?[]const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     try out.append(alloc, '[');
@@ -374,6 +454,8 @@ fn sessionIdsJson(alloc: std.mem.Allocator) ![]u8 {
     while (it.next()) |name| {
         if (!std.mem.endsWith(u8, name, ".json")) continue;
         if (std.mem.eql(u8, name, "index.json")) continue;
+        if (std.mem.eql(u8, name, "workspaces.json")) continue;
+        if (!sessionBelongsTo(name, ws_path)) continue;
         if (!first) try out.append(alloc, ',');
         first = false;
         const stem = name[0 .. name.len - 5];
@@ -385,27 +467,66 @@ fn sessionIdsJson(alloc: std.mem.Allocator) ![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
-/// workspace.follow upsert increment: the synthesized workspace with its
-/// CURRENT member list. Broadcast after every session.create so connected
-/// pages see workspace.sessionIds grow (the picker/composer gate reads it).
+/// workspace.follow upsert increments for EVERY workspace (root + adopted):
+/// each carries its own grouped member list. Broadcast after every
+/// session.create so connected pages see the right workspace's sessionIds
+/// grow (the picker/composer gate reads it).
 pub fn publishWorkspaceUpsertFromDir(alloc: std.mem.Allocator) void {
-    const ids = sessionIdsJson(alloc) catch return;
-    defer alloc.free(ids);
-    if (std.c.getenv("ZH_DEBUG_RPC") != null)
-        std.debug.print("[ws-upsert] sessionIds={s}\n", .{ids});
-
-    var id_json: std.ArrayList(u8) = .empty;
-    defer id_json.deinit(c_alloc);
+    _ = alloc;
+    var buf: [4096]u8 = undefined;
+    const root_path: []u8 = blk: {
+        const n = std.c.getcwd(&buf, buf.len);
+        if (n != null) break :blk c_alloc.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(&buf)))) catch return;
+        break :blk c_alloc.dupe(u8, ".") catch return;
+    };
+    defer c_alloc.free(root_path);
 
     lock();
     defer unlock();
+    var id_json: std.ArrayList(u8) = .empty;
+    defer id_json.deinit(c_alloc);
     for (g_streams.items) |s| {
         if (s.kind != .workspace) continue;
         id_json.clearRetainingCapacity();
         jsonx.appendJsonString(c_alloc, &id_json, s.stream_id) catch continue;
-        const frame = std.fmt.allocPrint(c_alloc, "{{\"type\":\"item\",\"streamId\":{s},\"value\":{{\"type\":\"upsert\",\"workspace\":{{\"workspaceId\":\"ws-zharness\",\"path\":\".\",\"title\":\"zharness\",\"sessionIds\":{s},\"createdAt\":\"2026-01-01T00:00:00.000Z\",\"updatedAt\":\"2026-01-01T00:00:00.000Z\"}}}}}}", .{ id_json.items, ids }) catch continue;
-        defer c_alloc.free(frame);
-        s.conn.writeText(frame) catch {};
+
+        var frames: std.ArrayList(u8) = .empty;
+        defer frames.deinit(c_alloc);
+        // Root workspace row.
+        {
+            const ids = sessionIdsJson(c_alloc, null) catch continue;
+            defer c_alloc.free(ids);
+            var p_json: std.ArrayList(u8) = .empty;
+            defer p_json.deinit(c_alloc);
+            jsonx.appendJsonString(c_alloc, &p_json, root_path) catch continue;
+            frames.appendSlice(c_alloc, "{\"type\":\"item\",\"streamId\":") catch continue;
+            frames.appendSlice(c_alloc, id_json.items) catch continue;
+            frames.appendSlice(c_alloc, ",\"value\":{\"type\":\"upsert\",\"workspace\":{\"workspaceId\":\"ws-zharness\",\"path\":") catch continue;
+            frames.appendSlice(c_alloc, p_json.items) catch continue;
+            frames.appendSlice(c_alloc, ",\"title\":\"zharness\",\"sessionIds\":") catch continue;
+            frames.appendSlice(c_alloc, ids) catch continue;
+            frames.appendSlice(c_alloc, ",\"createdAt\":\"2026-01-01T00:00:00.000Z\",\"updatedAt\":\"2026-01-01T00:00:00.000Z\"}}}") catch continue;
+        }
+        // Adopted workspace rows.
+        for (g_extra_ws.items) |e| {
+            const ids = sessionIdsJson(c_alloc, e.path) catch continue;
+            defer c_alloc.free(ids);
+            var p_json: std.ArrayList(u8) = .empty;
+            defer p_json.deinit(c_alloc);
+            jsonx.appendJsonString(c_alloc, &p_json, e.path) catch continue;
+            frames.appendSlice(c_alloc, ",{\"type\":\"item\",\"streamId\":") catch continue;
+            frames.appendSlice(c_alloc, id_json.items) catch continue;
+            frames.appendSlice(c_alloc, ",\"value\":{\"type\":\"upsert\",\"workspace\":{\"workspaceId\":") catch continue;
+            jsonx.appendJsonString(c_alloc, &frames, e.id) catch continue;
+            frames.appendSlice(c_alloc, ",\"path\":") catch continue;
+            frames.appendSlice(c_alloc, p_json.items) catch continue;
+            frames.appendSlice(c_alloc, ",\"title\":") catch continue;
+            jsonx.appendJsonString(c_alloc, &frames, e.title) catch continue;
+            frames.appendSlice(c_alloc, ",\"sessionIds\":") catch continue;
+            frames.appendSlice(c_alloc, ids) catch continue;
+            frames.appendSlice(c_alloc, ",\"createdAt\":\"2026-01-01T00:00:00.000Z\",\"updatedAt\":\"2026-01-01T00:00:00.000Z\"}}}") catch continue;
+        }
+        s.conn.writeText(frames.items) catch {};
     }
 }
 

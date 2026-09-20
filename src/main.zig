@@ -624,6 +624,80 @@ fn obsEmit(kind: agent.AgentLoop.EventKind, payload: []const u8) void {
 
 // ── loop extensions: skills / memory / plan / goal (dev.md §XIII–XVII) ─────
 
+// Workspace membership: `<root>/.zharness/sessions/workspaces.json` maps
+// sessionId → workspace path for sessions created in a non-root workspace.
+// Storage stays at the root; the map drives sidebar grouping and the run's
+// tool-execution cwd.
+
+/// Path of the membership map file. Caller owns the memory.
+fn sessionWsMapPath(alloc: std.mem.Allocator, root_cwd: []const u8) ![]u8 {
+    return std.fmt.allocPrint(alloc, "{s}/.zharness/sessions/workspaces.json", .{root_cwd});
+}
+
+/// Read the map as a raw JSON object body (`"sid":"cwd",…`) or null.
+fn readSessionWsMap(alloc: std.mem.Allocator, io: std.Io, root_cwd: []const u8) ?[]u8 {
+    const path = sessionWsMapPath(alloc, root_cwd) catch return null;
+    defer alloc.free(path);
+    return std.Io.Dir.readFileAlloc(.cwd(), io, path, alloc, .unlimited) catch null;
+}
+
+/// Record `sid` as belonging to the workspace at `ws_cwd`. Best effort.
+fn recordSessionWs(alloc: std.mem.Allocator, io: std.Io, root_cwd: []const u8, sid: []const u8, ws_cwd: []const u8) void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(alloc);
+    if (readSessionWsMap(alloc, io, root_cwd)) |raw| {
+        defer alloc.free(raw);
+        // Keep every prior entry verbatim except the one being replaced.
+        var it = apix_jsonx.MemberIter.init(raw);
+        while (it.next()) |m| {
+            const key = apix_jsonx.decodeString(alloc, m.key) catch continue;
+            defer alloc.free(key);
+            if (std.mem.eql(u8, key, sid)) continue;
+            body.appendSlice(alloc, if (body.items.len > 0) "," else "") catch return;
+            body.appendSlice(alloc, m.key) catch return;
+            body.append(alloc, ':') catch return;
+            body.appendSlice(alloc, m.value) catch return;
+        }
+    }
+    var sid_j: std.ArrayList(u8) = .empty;
+    defer sid_j.deinit(alloc);
+    apix_jsonx.appendJsonString(alloc, &sid_j, sid) catch return;
+    var cwd_j: std.ArrayList(u8) = .empty;
+    defer cwd_j.deinit(alloc);
+    apix_jsonx.appendJsonString(alloc, &cwd_j, ws_cwd) catch return;
+    const doc = std.fmt.allocPrint(alloc, "{{{s}{s}:{s}}}", .{ body.items, sid_j.items, cwd_j.items }) catch return;
+    defer alloc.free(doc);
+    const path = sessionWsMapPath(alloc, root_cwd) catch return;
+    defer alloc.free(path);
+    const dir = std.fs.path.dirname(path) orelse return;
+    std.Io.Dir.createDirPath(.cwd(), io, dir) catch {};
+    std.Io.Dir.writeFile(.cwd(), io, .{ .sub_path = path, .data = doc }) catch {};
+}
+
+/// The workspace cwd recorded for `sid`, or null when it belongs to the root.
+fn sessionWsFor(alloc: std.mem.Allocator, io: std.Io, root_cwd: []const u8, sid: []const u8) ?[]const u8 {
+    const raw = readSessionWsMap(alloc, io, root_cwd) orelse return null;
+    defer alloc.free(raw);
+    var sid_buf: [84]u8 = undefined;
+    if (sid.len + 2 > sid_buf.len) return null;
+    sid_buf[0] = '"';
+    @memcpy(sid_buf[1 .. sid.len + 1], sid);
+    sid_buf[sid.len + 1] = '"';
+    const key = sid_buf[0 .. sid.len + 2];
+    const pos = std.mem.indexOf(u8, raw, key) orelse return null;
+    var v = pos + key.len;
+    while (v < raw.len and (raw[v] == ' ' or raw[v] == ':')) : (v += 1) {
+        if (raw[v] == ':') {
+            v += 1;
+            break;
+        }
+    }
+    while (v < raw.len and (raw[v] == ' ' or raw[v] == '\t')) : (v += 1) {}
+    if (v >= raw.len or raw[v] != '"') return null;
+    const end = std.mem.indexOfScalarPos(u8, raw, v + 1, '"') orelse return null;
+    return apix_jsonx.decodeString(alloc, raw[v + 1 .. end]) catch null;
+}
+
 /// Re-register the workspaces adopted in earlier runs: config.toml
 /// [workspaces] adopted = ["<abs path>", …] → remote.mux baseline rows
 /// under deterministic ws-<hash> ids.
@@ -1409,6 +1483,11 @@ fn apxListSessions(ctx: ?*anyopaque, alloc: std.mem.Allocator) anyerror![]apipro
         }
         const title_src: []const u8 = title orelse id;
         defer if (title) |t| alloc.free(t);
+        // Workspace membership: sessions created in an adopted workspace
+        // report its path (the client groups by cwd); the rest sit at root.
+        const sess_cwd: []const u8 = sessionWsFor(alloc, io, st.cfg.cwd, id) orelse
+            try alloc.dupe(u8, st.cfg.cwd);
+        defer if (!std.mem.eql(u8, sess_cwd, st.cfg.cwd)) alloc.free(sess_cwd);
         const proj = try std.fmt.allocPrint(
             alloc,
             "{{\"asOfSeq\":-1,\"values\":{{\"title\":\"{s}\"}}}}",
@@ -1420,7 +1499,7 @@ fn apxListSessions(ctx: ?*anyopaque, alloc: std.mem.Allocator) anyerror![]apipro
             .updated_at_ms = updated,
             .running = false,
             .blank = blank,
-            .cwd = try alloc.dupe(u8, st.cfg.cwd),
+            .cwd = try alloc.dupe(u8, sess_cwd),
             .projections_json = try alloc.dupe(u8, proj),
         });
     }
@@ -1517,6 +1596,17 @@ fn apxCreateSession(
     }
     s.* = try session.Session.init(alloc, final_id);
     try s.save(io, path);
+    // Workspace membership: a session created in an adopted workspace records
+    // that directory — sidebar grouping and the run's tool-execution cwd both
+    // read it. Root-workspace sessions stay unmapped (the default).
+    if (opts.workspace_id) |wid| {
+        if (remote_mux.workspacePathFor(alloc, wid)) |ws_path| {
+            defer alloc.free(ws_path);
+            if (!std.mem.eql(u8, ws_path, st.cfg.cwd)) {
+                recordSessionWs(alloc, io, st.cfg.cwd, final_id, ws_path);
+            }
+        }
+    }
     // Sidebar liveness: announce the new (blank) session on the host hub.
     if (jsonEsc(gpaAlloc(), final_id)) |sid| {
         defer gpaAlloc().free(sid);
@@ -1624,10 +1714,15 @@ fn apxPromptSession(ctx: ?*anyopaque, alloc: std.mem.Allocator, req: apiproxy.Pr
         st.alloc.dupe(u8, rid) catch return error.OutOfMemory
     else
         null;
+    // Workspace sessions execute in their workspace directory (tool cwd);
+    // storage stays at the server root. sessionWsFor allocates from st.alloc,
+    // which outlives the detached run.
+    const ws_cwd_copy: ?[]const u8 = sessionWsFor(st.alloc, g_io orelse return error.IoUnavailable, st.cfg.cwd, req.session_id);
 
-    const th = std.Thread.spawn(.{}, runDetachedForGui, .{ st.alloc, st.cfg, st.ov, st.opts, sid_copy, prompt_copy, pi, rpc_copy }) catch |e| {
+    const th = std.Thread.spawn(.{}, runDetachedForGui, .{ st.alloc, st.cfg, st.ov, st.opts, sid_copy, prompt_copy, pi, rpc_copy, ws_cwd_copy }) catch |e| {
         st.alloc.free(sid_copy);
         if (rpc_copy) |rid| st.alloc.free(rid);
+        if (ws_cwd_copy) |wc| st.alloc.free(wc);
         return e;
     };
     th.detach();
@@ -1638,8 +1733,9 @@ fn apxPromptSession(ctx: ?*anyopaque, alloc: std.mem.Allocator, req: apiproxy.Pr
 /// user/message before the loop and assistant/turn-end after (success or
 /// failure). The session id parks BEFORE the first frame — muxPublish drops
 /// everything while no run session is parked.
-fn runDetachedForGui(alloc: std.mem.Allocator, base_cfg: *config.Config, ov: ServeOverrides, opts: LoopOpts, session_id: []const u8, prompt: []const u8, pi: *attachments.PromptImages, request_id: ?[]const u8) void {
+fn runDetachedForGui(alloc: std.mem.Allocator, base_cfg: *config.Config, ov: ServeOverrides, opts: LoopOpts, session_id: []const u8, prompt: []const u8, pi: *attachments.PromptImages, request_id: ?[]const u8, exec_cwd: ?[]const u8) void {
     defer if (request_id) |rid| alloc.free(rid);
+    defer if (exec_cwd) |wc| alloc.free(wc);
     // ServeState outlives every detached run (serveBlocking never returns).
     g_run_mutex.lock();
     defer g_run_mutex.unlock();
@@ -1671,6 +1767,7 @@ fn runDetachedForGui(alloc: std.mem.Allocator, base_cfg: *config.Config, ov: Ser
     var run_opts = opts;
     run_opts.session_id = sid_dup;
     run_opts.images = pi.image_parts;
+    run_opts.exec_cwd = exec_cwd;
     defer {
         g_mux_run_session = null;
         gpaAlloc().free(sid_dup);
@@ -2149,11 +2246,18 @@ pub const LoopOpts = struct {
     /// Image parts owned by the caller for the first user message.
     images: []const model.ImagePart = &.{},
     session_id: []const u8 = "",
+    /// Tool-execution root for this run (workspace sessions run in their
+    /// workspace directory). Storage (transcripts/checkpoints/logs) stays at
+    /// cfg.cwd regardless; only AgentLoop/spawn/run_code/persona see this.
+    exec_cwd: ?[]const u8 = null,
 };
 
 fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Built {
     var ctx = try cordis.Context.init(alloc);
     errdefer ctx.deinit();
+    // Execution root: workspace sessions run in their workspace directory;
+    // everything storage-shaped keeps using cfg.cwd.
+    const run_cwd: []const u8 = opts.exec_cwd orelse cfg.cwd;
 
     const tools = try alloc.create(tool_reg.ToolRegistry);
     errdefer alloc.destroy(tools);
@@ -2458,7 +2562,7 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
     spawn_env.* = .{
         .client = spawn_client,
         .io = ctx.io(),
-        .cwd = cfg.cwd,
+        .cwd = run_cwd,
         .sandbox_mode = cfg.sandbox_mode,
     };
 
@@ -2481,7 +2585,7 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
     // Code Mode (run_code) wiring
     const rc_deps = try alloc.create(run_code.Deps);
     errdefer alloc.destroy(rc_deps);
-    rc_deps.* = .{ .io = ctx.io(), .cwd = cfg.cwd, .sandbox_mode = cfg.sandbox_mode };
+    rc_deps.* = .{ .io = ctx.io(), .cwd = run_cwd, .sandbox_mode = cfg.sandbox_mode };
     run_code.setCtx(rc_deps);
     errdefer run_code.clearCtx();
 
@@ -2494,7 +2598,7 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
     if (opts.preset) |kind| {
         const spec = presets_mod.spec(kind);
         // Persona template: {{model}}/{{cwd}} substitution
-        const persona = try presets_mod.resolvePersona(alloc, spec, cfg.model, cfg.cwd);
+        const persona = try presets_mod.resolvePersona(alloc, spec, cfg.model, run_cwd);
         if (spec.complete_prompt) {
             // complete_prompt: persona IS the entire system prompt
             system_prompt = persona;
@@ -2529,7 +2633,7 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
 
     const loop = try alloc.create(agent.AgentLoop);
     errdefer alloc.destroy(loop);
-    loop.* = try agent.AgentLoop.init(alloc, ctx, ag, client, tools, cfg.cwd, onEvent, checkpoints, ext_iface);
+    loop.* = try agent.AgentLoop.init(alloc, ctx, ag, client, tools, run_cwd, onEvent, checkpoints, ext_iface);
     loop.first_user_images = opts.images;
 
     return .{
