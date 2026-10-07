@@ -134,6 +134,21 @@ pub const definition = tool_reg.ToolDefinition{
     ,
 };
 
+/// Upstream agent-team shape: a named teammate. Maps onto the same synchronous
+/// subagent run (context=fork is accepted but treated as fresh).
+pub const teammate_definition = tool_reg.ToolDefinition{
+    .name = "spawn_teammate",
+    .description =
+    \\Create one named teammate that works a delegated task in its own context and
+    \\reports back its final text. Like spawn_agent, but addressed by a required
+    \\lower-kebab name. context=fork is accepted but behaves like fresh.
+    ,
+    .category = .general,
+    .parameters_json =
+    \\{"type":"object","properties":{"name":{"type":"string","description":"Unique lower-kebab-case teammate name"},"description":{"type":"string","description":"Short description of the responsibility"},"prompt":{"type":"string","description":"Complete initial task for the teammate"},"context":{"type":"string","enum":["fresh","fork"],"description":"Defaults to fresh (fork accepted, treated as fresh)"},"max_turns":{"type":"integer","description":"Optional turn budget (1-64)"}},"required":["name","description","prompt"]}
+    ,
+};
+
 // ── executor ────────────────────────────────────────────────────────────────
 
 pub const ToolCall = struct {
@@ -160,6 +175,9 @@ fn fail(alloc: std.mem.Allocator, msg: []const u8) ToolResult {
 /// Dispatch a spawn_agent call. Signature mirrors tool/builtin.zig's execute
 /// convention: allocations use `alloc`; the caller frees via freeResult.
 pub fn execute(alloc: std.mem.Allocator, call: ToolCall) !ToolResult {
+    const is_teammate = std.mem.eql(u8, call.name, teammate_definition.name);
+    if (!is_teammate and !std.mem.eql(u8, call.name, definition.name))
+        return fail(alloc, "unknown spawn tool");
     const wiring = g_spawn_ctx orelse return fail(
         alloc,
         "spawn_agent is not wired: the host must call spawn_agent.setSpawnCtx(&SpawnDeps{...}) at startup",
@@ -168,10 +186,14 @@ pub fn execute(alloc: std.mem.Allocator, call: ToolCall) !ToolResult {
     var args = try parseArgs(alloc, call.arguments);
     defer freeArgs(alloc, &args);
 
-    const task = args.get("task") orelse
-        return fail(alloc, "missing task");
+    const task = args.get("task") orelse args.get("prompt") orelse
+        return fail(alloc, if (is_teammate) "missing prompt" else "missing task");
     if (task.len == 0)
         return fail(alloc, "task must be a non-empty string");
+    if (is_teammate) {
+        const nm = args.get("name") orelse return fail(alloc, "missing name");
+        if (nm.len == 0) return fail(alloc, "name must be a non-empty string");
+    }
 
     // Always dupe name/system_prompt into `alloc` so the defers below have a
     // single, unconditional ownership story.
@@ -446,4 +468,34 @@ test "max_turns clamped to hard ceiling" {
     try std.testing.expect(
         std.mem.indexOf(u8, res.output, "[subagent 'subagent' finished: 64 turn(s), truncated]") != null,
     );
+}
+
+test "spawn_teammate runs via prompt and requires a name" {
+    const alloc = std.testing.allocator;
+    var scripted = subagent.ScriptedChat.init(alloc, &.{
+        .{ .content = "teammate done" },
+    });
+    defer scripted.deinit();
+    var reg = try tool_reg.ToolRegistry.init(alloc);
+    defer reg.deinit();
+    var wiring = SpawnDeps{ .deps = scripted.deps(&reg) };
+    setSpawnCtx(&wiring);
+    defer clearSpawnCtx();
+
+    var res = try execute(alloc, .{
+        .name = "spawn_teammate",
+        .arguments = "{\"name\":\"scout\",\"description\":\"look\",\"prompt\":\"find it\"}",
+    });
+    defer freeResult(alloc, &res);
+    try std.testing.expect(res.success);
+    try std.testing.expect(std.mem.indexOf(u8, res.output, "teammate done") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.output, "[subagent 'scout' finished") != null);
+
+    var bad = try execute(alloc, .{
+        .name = "spawn_teammate",
+        .arguments = "{\"description\":\"look\",\"prompt\":\"find it\"}",
+    });
+    defer freeResult(alloc, &bad);
+    try std.testing.expect(!bad.success);
+    try std.testing.expectEqualStrings("missing name", bad.err_msg.?);
 }

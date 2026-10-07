@@ -1067,7 +1067,7 @@ pub const LoopExtensions = struct {
             const r = try run_code.execute(alloc, .{ .name = call.name, .arguments = call.arguments });
             return .{ .success = r.success, .output = r.output, .err_msg = r.err_msg };
         }
-        if (std.mem.eql(u8, call.name, "spawn_agent")) {
+        if (std.mem.eql(u8, call.name, "spawn_agent") or std.mem.eql(u8, call.name, "spawn_teammate")) {
             const r = try spawn_agent.execute(alloc, .{ .name = call.name, .arguments = call.arguments });
             // spawn_agent's ToolResult mirrors the builtin shape; re-tag it so
             // the loop's freeResult path owns the memory uniformly.
@@ -2579,6 +2579,7 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
     // spawn_agent (dev.md §XVIII) — schema registered now; the executor slot
     // is wired right after the chat client exists below.
     try tools.register(spawn_agent.definition);
+    try tools.register(spawn_agent.teammate_definition);
     try tools.register(run_code.definition);
     try tools.register(ask_user.definition);
     // Upstream alias — canonical is ask_user_question (advertise both,

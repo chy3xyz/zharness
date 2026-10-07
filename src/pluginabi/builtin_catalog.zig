@@ -50,7 +50,7 @@ pub const entries = [_]Builtin{
     .{
         .stable_id = "tool-subagent",
         .module_name = "@deepseek-ai/dsh-tool-subagent",
-        .tool_names = &.{"spawn_agent"},
+        .tool_names = &.{ "spawn_agent", "spawn_teammate" },
         .entry_id = "builtin:tool-subagent",
     },
     .{

@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Zig 0.17](https://img.shields.io/badge/Zig-0.17-orange.svg)](https://ziglang.org/)
-[![Tests](https://img.shields.io/badge/Tests-435%20passing-brightgreen.svg)](#testing)
+[![Tests](https://img.shields.io/badge/Tests-436%20passing-brightgreen.svg)](#testing)
 [![CI](https://github.com/chy3xyz/zharness/actions/workflows/ci.yml/badge.svg)](https://github.com/chy3xyz/zharness/actions/workflows/ci.yml)
 
 ---
@@ -200,7 +200,7 @@ The coding agent has access to:
 | `git_commit` | Stage all changes and commit with a message |
 | `web_fetch`  | Fetch web pages via curl |
 | `web_search` | Search the web |
-| `spawn_agent` | Spawn isolated child agents |
+| `spawn_agent` / `spawn_teammate` | Spawn isolated child agents / named teammates |
 | `run_code`   | Execute code snippets |
 | `skill_use` / `skill` | Load specialized instructions |
 | `memory_get` / `memory_set` | Persistent key-value memory |
@@ -305,7 +305,7 @@ zharness/
 ## Testing
 
 ```bash
-zig build test                             # full suite (435 tests)
+zig build test                             # full suite (436 tests)
 zig build test -Dtest-filter="shell echo"  # a single test by name
 ```
 
