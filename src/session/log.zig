@@ -161,6 +161,58 @@ pub fn readMessages(alloc: std.mem.Allocator, io: std.Io, path: []const u8) ![]m
     return out.toOwnedSlice(alloc);
 }
 
+/// One raw message-event line with its seq. `raw` is the JSON object text
+/// (no trailing newline), owned by the reader.
+pub const EventLine = struct {
+    seq: i64,
+    raw: []u8,
+};
+
+pub fn freeEventLines(alloc: std.mem.Allocator, lines: []EventLine) void {
+    for (lines) |l| alloc.free(l.raw);
+    alloc.free(lines);
+}
+
+/// Read the message events of a log as raw JSON objects (header skipped,
+/// unknown versions rejected, malformed lines tolerated).
+pub fn readEventLines(alloc: std.mem.Allocator, io: std.Io, path: []const u8) ![]EventLine {
+    const raw = try std.Io.Dir.readFileAlloc(.cwd(), io, path, alloc, .unlimited);
+    defer alloc.free(raw);
+
+    var out: std.ArrayList(EventLine) = .empty;
+    errdefer {
+        for (out.items) |l| alloc.free(l.raw);
+        out.deinit(alloc);
+    }
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r");
+        if (t.len == 0 or t[0] != '{') continue;
+        if (std.mem.indexOf(u8, t, "\"kind\":\"header\"") != null) {
+            const v = std.mem.indexOf(u8, t, "\"v\":") orelse continue;
+            var i = v + 4;
+            var n: u32 = 0;
+            while (i < t.len and t[i] >= '0' and t[i] <= '9') : (i += 1) n = n * 10 + (t[i] - '0');
+            if (n != format_version) return Error.UnsupportedFormatVersion;
+            continue;
+        }
+        if (std.mem.indexOf(u8, t, "\"kind\":\"message\"") == null) continue;
+        const seq = extractSeq(t) orelse continue;
+        try out.append(alloc, .{ .seq = seq, .raw = try alloc.dupe(u8, t) });
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+fn extractSeq(t: []const u8) ?i64 {
+    const key = "\"seq\":";
+    const i = std.mem.indexOf(u8, t, key) orelse return null;
+    const rest = t[i + key.len ..];
+    var end: usize = 0;
+    while (end < rest.len and (rest[end] == '-' or (rest[end] >= '0' and rest[end] <= '9'))) end += 1;
+    if (end == 0) return null;
+    return std.fmt.parseInt(i64, rest[0..end], 10) catch null;
+}
+
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;

@@ -61,6 +61,7 @@ const schedule_mod = @import("tool/schedule.zig");
 const lsp_tool = @import("tool/lsp.zig");
 const team_task = @import("tool/team_task.zig");
 const agents_tool = @import("tool/agents.zig");
+const session_events = @import("tool/session_events.zig");
 const otel = @import("telemetry/otel.zig");
 const goals_rpc = @import("server/apiproxy/goals_rpc.zig");
 const plan_frames = @import("server/apiproxy/plan_frames.zig");
@@ -1029,6 +1030,7 @@ pub const LoopExtensions = struct {
         if (lsp_tool.isLspTool(call.name)) return try lsp_tool.execute(alloc, io, self.cwd, call);
         if (team_task.isTeamTaskTool(call.name)) return try team_task.execute(alloc, call);
         if (agents_tool.isAgentTool(call.name)) return try agents_tool.execute(alloc, call);
+        if (session_events.isSessionEventTool(call.name)) return try session_events.execute(alloc, io, self.cwd, call);
         if (std.mem.eql(u8, call.name, "read_image")) {
             const path = (model.extractStringField(alloc, call.arguments, "path") catch null) orelse
                 return .{ .success = false, .output = "", .err_msg = try alloc.dupe(u8, "read_image: missing 'path'") };
@@ -2597,6 +2599,7 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
     try lsp_tool.register(tools);
     try team_task.register(tools);
     try agents_tool.register(tools);
+    try session_events.register(tools);
     g_ask_storage = .{ .publish = publishAskFrame, .store = questions.sharedStore() catch null };
     ask_user.setAskCtx(&g_ask_storage);
 
