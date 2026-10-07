@@ -579,6 +579,9 @@ fn gpaAlloc() std.mem.Allocator {
 /// go through a cordis Context. Null for run/chat (they use the ctx's io).
 var g_io: ?std.Io = null;
 
+/// Monotonic approval-request id source for the audit pair.
+var g_approval_seq = std.atomic.Value(u64).init(0);
+
 fn obsBegin(alloc: std.mem.Allocator, io: std.Io, session_id: []const u8) void {
     const sink = alloc.create(obs_mod.JsonlSink) catch return;
     sink.* = obs_mod.JsonlSink.init(alloc, obs_mod.default_log_path) catch {
@@ -859,15 +862,45 @@ pub const LoopExtensions = struct {
     /// Permission gate: consult the shared ApprovalStore for this session.
     /// Fail-closed — with no interactive answerer \`ask\` resolves unavailable
     /// (a denial) and \`never\` rejects outright.
-    fn approve(ctx: *anyopaque, reason: []const u8) bool {
-        _ = reason;
+    fn approve(ctx: *anyopaque, tool_name: []const u8, reason: []const u8) agent.ApprovalVerdict {
         const self: *LoopExtensions = @ptrCast(@alignCast(ctx));
-        const store = questions.sharedApprovalStore() catch return false;
+        const store = questions.sharedApprovalStore() catch return .unavailable;
         store.setPolicy(self.session_id, switch (self.approval_mode) {
             .ask => .ask,
             .never => .never,
-        }) catch return false;
-        return store.checkFailClosed(self.session_id);
+        }) catch return .unavailable;
+        const outcome = store.check(self.session_id);
+        auditApproval(tool_name, reason, outcome);
+        return switch (outcome) {
+            .allowed_once => .allowed,
+            .rejected => .rejected,
+            .cancelled => .cancelled,
+            .unavailable => .unavailable,
+        };
+    }
+
+    /// Log-only approval audit pair (approval/asked + approval/decided),
+    /// mirroring upstream dsh-user-approval. Best-effort: no observability
+    /// sink means no event.
+    fn auditApproval(tool_name: []const u8, reason: []const u8, outcome: questions.ApprovalOutcome) void {
+        const st = g_obs orelse return;
+        const n = g_approval_seq.fetchAdd(1, .monotonic) + 1;
+        var idbuf: [32]u8 = undefined;
+        const aid = std.fmt.bufPrint(&idbuf, "approval-{d}", .{n}) catch return;
+        const asked = std.fmt.allocPrint(
+            st.alloc,
+            "{{\"approvalId\":\"{s}\",\"toolName\":\"{s}\",\"reason\":\"{s}\"}}",
+            .{ aid, tool_name, reason },
+        ) catch return;
+        defer st.alloc.free(asked);
+        st.sink.emitAt(st.io, &st.trace, .info, "approval/asked", asked);
+        const decided = std.fmt.allocPrint(
+            st.alloc,
+            "{{\"approvalId\":\"{s}\",\"outcome\":\"{s}\"}}",
+            .{ aid, outcome.asStr() },
+        ) catch return;
+        defer st.alloc.free(decided);
+        st.sink.emitAt(st.io, &st.trace, .info, "approval/decided", decided);
     }
 
     /// Dynamic system-prompt section: skill index + goal + plan checklist +

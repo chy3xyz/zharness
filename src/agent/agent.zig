@@ -91,15 +91,20 @@ pub const AgentConfig = struct {
 /// concrete imports — swarm decoupling rule). Lets the loop serve the
 /// loop-native tools (skill_use / memory_* / plan_* / goal_set) from
 /// main-owned state and refresh dynamic system-prompt sections each turn.
+/// Outcome of an approval request at the loop boundary. Mirrors upstream
+/// dsh-user-approval's closed vocabulary; the loop converts a non-allow
+/// verdict into a model-visible tool error (fail-closed).
+pub const ApprovalVerdict = enum { allowed, rejected, unavailable, cancelled };
+
 pub const Extensions = struct {
     ctx: *anyopaque,
     /// Extra system-prompt text appended after the configured prompt, rendered
     /// fresh on every turn. Caller frees; "" contributes nothing.
     renderContext: *const fn (ctx: *anyopaque, alloc: std.mem.Allocator) anyerror![]const u8,
-    /// Permission gate callback: return true to grant an approval-gated tool
-    /// call. Null (or returning false) fails closed. main.zig wires this to
-    /// the ApprovalStore; it stays absent in tests and headless runs.
-    approve: ?*const fn (ctx: *anyopaque, reason: []const u8) bool = null,
+    /// Permission gate callback: resolve an approval-gated tool call. Null
+    /// fails closed. main.zig wires this to the ApprovalStore and emits the
+    /// approval/asked + approval/decided audit pair.
+    approve: ?*const fn (ctx: *anyopaque, tool_name: []const u8, reason: []const u8) ApprovalVerdict = null,
     /// Try to serve a tool call from extension state. Return `null` when the
     /// tool name is unknown so the loop falls back to the builtin executors.
     executeTool: *const fn (
@@ -227,14 +232,18 @@ pub const AgentLoop = struct {
             .allow => {},
             .deny => |why| return self.deniedResult("permission policy", why),
             .ask => |why| {
-                if (self.agent.config.approval_mode == .never) {
-                    return self.deniedResult("approval policy 'never'", why);
+                // Fail-closed default: 'never' rejects, and with no callback
+                // the ask is unavailable. A wired callback resolves it.
+                var verdict: ApprovalVerdict = if (self.agent.config.approval_mode == .never) .rejected else .unavailable;
+                if (self.ext) |e| {
+                    if (e.approve) |f| verdict = f(e.ctx, tc.name, why);
                 }
-                const granted = if (self.ext) |e|
-                    (e.approve orelse return self.deniedResult("permission policy", why))(e.ctx, why)
-                else
-                    false;
-                if (!granted) return self.deniedResult("permission policy", why);
+                switch (verdict) {
+                    .allowed => {},
+                    .rejected => return self.deniedResult("approval policy 'never'", why),
+                    .cancelled => return self.deniedResult("approval cancelled", why),
+                    .unavailable => return self.deniedResult("permission policy", why),
+                }
             },
         }
         const call = tool_builtin.ToolCall{ .name = tc.name, .arguments = tc.arguments };

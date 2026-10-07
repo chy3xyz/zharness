@@ -25,7 +25,7 @@ zig build test -Dtest-filter="shell echo"
 zig build --help
 ```
 
-`build.zig` defines two steps: install the `zh` executable, and `zig build test` (builds a test executable from `src/tests.zig` linking the `cordis` module). Tests live inline in each module (`test { ... }` blocks); the suite is currently **398 tests**.
+`build.zig` defines two steps: install the `zh` executable, and `zig build test` (builds a test executable from `src/tests.zig` linking the `cordis` module). Tests live inline in each module (`test { ... }` blocks); the suite is currently **399 tests**.
 
 ## Dependencies and module layout
 
@@ -48,7 +48,7 @@ The data flows: `CLI → Config → AgentLoop → ChatClient (model IR) ⇄ tool
 - **No JSON or HTTP library** — zeepseek deliberately used `std.http` + hand-rolled JSON. Keep new parsing in the same style; don't pull in deps.
 - **Memory ownership**: tool/result/model slices are allocator-owned; callers must `free` (`tool_builtin.freeResult`, `ChatResponse.deinit`, `Config.deinit`). `Message` content is duped into the loop's allocator.
 - **Tool-call echo**: when the model emits `tool_calls`, the assistant message must include `tool_calls_json` (rebuilt by `tool_mod_echo`) so the next request is accepted by the provider. Missing this breaks multi-turn tool use.
-- **Sandbox**: tools only touch paths inside `cwd`. System-wide reads must go through `shell` (approval is stubbed; `SandboxMode` exists in config but is not yet wired into `builtin.zig`).
+- **Sandbox / permissions**: filesystem tools only touch paths inside `cwd`; the `shell` tool runs under `sandbox_mode` (deny-list + env allowlist + watchdog at `.process`). `dispatchTool` additionally gates every tool through the permission preset + approval policy (see `src/sandbox/sandbox.zig`, `src/agent/agent.zig`).
 - **zcordis coupling**: `AgentLoop` holds a `*cordis.Context`; services/events follow the zcordis API (`ctx.emit`, `scope.on`, `ctx.provide`). Consult `../zcordis/src/cordis.zig` for the public surface.
 
 ## Project status
@@ -56,6 +56,6 @@ The data flows: `CLI → Config → AgentLoop → ChatClient (model IR) ⇄ tool
 MVP-1 (CLI agent), MVP-2 (HTTP server + Web GUI + MCP + skills/memory/plan/goal) and
 MVP-3 (subagents, workflows, WASM plugin sandbox, dynamic Cordis runtime,
 observability) are implemented — `zig build` and `zig build test` are green
-(398/398). Remaining roadmap items live under "Production" in `README.md`
+(399/399). Remaining roadmap items live under "Production" in `README.md`
 (OpenTelemetry, advanced sandboxing, plugin marketplace, multi-agent
 coordination). See `AGENTS.md` for the operational cheat-sheet.

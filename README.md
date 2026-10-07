@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Zig 0.17](https://img.shields.io/badge/Zig-0.17-orange.svg)](https://ziglang.org/)
-[![Tests](https://img.shields.io/badge/Tests-398%20passing-brightgreen.svg)](#testing)
+[![Tests](https://img.shields.io/badge/Tests-399%20passing-brightgreen.svg)](#testing)
 [![CI](https://github.com/chy3xyz/zharness/actions/workflows/ci.yml/badge.svg)](https://github.com/chy3xyz/zharness/actions/workflows/ci.yml)
 
 ---
@@ -294,7 +294,7 @@ zharness/
 ## Testing
 
 ```bash
-zig build test                             # full suite (398 tests)
+zig build test                             # full suite (399 tests)
 zig build test -Dtest-filter="shell echo"  # a single test by name
 ```
 

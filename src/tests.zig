@@ -736,6 +736,62 @@ test "permission gate blocks mutating tools under read-only preset" {
     try std.testing.expect(ok.success);
 }
 
+const RecApprove = struct {
+    tool_buf: [64]u8 = undefined,
+    tool_len: usize = 0,
+
+    fn render(_: *anyopaque, alloc: std.mem.Allocator) anyerror![]const u8 {
+        return alloc.dupe(u8, "");
+    }
+    fn exec(_: *anyopaque, _: std.mem.Allocator, _: std.Io, _: tool_builtin.ToolCall) anyerror!?tool_builtin.ToolResult {
+        return null;
+    }
+    fn approve(ctx: *anyopaque, tool_name: []const u8, _: []const u8) agent.ApprovalVerdict {
+        const self: *RecApprove = @ptrCast(@alignCast(ctx));
+        const n = @min(tool_name.len, self.tool_buf.len);
+        @memcpy(self.tool_buf[0..n], tool_name[0..n]);
+        self.tool_len = n;
+        return .allowed;
+    }
+};
+
+test "permission gate hands the tool name to the approval callback" {
+    const alloc = std.testing.allocator;
+    var ctx = try cordis.Context.init(alloc);
+    defer ctx.deinit();
+    const io = ctx.io();
+
+    var reg = try tool_reg.ToolRegistry.init(alloc);
+    defer reg.deinit();
+    try tool_reg.registerBuiltins(&reg);
+
+    const cfg = agent.AgentConfig{
+        .system_prompt = "sys",
+        .max_turns = 4,
+        .reasoning_effort = null,
+        .sandbox_mode = .none,
+        .permission_preset = .read_only,
+    };
+    const ag = try agent.Agent.init(alloc, ctx.root, &cfg);
+    defer ag.deinit(alloc);
+    const client = model.ChatClient.init(alloc, io, "https://localhost.invalid", "m", "");
+
+    var rec = RecApprove{};
+    const ext = agent.Extensions{
+        .ctx = &rec,
+        .renderContext = RecApprove.render,
+        .executeTool = RecApprove.exec,
+        .approve = RecApprove.approve,
+    };
+    var loop = try agent.AgentLoop.init(alloc, ctx, ag, client, &reg, "/tmp", null, null, &ext);
+    defer loop.deinit();
+
+    var r = try loop.dispatchTool(.{ .id = "1", .name = "shell", .arguments = "{\"command\":\"echo approved\"}" });
+    defer tool_builtin.freeResult(alloc, &r);
+    try std.testing.expect(r.success);
+    try std.testing.expectEqualStrings("shell", rec.tool_buf[0..rec.tool_len]);
+}
+
 test "loop extensions wiring: plan goal memory skills end to end" {
     const alloc = std.testing.allocator;
     var ctx = try cordis.Context.init(alloc);
