@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Zig 0.17](https://img.shields.io/badge/Zig-0.17-orange.svg)](https://ziglang.org/)
-[![Tests](https://img.shields.io/badge/Tests-417%20passing-brightgreen.svg)](#testing)
+[![Tests](https://img.shields.io/badge/Tests-418%20passing-brightgreen.svg)](#testing)
 [![CI](https://github.com/chy3xyz/zharness/actions/workflows/ci.yml/badge.svg)](https://github.com/chy3xyz/zharness/actions/workflows/ci.yml)
 
 ---
@@ -209,6 +209,7 @@ The coding agent has access to:
 | `present`    | Declare the final files this turn delivers (deliverables) |
 | `read_image` | Attach a workspace image so a vision model sees it next request |
 | `terminal_open` / `terminal_send` / `terminal_read` / `terminal_list` / `terminal_close` | Persistent shells (`/bin/sh`) whose cwd/env survive across calls |
+| `session_search` / `session_read` | Search past session transcripts and read one session |
 | `job_list` / `job_output` / `job_kill` | Inspect/read/stop background jobs (live registry + workflow runs) |
 | `mcp_*`      | MCP server tools (projected as `mcp_<srv>_<tool>`) |
 | `list_mcp_resources` / `list_mcp_resource_templates` / `read_mcp_resource` | Inspect and read MCP server resources |
@@ -300,7 +301,7 @@ zharness/
 ## Testing
 
 ```bash
-zig build test                             # full suite (417 tests)
+zig build test                             # full suite (418 tests)
 zig build test -Dtest-filter="shell echo"  # a single test by name
 ```
 

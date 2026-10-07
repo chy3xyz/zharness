@@ -265,15 +265,33 @@ pub fn searchSessionsFn(ctx: ?*anyopaque, alloc: std.mem.Allocator, query: []con
     // Query validation runs BEFORE the config probe so bad requests render
     // bad-request even on an unwired host (upstream zod validates first).
     const q = try validatedQuery(alloc, query);
+    alloc.free(q);
     const cfg = g_config orelse return error.SessionSearchUnavailable;
-    const dir = try sessions.transcriptDir(alloc, cfg.cwd);
-    const res = try scanTranscripts(cfg.io, alloc, dir, q);
+    return searchIn(cfg.io, alloc, cfg.cwd, query);
+}
 
-    // Render into router.SearchPage, dropping everything beyond the limit.
+/// Dep-free scan of the cwd transcripts. Used by the model-facing
+/// session_search tool and by searchSessionsFn (which supplies the config
+/// singleton io and cwd).
+pub fn searchIn(io: std.Io, alloc: std.mem.Allocator, cwd: []const u8, query: []const u8) !router.SearchPage {
+    const q = try validatedQuery(alloc, query);
+    defer alloc.free(q);
+    const dir = try sessions.transcriptDir(alloc, cwd);
+    defer alloc.free(dir);
+    const res = try scanTranscripts(io, alloc, dir, q);
+    defer alloc.free(res.hits);
+
     const take = @min(res.hits.len, result_limit);
     const items = try alloc.alloc(router.SearchItem, take);
-    for (res.hits[0..take], 0..) |h, i| {
-        items[i] = .{ .session_id = h.session_id, .snippet = h.snippet };
+    // Transfer ownership of the kept hits strings into items; release the
+    // rest so the hits slice itself can be freed.
+    for (res.hits, 0..) |h, i| {
+        if (i < take) {
+            items[i] = .{ .session_id = h.session_id, .snippet = h.snippet };
+        } else {
+            alloc.free(h.session_id);
+            alloc.free(h.snippet);
+        }
     }
     return .{ .items = items, .has_more = res.has_more };
 }
