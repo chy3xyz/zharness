@@ -253,7 +253,7 @@ pub const ChatClient = struct {
         _ = clib.pclosePipe(fp);
 
         const resp_body = try out.toOwnedSlice(self.alloc);
-        if (std.c.getenv("ZH_DEBUG_RESP") != null) std.debug.print("[resp] {s}\n", .{resp_body[0..@min(resp_body.len,2000)]});
+        if (std.c.getenv("ZH_DEBUG_RESP") != null) std.debug.print("[resp] {s}\n", .{resp_body[0..@min(resp_body.len, 2000)]});
         defer self.alloc.free(resp_body);
 
         // Classify failures precisely instead of substring-guessing: only a
@@ -332,8 +332,7 @@ pub const ChatClient = struct {
             // Surface the first bytes of the raw stream so the operator can
             // distinguish rate limits, auth failures, and empty 200s.
             if (raw_first) |rf| {
-                const msg = std.fmt.allocPrint(self.alloc,
-                    "stream ended without any data (first bytes: {s})", .{rf}) catch
+                const msg = std.fmt.allocPrint(self.alloc, "stream ended without any data (first bytes: {s})", .{rf}) catch
                     "stream ended without any data from the provider";
                 self.setLastError(msg);
                 self.alloc.free(msg);
@@ -595,7 +594,7 @@ pub const ChatClient = struct {
                 break;
             };
             const arr = json[arr_start .. bracket_end + 1];
-            if (std.c.getenv("ZH_DEBUG_ARGS") != null) std.debug.print("[parseTC] arr_len={d} arr={s}\n", .{ arr.len, arr[0..@min(arr.len,200)] });
+            if (std.c.getenv("ZH_DEBUG_ARGS") != null) std.debug.print("[parseTC] arr_len={d} arr={s}\n", .{ arr.len, arr[0..@min(arr.len, 200)] });
             var i: usize = 1; // skip '['
             while (i < arr.len) : (i += 1) {
                 if (arr[i] == '{') {

@@ -26,7 +26,7 @@ const types = @import("types.zig");
 /// Lifecycle-safe Cordis verbs a host half may call. Timer verbs require
 /// `inject: ['timer']` (guarded in JS; here documented for teaching errors).
 pub const CTX_VERBS = [_][]const u8{
-    "effect", "on", "once", "provide", "timeout", "interval",
+    "effect",     "on",          "once",     "provide",  "timeout", "interval",
     "setTimeout", "setInterval", "throttle", "debounce",
 };
 
@@ -190,8 +190,14 @@ fn balancedDelims(s: []const u8) bool {
     while (i < s.len) : (i += 1) {
         const c = s[i];
         if (in_str != 0) {
-            if (escaped) { escaped = false; continue; }
-            if (c == '\\') { escaped = true; continue; }
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+            if (c == '\\') {
+                escaped = true;
+                continue;
+            }
             if (c == in_str) in_str = 0;
             continue;
         }
@@ -207,7 +213,10 @@ fn balancedDelims(s: []const u8) bool {
             i += 1; // consume '/'
             continue;
         }
-        if (c == '"' or c == '\'' or c == '`') { in_str = c; continue; }
+        if (c == '"' or c == '\'' or c == '`') {
+            in_str = c;
+            continue;
+        }
         switch (c) {
             '(' => depth_paren += 1,
             ')' => {

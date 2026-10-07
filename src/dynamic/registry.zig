@@ -146,19 +146,37 @@ pub const DynamicRegistry = struct {
         var escaped = false;
         for (s) |c| {
             if (in_str != 0) {
-                if (escaped) { escaped = false; continue; }
-                if (c == '\\') { escaped = true; continue; }
+                if (escaped) {
+                    escaped = false;
+                    continue;
+                }
+                if (c == '\\') {
+                    escaped = true;
+                    continue;
+                }
                 if (c == in_str) in_str = 0;
                 continue;
             }
-            if (c == '"' or c == '\'') { in_str = c; continue; }
+            if (c == '"' or c == '\'') {
+                in_str = c;
+                continue;
+            }
             switch (c) {
                 '(' => depth_paren += 1,
-                ')' => { depth_paren -= 1; if (depth_paren < 0) return false; },
+                ')' => {
+                    depth_paren -= 1;
+                    if (depth_paren < 0) return false;
+                },
                 '{' => depth_brace += 1,
-                '}' => { depth_brace -= 1; if (depth_brace < 0) return false; },
+                '}' => {
+                    depth_brace -= 1;
+                    if (depth_brace < 0) return false;
+                },
                 '[' => depth_brack += 1,
-                ']' => { depth_brack -= 1; if (depth_brack < 0) return false; },
+                ']' => {
+                    depth_brack -= 1;
+                    if (depth_brack < 0) return false;
+                },
                 else => {},
             }
         }

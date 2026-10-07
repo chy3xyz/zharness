@@ -94,7 +94,7 @@ pub const RequestRunOutcome = enum {
 
     pub fn fromString(s: []const u8) ?RequestRunOutcome {
         inline for (@typeInfo(RequestRunOutcome).@"enum".field_names, 0..) |name, i| {
-            if (std.mem.eql(u8, s, name)) return @enumFromInt(@typeInfo(RequestRunOutcome).@"enum".field_values[i]);
+            if (std.mem.eql(u8, s, name)) return @fromBackingInt(@intCast(@typeInfo(RequestRunOutcome).@"enum".field_values[i]));
         }
         return null;
     }
@@ -322,8 +322,7 @@ pub fn handleRespond(lc: *Lifecycle, alloc: std.mem.Allocator, body: []const u8)
         return .not_mine;
     }
     const value_raw = jsonx.getRaw(result_raw, "value") orelse return .not_mine;
-    const request_id = (jsonx.getStringAlloc(alloc, value_raw, "requestId") catch null)
-        orelse return .not_mine; // question answers have sessionId/answers, not requestId
+    const request_id = (jsonx.getStringAlloc(alloc, value_raw, "requestId") catch null) orelse return .not_mine; // question answers have sessionId/answers, not requestId
     defer alloc.free(request_id);
 
     // From here on the body IS ours — every problem is a receipt, not a pass.
@@ -479,7 +478,8 @@ test "handleRespond routes cordis-shaped bodies; others are not-mine" {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const question_body = try std.fmt.allocPrint(a,
+        const question_body = try std.fmt.allocPrint(
+            a,
             "{{\"type\":\"client-response\",\"rpcId\":\"q-1\",\"result\":{{\"ok\":true,\"value\":{{\"sessionId\":\"web-1\",\"answer\":{{\"answers\":[]}}}}}}}}",
             .{},
         );
@@ -495,7 +495,8 @@ test "handleRespond routes cordis-shaped bodies; others are not-mine" {
 
     // Mine, declined: accepted receipt, latest_run settles rejected.
     {
-        const body = try std.fmt.allocPrint(alloc,
+        const body = try std.fmt.allocPrint(
+            alloc,
             "{{\"type\":\"client-response\",\"rpcId\":\"cordis-42\",\"result\":{{\"ok\":true,\"value\":{{\"requestId\":\"{s}\",\"decision\":\"rejected\"}}}}}}",
             .{req_id},
         );
@@ -509,7 +510,8 @@ test "handleRespond routes cordis-shaped bodies; others are not-mine" {
 
     // Late duplicate / unknown ids: mine, but not-pending.
     {
-        const body = try std.fmt.allocPrint(alloc,
+        const body = try std.fmt.allocPrint(
+            alloc,
             "{{\"type\":\"client-response\",\"rpcId\":\"cordis-43\",\"result\":{{\"ok\":true,\"value\":{{\"requestId\":\"{s}\",\"decision\":\"approved\"}}}}}}",
             .{req_id},
         );
@@ -519,7 +521,8 @@ test "handleRespond routes cordis-shaped bodies; others are not-mine" {
         try testing.expect(r.mine);
         try testing.expectEqualStrings("{\"accepted\":false,\"reason\":\"not-pending\"}", r.body);
 
-        const unknown = try std.fmt.allocPrint(alloc,
+        const unknown = try std.fmt.allocPrint(
+            alloc,
             "{{\"type\":\"client-response\",\"rpcId\":\"cordis-44\",\"result\":{{\"ok\":true,\"value\":{{\"requestId\":\"approval-99999\",\"decision\":\"approved\"}}}}}}",
             .{},
         );
@@ -542,7 +545,8 @@ test "handleRespond routes cordis-shaped bodies; others are not-mine" {
             if (r2.currentPackageId) |v| alloc.free(v);
             if (r2.approvalRequestId) |v| alloc.free(v);
         }
-        const body = try std.fmt.allocPrint(alloc,
+        const body = try std.fmt.allocPrint(
+            alloc,
             "{{\"type\":\"client-response\",\"rpcId\":\"cordis-45\",\"result\":{{\"ok\":true,\"value\":{{\"requestId\":\"{s}\",\"decision\":\"allow-forever\"}}}}}}",
             .{r2.approvalRequestId.?},
         );

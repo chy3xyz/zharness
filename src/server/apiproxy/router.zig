@@ -369,9 +369,15 @@ fn sanitizeResponseBody(alloc: std.mem.Allocator, body: []const u8) ![]const u8 
     while (i < body.len) : (i += 1) {
         const c = body[i];
         if (in_str) {
-            if (c == '\\') { i += 1; continue; }
+            if (c == '\\') {
+                i += 1;
+                continue;
+            }
             if (c == '"') in_str = false;
-            if (c < 0x20) { needs_fix = true; break; }
+            if (c < 0x20) {
+                needs_fix = true;
+                break;
+            }
         } else {
             switch (c) {
                 '"' => in_str = true,
@@ -388,15 +394,24 @@ fn sanitizeResponseBody(alloc: std.mem.Allocator, body: []const u8) ![]const u8 
         while (si < body.len) : (si += 1) {
             const bc = body[si];
             if (in_s) {
-                if (bc == '\\') { si += 1; continue; }
+                if (bc == '\\') {
+                    si += 1;
+                    continue;
+                }
                 if (bc == '"') in_s = false;
             } else {
-                if (bc == '"') { in_s = true; continue; }
+                if (bc == '"') {
+                    in_s = true;
+                    continue;
+                }
                 if (bc == '{') depth_brace += 1;
                 if (bc == '}') depth_brace -= 1;
                 if (bc == '[') depth_bracket += 1;
                 if (bc == ']') depth_bracket -= 1;
-                if (depth_brace < 0 or depth_bracket < 0) { needs_fix = true; break; }
+                if (depth_brace < 0 or depth_bracket < 0) {
+                    needs_fix = true;
+                    break;
+                }
             }
         }
         if (in_s or depth_brace != 0 or depth_bracket != 0) needs_fix = true;
@@ -413,54 +428,79 @@ fn sanitizeResponseBody(alloc: std.mem.Allocator, body: []const u8) ![]const u8 
         if (in_str) {
             if (c == '\\' and i + 1 < body.len) {
                 // Escaped char: copy both bytes
-                out[oi] = body[i]; oi += 1;
+                out[oi] = body[i];
+                oi += 1;
                 i += 1;
-                out[oi] = body[i]; oi += 1;
+                out[oi] = body[i];
+                oi += 1;
                 continue;
             }
             if (c == '"') {
                 in_str = false;
-                out[oi] = c; oi += 1;
+                out[oi] = c;
+                oi += 1;
                 continue;
             }
             if (c < 0x20) {
                 // Raw control char inside string → space
-                out[oi] = ' '; oi += 1;
+                out[oi] = ' ';
+                oi += 1;
                 continue;
             }
             // Check for invalid UTF-8
-            if (c >= 0x80 and c <= 0xBF) { out[oi] = '?'; oi += 1; continue; }
-            if (c >= 0xF8) { out[oi] = '?'; oi += 1; continue; }
+            if (c >= 0x80 and c <= 0xBF) {
+                out[oi] = '?';
+                oi += 1;
+                continue;
+            }
+            if (c >= 0xF8) {
+                out[oi] = '?';
+                oi += 1;
+                continue;
+            }
             if (c >= 0xC0) {
                 const len: usize = if (c >= 0xF0) 4 else if (c >= 0xE0) 3 else 2;
                 if (i + len <= body.len) {
                     var ok = true;
                     var k: usize = 1;
                     while (k < len) : (k += 1) {
-                        if (body[i+k] & 0xC0 != 0x80) ok = false;
+                        if (body[i + k] & 0xC0 != 0x80) ok = false;
                     }
                     if (ok) {
-                        @memcpy(out[oi..oi+len], body[i..i+len]);
-                        oi += len; i += len - 1; // -1 because loop increments
+                        @memcpy(out[oi .. oi + len], body[i .. i + len]);
+                        oi += len;
+                        i += len - 1; // -1 because loop increments
                         continue;
                     }
                 }
-                out[oi] = '?'; oi += 1;
+                out[oi] = '?';
+                oi += 1;
                 continue;
             }
             // Normal char inside string
-            out[oi] = c; oi += 1;
+            out[oi] = c;
+            oi += 1;
         } else {
             // Outside string
             if (c == '"') {
                 in_str = true;
-                out[oi] = c; oi += 1;
+                out[oi] = c;
+                oi += 1;
                 continue;
             }
             // Check for invalid UTF-8 outside strings (shouldn't happen in JSON)
-            if (c >= 0x80 and c <= 0xBF) { out[oi] = '?'; oi += 1; continue; }
-            if (c >= 0xF8) { out[oi] = '?'; oi += 1; continue; }
-            out[oi] = c; oi += 1;
+            if (c >= 0x80 and c <= 0xBF) {
+                out[oi] = '?';
+                oi += 1;
+                continue;
+            }
+            if (c >= 0xF8) {
+                out[oi] = '?';
+                oi += 1;
+                continue;
+            }
+            out[oi] = c;
+            oi += 1;
         }
     }
     return out[0..oi];
@@ -994,7 +1034,7 @@ fn sessionCreateAndAnnounce(deps: *const ApiProxyDeps, alloc: std.mem.Allocator,
     var sid_j2: std.ArrayList(u8) = .empty;
     defer sid_j2.deinit(alloc);
     jsonx.appendJsonString(alloc, &sid_j2, sid) catch return resp;
-    const proj_frame = std.fmt.allocPrint(alloc, "{{\"type\":\"projection\",\"sessionId\":{s},\"key\":\"modelSelection\",\"value\":{{\"lastUsed\":{{\"provider\":\"deepseek\",\"model\":\"deepseek-v4-flash\"}},\"pending\":null}},\"seq\":1}}", .{ sid_j2.items }) catch return resp;
+    const proj_frame = std.fmt.allocPrint(alloc, "{{\"type\":\"projection\",\"sessionId\":{s},\"key\":\"modelSelection\",\"value\":{{\"lastUsed\":{{\"provider\":\"deepseek\",\"model\":\"deepseek-v4-flash\"}},\"pending\":null}},\"seq\":1}}", .{sid_j2.items}) catch return resp;
     defer alloc.free(proj_frame);
     remote_mux.publishControlRaw(proj_frame);
 
@@ -2176,7 +2216,8 @@ fn hDynamicInventory(alloc: std.mem.Allocator, rpc_id: []const u8) !UnaryRespons
     return okValue(alloc, rpc_id, value.items);
 }
 
-fn hDynamicGetClientCode(alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8) !UnaryResponse {    const lc = try sharedDynamicLifecycle();
+fn hDynamicGetClientCode(alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8) !UnaryResponse {
+    const lc = try sharedDynamicLifecycle();
     const plugin_id = try reqString(alloc, payload, "pluginId");
     const package_id = try reqString(alloc, payload, "packageId");
     const run_id = try optString(alloc, payload, "pluginRunId");

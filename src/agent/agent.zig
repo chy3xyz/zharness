@@ -419,7 +419,7 @@ fn tool_mod_echo(alloc: std.mem.Allocator, resp: ChatResponse) ![]const u8 {
             }
             if (depth != 0 or in_str) break :blk "{}";
             if (std.c.getenv("ZH_DEBUG_ARGS") != null) {
-                std.debug.print("[args-echo] len={d} first_100={s}\n", .{ a.len, a[0..@min(a.len,100)] });
+                std.debug.print("[args-echo] len={d} first_100={s}\n", .{ a.len, a[0..@min(a.len, 100)] });
             }
             break :blk a;
         };

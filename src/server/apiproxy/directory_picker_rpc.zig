@@ -158,9 +158,7 @@ pub fn handleList(deps: *const router.ApiProxyDeps, alloc: std.mem.Allocator, rp
 pub fn handleCreateDirectory(deps: *const router.ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8) !router.UnaryResponse {
     const parent = try router.reqString(alloc, payload, "path");
     const name = try router.reqString(alloc, payload, "name");
-    if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")
-        or std.mem.indexOfAny(u8, name, "/\\") != null)
-    {
+    if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..") or std.mem.indexOfAny(u8, name, "/\\") != null) {
         return router.badRequest(alloc, rpc_id, "directory name must be a single path segment");
     }
     var joined_buf: [1024]u8 = undefined;

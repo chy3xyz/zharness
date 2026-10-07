@@ -128,7 +128,7 @@ pub fn parseArgs(alloc: std.mem.Allocator, json_args_raw: []const u8) !std.Strin
     const json_args = decodeArgs(alloc, json_args_raw) catch json_args_raw;
     defer if (json_args.ptr != json_args_raw.ptr) alloc.free(json_args);
     if (std.c.getenv("ZH_DEBUG_ARGS") != null) {
-        std.debug.print("[parseArgs] input ({d}B): {s}\n", .{ json_args.len, json_args[0..@min(json_args.len,200)] });
+        std.debug.print("[parseArgs] input ({d}B): {s}\n", .{ json_args.len, json_args[0..@min(json_args.len, 200)] });
     }
     var map = std.StringHashMap([]const u8).init(alloc);
     errdefer {
@@ -181,7 +181,7 @@ pub fn parseArgs(alloc: std.mem.Allocator, json_args_raw: []const u8) !std.Strin
         }
     }
     if (std.c.getenv("ZH_DEBUG_ARGS") != null) {
-        std.debug.print("[parseArgs] map size: {d}\n", .{ map.count() });
+        std.debug.print("[parseArgs] map size: {d}\n", .{map.count()});
     }
     return map;
 }

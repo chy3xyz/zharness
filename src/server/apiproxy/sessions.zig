@@ -275,9 +275,18 @@ fn sanitizeContent(alloc: std.mem.Allocator, input: []const u8) ![]const u8 {
     var i: usize = 0;
     while (i < input.len) {
         const c = input[i];
-        if (c < 0x20 and c != '\n') { needs_fix = true; break; }
-        if (c >= 0x80 and c <= 0xBF) { needs_fix = true; break; } // orphan continuation
-        if (c >= 0xF8) { needs_fix = true; break; }
+        if (c < 0x20 and c != '\n') {
+            needs_fix = true;
+            break;
+        }
+        if (c >= 0x80 and c <= 0xBF) {
+            needs_fix = true;
+            break;
+        } // orphan continuation
+        if (c >= 0xF8) {
+            needs_fix = true;
+            break;
+        }
         if (c >= 0xC0) {
             const len: usize = if (c >= 0xF0) 4 else if (c >= 0xE0) 3 else 2;
             var ok = i + len <= input.len;
@@ -285,7 +294,10 @@ fn sanitizeContent(alloc: std.mem.Allocator, input: []const u8) ![]const u8 {
             while (j < len and ok) : (j += 1) {
                 if (input[i + j] & 0xC0 != 0x80) ok = false;
             }
-            if (!ok) { needs_fix = true; break; }
+            if (!ok) {
+                needs_fix = true;
+                break;
+            }
             i += len;
             continue;
         }
@@ -298,21 +310,32 @@ fn sanitizeContent(alloc: std.mem.Allocator, input: []const u8) ![]const u8 {
     while (i < input.len) {
         const c = input[i];
         if (c < 0x20 and c != '\n') {
-            out[oi] = ' '; oi += 1; i += 1;
+            out[oi] = ' ';
+            oi += 1;
+            i += 1;
         } else if (c >= 0x80 and c <= 0xBF) {
-            out[oi] = '?'; oi += 1; i += 1;
+            out[oi] = '?';
+            oi += 1;
+            i += 1;
         } else if (c >= 0xF8) {
-            out[oi] = '?'; oi += 1; i += 1;
+            out[oi] = '?';
+            oi += 1;
+            i += 1;
         } else if (c >= 0xC0) {
             const len: usize = if (c >= 0xF0) 4 else if (c >= 0xE0) 3 else 2;
             if (i + len <= input.len) {
-                @memcpy(out[oi..oi+len], input[i..i+len]);
-                oi += len; i += len;
+                @memcpy(out[oi .. oi + len], input[i .. i + len]);
+                oi += len;
+                i += len;
             } else {
-                out[oi] = '?'; oi += 1; i += 1;
+                out[oi] = '?';
+                oi += 1;
+                i += 1;
             }
         } else {
-            out[oi] = c; oi += 1; i += 1;
+            out[oi] = c;
+            oi += 1;
+            i += 1;
         }
     }
     return out[0..oi];
@@ -359,7 +382,7 @@ pub fn buildHistoryPage(
         if (std.mem.eql(u8, m.role, "assistant")) {
             // tool/call slots precede the finalized assistant message.
             if (m.tool_calls_json) |tcj| {
-            const tcj_clean = sanitizeContent(alloc, tcj) catch tcj;
+                const tcj_clean = sanitizeContent(alloc, tcj) catch tcj;
                 const slots = try parseToolCallSlots(alloc, tcj_clean);
                 defer freeToolCallSlots(alloc, slots);
                 for (slots) |slot| {

@@ -367,7 +367,7 @@ pub fn serveRemoteMux(alloc: std.mem.Allocator, conn: *httpd.WsConn) anyerror!vo
                     var sid_j: std.ArrayList(u8) = .empty;
                     defer sid_j.deinit(alloc);
                     jsonx.appendJsonString(alloc, &sid_j, session_id) catch continue;
-                    const proj = std.fmt.allocPrint(alloc, "{{\"type\":\"projection\",\"sessionId\":{s},\"key\":\"modelSelection\",\"value\":{{\"lastUsed\":{{\"provider\":\"deepseek\",\"model\":\"deepseek-v4-flash\"}},\"pending\":null}},\"seq\":1}}", .{ sid_j.items }) catch continue;
+                    const proj = std.fmt.allocPrint(alloc, "{{\"type\":\"projection\",\"sessionId\":{s},\"key\":\"modelSelection\",\"value\":{{\"lastUsed\":{{\"provider\":\"deepseek\",\"model\":\"deepseek-v4-flash\"}},\"pending\":null}},\"seq\":1}}", .{sid_j.items}) catch continue;
                     defer alloc.free(proj);
                     remote_mux.publishControlRaw(proj);
                 } else if (std.mem.eql(u8, endpoint, "$events")) {
