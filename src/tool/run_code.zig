@@ -102,7 +102,9 @@ pub const definition = tool_reg.ToolDefinition{
     \\mode every step runs independently. Results come back as a JSON array
     \\of {step, tool, ok, output} entries in order. Later steps may splice
     \\earlier results into their args with {{steps[N].output}}, {{steps[N].error}}
-    \\or {{prev.output}} (JSON-escaped into the surrounding string).
+    \\or {{prev.output}} (JSON-escaped into the surrounding string). An optional
+    \\per-step "when" guard ([!](prev|steps[N]).(ok|failed)) skips a step without
+    \\failing the batch.
     ,
     .category = .general,
     .parameters_json =
@@ -320,12 +322,46 @@ fn resolveArgs(
     return out.toOwnedSlice(alloc);
 }
 
+/// Evaluate a when guard against prior step outcomes:
+///   [!](prev|steps[N]).(ok|failed)
+/// Unknown forms evaluate to true (run) so a typo is not silently fatal.
+fn evalWhen(expr: []const u8, oks: []const bool) bool {
+    var e = std.mem.trim(u8, expr, " \t");
+    var negate = false;
+    if (e.len > 0 and e[0] == '!') {
+        negate = true;
+        e = std.mem.trim(u8, e[1..], " \t");
+    }
+    var idx: usize = 0;
+    var field: []const u8 = undefined;
+    if (std.mem.startsWith(u8, e, "prev.")) {
+        if (oks.len == 0) return true;
+        idx = oks.len - 1;
+        field = e["prev.".len..];
+    } else if (std.mem.startsWith(u8, e, "steps[")) {
+        const close = std.mem.indexOfScalar(u8, e, ']') orelse return true;
+        idx = std.fmt.parseInt(usize, e["steps[".len..close], 10) catch return true;
+        if (close + 1 >= e.len or e[close + 1] != '.') return true;
+        field = e[close + 2 ..];
+    } else {
+        return true;
+    }
+    if (idx >= oks.len) return true;
+    const want_ok = std.mem.eql(u8, field, "ok");
+    const want_failed = std.mem.eql(u8, field, "failed");
+    if (!want_ok and !want_failed) return true;
+    const val = if (want_ok) oks[idx] else !oks[idx];
+    return if (negate) !val else val;
+}
+
 // ── executor ────────────────────────────────────────────────────────────────
 
 /// One parsed step awaiting execution.
 const Step = struct {
     tool: []const u8,
     args: []const u8,
+    /// Optional guard: [!](prev|steps[N]).(ok|failed). Null = always run.
+    when: ?[]const u8 = null,
 };
 
 /// Dispatch a run_code call. Signature mirrors tool/builtin.zig's execute
@@ -380,14 +416,17 @@ pub fn execute(alloc: std.mem.Allocator, call: ToolCall) !ToolResult {
         const tool_raw = topLevelValue(el_t, "tool") orelse
             return fail(alloc, "step missing tool");
         const args_val = topLevelValue(el_t, "args") orelse "{}";
+        const when_raw = topLevelValue(el_t, "when");
         steps[idx] = .{
             .tool = try stringValue(alloc, tool_raw),
             .args = try alloc.dupe(u8, std.mem.trim(u8, args_val, " \t\r\n")),
+            .when = if (when_raw) |w| try stringValue(alloc, w) else null,
         };
     }
     defer for (steps) |s| {
         alloc.free(s.tool);
         alloc.free(s.args);
+        if (s.when) |w| alloc.free(w);
     };
 
     // Resolve mode (default sequential; unknown values are rejected rather
@@ -425,6 +464,8 @@ pub fn execute(alloc: std.mem.Allocator, call: ToolCall) !ToolResult {
         for (prior_errors.items) |s| alloc.free(s);
         prior_errors.deinit(alloc);
     }
+    var prior_oks: std.ArrayList(bool) = .empty;
+    defer prior_oks.deinit(alloc);
     for (steps, 0..) |step, idx| {
         if (sequential and any_failed) {
             stopped_early = true;
@@ -439,7 +480,17 @@ pub fn execute(alloc: std.mem.Allocator, call: ToolCall) !ToolResult {
         defer if (out_copy) |s| alloc.free(s);
         defer if (err_copy) |m| alloc.free(m);
 
-        if (std.mem.eql(u8, step.tool, "run_code")) {
+        var skipped = false;
+        if (step.when) |w| {
+            if (!evalWhen(w, prior_oks.items)) {
+                skipped = true;
+                ok = true;
+                out_copy = try alloc.dupe(u8, "");
+            }
+        }
+        if (skipped) {
+            // Guard failed: record a no-op success.
+        } else if (std.mem.eql(u8, step.tool, "run_code")) {
             // Recursion guard: a batch invoking itself is unbounded by design.
             err_copy = try alloc.dupe(u8, "run_code cannot invoke itself");
         } else {
@@ -466,6 +517,7 @@ pub fn execute(alloc: std.mem.Allocator, call: ToolCall) !ToolResult {
         if (!ok) any_failed = true;
         try prior_outputs.append(alloc, try alloc.dupe(u8, out_copy orelse ""));
         try prior_errors.append(alloc, try alloc.dupe(u8, err_copy orelse ""));
+        try prior_oks.append(alloc, ok);
 
         if (idx > 0) try out.append(alloc, ',');
         try out.appendSlice(alloc, "{\"step\":");
@@ -475,6 +527,7 @@ pub fn execute(alloc: std.mem.Allocator, call: ToolCall) !ToolResult {
         try appendEscaped(alloc, &out, step.tool);
         try out.appendSlice(alloc, "\",\"ok\":");
         try out.appendSlice(alloc, if (ok) "true" else "false");
+        if (skipped) try out.appendSlice(alloc, ",\"skipped\":true");
         try out.appendSlice(alloc, ",\"output\":\"");
         try appendEscaped(alloc, &out, out_copy orelse "");
         try out.appendSlice(alloc, "\"");
@@ -725,4 +778,17 @@ test "resolveArgs splices prior step results with JSON escaping" {
     const got = try resolveArgs(alloc, "{\"x\":\"{{steps[0].output}}\",\"y\":\"{{prev.error}}\",\"z\":\"{{nope}}\"}", &outputs, &errors);
     defer alloc.free(got);
     try std.testing.expectEqualStrings("{\"x\":\"a\\\"b\\nc\",\"y\":\"boom\",\"z\":\"{{nope}}\"}", got);
+}
+
+test "evalWhen reads ok/failed guards with negation" {
+    const oks = [_]bool{ true, false };
+    try std.testing.expect(evalWhen("prev.failed", &oks));
+    try std.testing.expect(!evalWhen("prev.ok", &oks));
+    try std.testing.expect(evalWhen("steps[0].ok", &oks));
+    try std.testing.expect(!evalWhen("!steps[0].ok", &oks));
+    try std.testing.expect(evalWhen("steps[1].failed", &oks));
+    // Unknown / out-of-range guards run the step.
+    try std.testing.expect(evalWhen("nonsense", &oks));
+    try std.testing.expect(evalWhen("steps[9].ok", &oks));
+    try std.testing.expect(evalWhen("prev.ok", &[_]bool{}));
 }
