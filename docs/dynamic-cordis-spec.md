@@ -252,6 +252,13 @@ interface DynamicCordisClientSource { code:string; name:string; pluginId, packag
 
 - `cordis_inspect_list` / `cordis_inspect_query {platform:host|client, provider, method, input?}` (client query waits for first page answer, cancellable) — `tool-cordis/src/index.ts:42,60`.
 - `cordis_inspect_self {pluginId?, packageId?}` (layered: list → plugin → package source+diagnostics, `packageId` requires `pluginId`).
+
+> **zharness status.** `cordis_inspect` was zharness's original name; it now
+aliases `cordis_inspect_list`. zharness has no host/client Inspect provider
+registry, so `cordis_inspect_query` keys on `{pluginId}` and returns that
+plugin's packages and live status, and `cordis_inspect_self` reports the
+calling session id plus its plugin count — a pragmatic subset of the
+platform/provider/method contract above.
 - `cordis_define {plugin:{kind:new{idPrefix:[a-z]{3,6}} | existing{pluginId}}, name, purpose, code:{host?,client?}}` — syntax-only, returns `{pluginId, packageId, hasHostHalf, hasClientHalf}` with presentationMeta.
 - `cordis_run {pluginId, packageId, mode:run|update}` — returns `{status:awaiting-approval|starting|running, pluginRunId, waitingFor?, clientWaitingFor?, currentPackageId?, nextPackageId?}`.
 - `cordis_stop {pluginId}` idempotent, `cordis_undefine {pluginId}` destructive.

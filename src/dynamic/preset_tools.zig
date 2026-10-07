@@ -139,6 +139,8 @@ pub const cordis_undefine = tool_reg.ToolDefinition{
     ,
 };
 
+/// Legacy name for the plugin-directory view; kept as an alias of
+/// cordis_inspect_list (upstream removed this name in the 0.2.x redesign).
 pub const cordis_inspect = tool_reg.ToolDefinition{
     .name = "cordis_inspect",
     .description =
@@ -149,13 +151,48 @@ pub const cordis_inspect = tool_reg.ToolDefinition{
     .parameters_json = "{\"type\":\"object\",\"properties\":{}}",
 };
 
-/// All five in registration order (integrator convenience).
+/// Upstream 0.2.x name for the plugin/provider directory.
+pub const cordis_inspect_list = tool_reg.ToolDefinition{
+    .name = "cordis_inspect_list",
+    .description =
+    \\List this session's dynamic packages and their live status: plugin ids,
+    \\package revisions, current/next pointers, and latest run state
+    \\(awaiting-approval / running / failed / stopped ...). Takes no arguments.
+    ,
+    .parameters_json = "{\"type\":\"object\",\"properties\":{}}",
+};
+
+/// Upstream 0.2.x per-provider query.
+pub const cordis_inspect_query = tool_reg.ToolDefinition{
+    .name = "cordis_inspect_query",
+    .description =
+    \\Return the details of one dynamic plugin owned by this session, by the
+    \\pluginId reported by cordis_inspect_list.
+    ,
+    .parameters_json = "{\"type\":\"object\",\"properties\":{\"pluginId\":{\"type\":\"string\"}},\"required\":[\"pluginId\"]}",
+};
+
+/// Upstream 0.2.x self-inspection (the calling session's dynamic wiring).
+pub const cordis_inspect_self = tool_reg.ToolDefinition{
+    .name = "cordis_inspect_self",
+    .description =
+    \\Report the dynamic wiring of the calling session: its session id and the
+    \\number of plugins it owns.
+    ,
+    .parameters_json = "{\"type\":\"object\",\"properties\":{}}",
+};
+
+/// Registration order (integrator convenience). cordis_inspect is the legacy
+/// alias of cordis_inspect_list.
 pub const definitions = [_]tool_reg.ToolDefinition{
     cordis_define,
     cordis_run,
     cordis_stop,
     cordis_undefine,
     cordis_inspect,
+    cordis_inspect_list,
+    cordis_inspect_query,
+    cordis_inspect_self,
 };
 
 // ── executor ────────────────────────────────────────────────────────────────
@@ -196,7 +233,13 @@ pub fn execute(alloc: std.mem.Allocator, call: ToolCall) !ToolResult {
     if (std.mem.eql(u8, call.name, cordis_run.name)) return cordisRunExec(alloc, deps, &args);
     if (std.mem.eql(u8, call.name, cordis_stop.name)) return cordisStopExec(alloc, deps, &args);
     if (std.mem.eql(u8, call.name, cordis_undefine.name)) return cordisUndefineExec(alloc, deps, &args);
-    if (std.mem.eql(u8, call.name, cordis_inspect.name)) return cordisInspectExec(alloc, deps);
+    if (std.mem.eql(u8, call.name, cordis_inspect.name) or
+        std.mem.eql(u8, call.name, cordis_inspect_list.name))
+    {
+        return cordisInspectExec(alloc, deps);
+    }
+    if (std.mem.eql(u8, call.name, cordis_inspect_query.name)) return cordisInspectQueryExec(alloc, deps, call.arguments);
+    if (std.mem.eql(u8, call.name, cordis_inspect_self.name)) return cordisInspectSelfExec(alloc, deps);
     return fail(alloc, "unknown cordis tool");
 }
 
@@ -440,6 +483,68 @@ fn cordisInspectExec(alloc: std.mem.Allocator, deps: *CordisDeps) !ToolResult {
     return .{ .success = true, .output = try out.toOwnedSlice(alloc), .err_msg = null };
 }
 
+fn cordisInspectQueryExec(alloc: std.mem.Allocator, deps: *CordisDeps, args: []const u8) !ToolResult {
+    const pid = (jsonx.getStringAlloc(alloc, args, "pluginId") catch null) orelse
+        return fail(alloc, "cordis_inspect_query: missing 'pluginId'");
+    defer alloc.free(pid);
+
+    const lc = deps.lc;
+    lc.lock.lock();
+    defer lc.lock.unlock();
+    const rows = lc.reg.snapshot(alloc, deps.session_id) catch |e|
+        return fail(alloc, @errorName(e));
+    defer {
+        for (rows) |r| alloc.free(r.packages);
+        alloc.free(rows);
+    }
+    for (rows) |r| {
+        if (!std.mem.eql(u8, r.pluginId, pid)) continue;
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(alloc);
+        try out.appendSlice(alloc, "plugin ");
+        try out.appendSlice(alloc, r.pluginId);
+        try out.appendSlice(alloc, " current=");
+        try out.appendSlice(alloc, r.currentPackageId orelse "none");
+        try out.appendSlice(alloc, " next=");
+        try out.appendSlice(alloc, r.nextPackageId orelse "none");
+        try out.appendSlice(alloc, " latest=");
+        if (r.latestRun) |lr| {
+            try out.appendSlice(alloc, lr.status.asStr());
+        } else {
+            try out.appendSlice(alloc, "idle");
+        }
+        try out.append(alloc, '\n');
+        for (r.packages) |pkg| {
+            try out.appendSlice(alloc, "  ");
+            try out.appendSlice(alloc, pkg.packageId);
+            try out.appendSlice(alloc, " '");
+            try out.appendSlice(alloc, pkg.name);
+            try out.appendSlice(alloc, "': ");
+            try out.appendSlice(alloc, pkg.purpose);
+            try out.append(alloc, '\n');
+        }
+        return .{ .success = true, .output = try out.toOwnedSlice(alloc), .err_msg = null };
+    }
+    return fail(alloc, "cordis_inspect_query: unknown pluginId");
+}
+
+fn cordisInspectSelfExec(alloc: std.mem.Allocator, deps: *CordisDeps) !ToolResult {
+    const lc = deps.lc;
+    lc.lock.lock();
+    defer lc.lock.unlock();
+    const rows = lc.reg.snapshot(alloc, deps.session_id) catch |e|
+        return fail(alloc, @errorName(e));
+    defer {
+        for (rows) |r| alloc.free(r.packages);
+        alloc.free(rows);
+    }
+    return .{
+        .success = true,
+        .output = try std.fmt.allocPrint(alloc, "session {s}: {d} plugin(s)", .{ deps.session_id, rows.len }),
+        .err_msg = null,
+    };
+}
+
 fn appendCount(alloc: std.mem.Allocator, out: *std.ArrayList(u8), n: usize) !void {
     var buf: [32]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, "{d}", .{n}) catch unreachable;
@@ -536,12 +641,12 @@ fn freeArgs(alloc: std.mem.Allocator, map: *std.StringHashMap([]const u8)) void 
 
 const testing = std.testing;
 
-test "all five definitions register into the registry" {
+test "all cordis definitions register into the registry" {
     const alloc = testing.allocator;
     var reg = try tool_reg.ToolRegistry.init(alloc);
     defer reg.deinit();
     for (definitions) |def| try reg.register(def);
-    inline for (.{ "cordis_define", "cordis_run", "cordis_stop", "cordis_undefine", "cordis_inspect" }) |n| {
+    inline for (.{ "cordis_define", "cordis_run", "cordis_stop", "cordis_undefine", "cordis_inspect", "cordis_inspect_list", "cordis_inspect_query", "cordis_inspect_self" }) |n| {
         const got = reg.get(n) orelse return error.TestUnexpectedResult;
         try testing.expectEqualStrings(n, got.name);
         try testing.expect(got.description.len > 0);
