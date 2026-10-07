@@ -20,11 +20,11 @@ git clone https://github.com/chy3xyz/zcordis.git ../zcordis
 
 ```bash
 zig build                                  # build ./zig-out/bin/zh
-zig build test                             # full suite (387 tests)
+zig build test                             # full suite (393 tests)
 zig build test -Dtest-filter="shell echo"  # a single test by name
 zig build run -- run "..."                 # run the agent (needs ZHARNESS_API_KEY)
 zig build -Doptimize=ReleaseSafe           # optimized test build
-zig fmt src/ tests/ examples/ build.zig    # MUST run before committing Zig changes
+zig fmt src/ test examples/ build.zig      # MUST run before committing Zig changes
 ```
 
 ## Layout / invariants
@@ -35,7 +35,7 @@ zig fmt src/ tests/ examples/ build.zig    # MUST run before committing Zig chan
 - **No JSON or HTTP library.** HTTPS goes through `curl` via libc `popen`; JSON
   is hand-rolled. Keep new parsing in this style.
 - `src/tests.zig` is the test root that pulls in every module; `zig build test`
-  is the gate and runs 387 tests. The binary installs as `zh` (not `zharness`).
+  is the gate and runs 393 tests. The binary installs as `zh` (not `zharness`).
 - `_ref/` is read-only reference material — do **not** compile it:
   `_ref/deepseek-harness` (original TypeScript project) and `_ref/zeepseek`
   (reusable Zig 0.17 patterns).

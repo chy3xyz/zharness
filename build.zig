@@ -42,15 +42,15 @@ pub fn build(b: *std.Build) void {
     });
     test_mod.addImport("cordis", cordis_mod);
 
+    // In Zig 0.17 --test-filter is a compile-time flag (the test runner no
+    // longer parses it at runtime), so hand it to the test compile step.
+    const test_filter: []const []const u8 = if (b.option([]const u8, "test-filter", "Only run tests whose name contains this string")) |filter| &.{filter} else &.{};
     const test_exe = b.addTest(.{
         .name = "zharness-tests",
         .root_module = test_mod,
+        .filters = test_filter,
     });
     const run_tests = b.addRunArtifact(test_exe);
-    if (b.option([]const u8, "test-filter", "Only run tests whose name contains this string")) |filter| {
-        run_tests.addArg("--test-filter");
-        run_tests.addArg(filter);
-    }
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
 }
