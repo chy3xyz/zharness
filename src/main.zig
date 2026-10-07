@@ -55,6 +55,7 @@ const tool_attachments = @import("tool/attachments.zig");
 const present_mod = @import("tool/present.zig");
 const jobs_tool = @import("tool/jobs.zig");
 const read_image_mod = @import("tool/read_image.zig");
+const terminal_mod = @import("tool/terminal.zig");
 const goals_rpc = @import("server/apiproxy/goals_rpc.zig");
 const plan_frames = @import("server/apiproxy/plan_frames.zig");
 const jobs_rpc = @import("server/apiproxy/jobs_rpc.zig");
@@ -1010,6 +1011,7 @@ pub const LoopExtensions = struct {
     fn execTool(ctx: *anyopaque, alloc: std.mem.Allocator, io: std.Io, call: tool_builtin.ToolCall) anyerror!?tool_builtin.ToolResult {
         const self: *LoopExtensions = @ptrCast(@alignCast(ctx));
         if (jobs_tool.isJobTool(call.name)) return try jobs_tool.execute(alloc, io, self.cwd, call);
+        if (terminal_mod.isTerminalTool(call.name)) return try terminal_mod.execute(alloc, call);
         if (std.mem.eql(u8, call.name, "read_image")) {
             const path = (model.extractStringField(alloc, call.arguments, "path") catch null) orelse
                 return .{ .success = false, .output = "", .err_msg = try alloc.dupe(u8, "read_image: missing 'path'") };
@@ -2552,6 +2554,7 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
     try present_mod.register(tools);
     try jobs_tool.register(tools);
     try read_image_mod.register(tools);
+    try terminal_mod.register(tools);
     g_ask_storage = .{ .publish = publishAskFrame, .store = questions.sharedStore() catch null };
     ask_user.setAskCtx(&g_ask_storage);
 

@@ -46,6 +46,7 @@ comptime {
     _ = @import("tool/present.zig"); // present (deliverables) tool
     _ = @import("tool/jobs.zig"); // job_list / job_output / job_kill
     _ = @import("tool/read_image.zig"); // read_image loader
+    _ = @import("tool/terminal.zig"); // terminal_* persistent shells
     _ = @import("tool/spawn_agent.zig");
     _ = @import("workflow/workflow.zig");
     _ = @import("workflow/executor.zig");
