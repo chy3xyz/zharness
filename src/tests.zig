@@ -44,6 +44,7 @@ comptime {
     _ = @import("agent/compaction.zig"); // context compaction: pure helpers + tests
     _ = @import("session/log.zig"); // append-only JSONL session log
     _ = @import("tool/present.zig"); // present (deliverables) tool
+    _ = @import("tool/jobs.zig"); // job_list / job_output / job_kill
     _ = @import("tool/spawn_agent.zig");
     _ = @import("workflow/workflow.zig");
     _ = @import("workflow/executor.zig");
