@@ -50,6 +50,7 @@ comptime {
     _ = @import("tool/session_query.zig"); // session_search / session_read
     _ = @import("tool/schedule.zig"); // schedule_create/list/update/delete
     _ = @import("tool/lsp.zig"); // lsp_diagnostics
+    _ = @import("tool/team_task.zig"); // team_task_* shared board
     _ = @import("telemetry/otel.zig"); // OTLP/JSON span export
     _ = @import("tool/spawn_agent.zig");
     _ = @import("workflow/workflow.zig");
