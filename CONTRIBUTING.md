@@ -33,7 +33,7 @@ export ZHARNESS_API_KEY="sk-..."
 ## Testing
 
 ```bash
-zig build test                             # full suite (432 tests)
+zig build test                             # full suite (433 tests)
 zig build test -Dtest-filter="shell echo"  # a single test by name
 ```
 
