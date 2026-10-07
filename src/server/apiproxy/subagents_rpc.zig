@@ -133,6 +133,10 @@ const Run = struct {
     status: Status = .running,
     started_at_ms: i64,
     duration_ms: ?i64 = null,
+    /// Cooperative cancellation request (set by interrupt_agent).
+    cancel_requested: bool = false,
+    /// Messages queued by send_message; drained between subagent turns.
+    inbox: std.ArrayList([]u8) = .empty,
 
     fn deinit(self: *Run, gpa: std.mem.Allocator) void {
         gpa.free(self.id);
@@ -140,6 +144,8 @@ const Run = struct {
         gpa.free(self.label);
         gpa.free(self.prompt);
         if (self.final_text) |t| gpa.free(t);
+        for (self.inbox.items) |m| gpa.free(m);
+        self.inbox.deinit(gpa);
     }
 };
 
@@ -271,6 +277,67 @@ pub const Registry = struct {
         defer self.lock.unlock();
         for (self.runs.items) |run| {
             if (std.mem.eql(u8, run.id, id)) return try dupeSnapshot(alloc, run);
+        }
+        return null;
+    }
+
+    /// Request cooperative cancellation of one run. False when unknown.
+    pub fn requestCancel(self: *Registry, id: []const u8) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (self.runs.items) |run| {
+            if (std.mem.eql(u8, run.id, id)) {
+                run.cancel_requested = true;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Has cancellation been requested for this run?
+    pub fn cancelRequested(self: *Registry, id: []const u8) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (self.runs.items) |run| {
+            if (std.mem.eql(u8, run.id, id)) return run.cancel_requested;
+        }
+        return false;
+    }
+
+    /// Queue one message for a run. False when unknown.
+    pub fn enqueueMessage(self: *Registry, id: []const u8, text: []const u8) bool {
+        const copy = dupInto(self.gpa, text) catch return false;
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (self.runs.items) |run| {
+            if (std.mem.eql(u8, run.id, id)) {
+                run.inbox.append(self.gpa, copy) catch {
+                    self.gpa.free(copy);
+                    return false;
+                };
+                return true;
+            }
+        }
+        self.gpa.free(copy);
+        return false;
+    }
+
+    /// Drain and clear a run inbox (null when empty/unknown). Reader owns.
+    pub fn drainInbox(self: *Registry, alloc: std.mem.Allocator, id: []const u8) !?[]const u8 {
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (self.runs.items) |run| {
+            if (!std.mem.eql(u8, run.id, id)) continue;
+            if (run.inbox.items.len == 0) return null;
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(alloc);
+            for (run.inbox.items, 0..) |m, i| {
+                if (i > 0) try out.append(alloc, '\n');
+                try out.appendSlice(alloc, m);
+                self.gpa.free(m);
+            }
+            run.inbox.clearRetainingCapacity();
+            return try out.toOwnedSlice(alloc);
         }
         return null;
     }

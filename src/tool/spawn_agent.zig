@@ -206,7 +206,15 @@ pub fn execute(alloc: std.mem.Allocator, call: ToolCall) !ToolResult {
         subagents_rpc.beginRun(alloc, wiring.parent_session_id, spec.name, task) catch null
     else
         null;
-    var outcome = subagent.runSubagent(alloc, &wiring.deps, spec, task) catch |e| {
+    // Per-run deps copy so the cooperative hooks can address this run by id
+    // (send_message queues text, interrupt_agent requests cancellation).
+    var run_deps = wiring.deps;
+    if (child_id) |id| {
+        run_deps.hook_run_id = id;
+        run_deps.should_cancel = cancelHook;
+        run_deps.drain_inbox = inboxHook;
+    }
+    var outcome = subagent.runSubagent(alloc, &run_deps, spec, task) catch |e| {
         if (child_id) |id| {
             subagents_rpc.endRun(id, false, null);
             alloc.free(id);
@@ -215,7 +223,7 @@ pub fn execute(alloc: std.mem.Allocator, call: ToolCall) !ToolResult {
     };
     defer outcome.deinit(alloc);
     if (child_id) |id| {
-        subagents_rpc.endRun(id, true, outcome.text);
+        subagents_rpc.endRun(id, !outcome.cancelled, outcome.text);
         alloc.free(id);
     }
 
@@ -227,8 +235,21 @@ pub fn execute(alloc: std.mem.Allocator, call: ToolCall) !ToolResult {
     try out.appendSlice(alloc, spec.name);
     try out.appendSlice(alloc, "' finished: ");
     try appendTurnSummary(alloc, &out, outcome.turns_used, outcome.truncated);
+    if (outcome.cancelled) try out.appendSlice(alloc, ", cancelled by request");
     try out.appendSlice(alloc, "]");
     return .{ .success = true, .output = try out.toOwnedSlice(alloc), .err_msg = null };
+}
+
+fn cancelHook(d: *subagent.SubAgentDeps) bool {
+    if (d.hook_run_id.len == 0) return false;
+    const reg = subagents_rpc.shared() catch return false;
+    return reg.cancelRequested(d.hook_run_id);
+}
+
+fn inboxHook(d: *subagent.SubAgentDeps, alloc: std.mem.Allocator) anyerror!?[]const u8 {
+    if (d.hook_run_id.len == 0) return null;
+    const reg = subagents_rpc.shared() catch return null;
+    return reg.drainInbox(alloc, d.hook_run_id);
 }
 
 fn appendTurnSummary(alloc: std.mem.Allocator, out: *std.ArrayList(u8), turns: usize, truncated: bool) !void {

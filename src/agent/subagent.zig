@@ -79,6 +79,13 @@ pub const SubAgentDeps = struct {
     /// Shared parent registry (read-only schema source). Null → no tools are
     /// advertised at all.
     tools: ?*const tool_reg.ToolRegistry = null,
+    /// Per-run registry id handed back to the optional cooperative hooks.
+    hook_run_id: []const u8 = "",
+    /// Cooperative cancellation probe, consulted at the top of every turn.
+    should_cancel: ?*const fn (deps: *SubAgentDeps) bool = null,
+    /// Cooperative inbox drain, consulted before every turn; non-empty text is
+    /// appended as a user message. Allocated with `deps.alloc`.
+    drain_inbox: ?*const fn (deps: *SubAgentDeps, alloc: std.mem.Allocator) anyerror!?[]const u8 = null,
 };
 
 /// Final answer handed back to the parent. `text` is owned by the caller:
@@ -89,6 +96,8 @@ pub const SubAgentOutcome = struct {
     /// True when the run did NOT finish naturally within its budgets (turn
     /// cap exhausted mid-work, or output cut by output_char_cap).
     truncated: bool,
+    /// True when a cooperative cancel request stopped the run.
+    cancelled: bool = false,
 
     pub fn deinit(self: *const SubAgentOutcome, alloc: std.mem.Allocator) void {
         alloc.free(self.text);
@@ -124,8 +133,21 @@ pub fn runSubagent(
 
     var turns_used: usize = 0;
     var finished_naturally = false;
+    var cancelled = false;
 
     while (turns_used < spec.max_turns) {
+        if (deps.should_cancel) |f| {
+            if (f(deps)) {
+                cancelled = true;
+                break;
+            }
+        }
+        if (deps.drain_inbox) |f| {
+            if (try f(deps, alloc)) |text| {
+                defer alloc.free(text);
+                if (text.len > 0) try messages.append(alloc, .{ .role = .user, .content = try alloc.dupe(u8, text) });
+            }
+        }
         turns_used += 1;
 
         var resp = try deps.chat_fn(deps, .{
@@ -175,13 +197,14 @@ pub fn runSubagent(
         errdefer out.deinit(alloc);
         try out.appendSlice(alloc, acc.items[0..cut]);
         try out.appendSlice(alloc, marker);
-        return .{ .text = try out.toOwnedSlice(alloc), .turns_used = turns_used, .truncated = true };
+        return .{ .text = try out.toOwnedSlice(alloc), .turns_used = turns_used, .truncated = true, .cancelled = cancelled };
     }
 
     return .{
         .text = try acc.toOwnedSlice(alloc),
         .turns_used = turns_used,
         .truncated = truncated,
+        .cancelled = cancelled,
     };
 }
 
@@ -563,4 +586,25 @@ test "missing executor yields error tool message" {
 
     try std.testing.expectEqualStrings("gave up gracefully", outcome.text);
     try std.testing.expectEqual(@as(usize, 0), scripted.exec_log.items.len);
+}
+
+test "cooperative cancel stops before the first turn" {
+    const alloc = std.testing.allocator;
+    const H = struct {
+        fn chat(d: *SubAgentDeps, req: ChatRequest) anyerror!ChatResponse {
+            _ = d;
+            _ = req;
+            return error.ShouldNotBeCalled;
+        }
+        fn cancel(d: *SubAgentDeps) bool {
+            _ = d;
+            return true;
+        }
+    };
+    var deps = SubAgentDeps{ .alloc = alloc, .chat_fn = H.chat, .should_cancel = H.cancel };
+    const spec = SubAgentSpec{ .name = "x", .system_prompt = "s", .max_turns = 3, .output_char_cap = 1000 };
+    var out = try runSubagent(alloc, &deps, spec, "task");
+    defer out.deinit(alloc);
+    try std.testing.expect(out.cancelled);
+    try std.testing.expectEqual(@as(usize, 0), out.turns_used);
 }

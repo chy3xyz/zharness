@@ -33,13 +33,34 @@ pub const wait_definition = tool_reg.ToolDefinition{
     ,
 };
 
+pub const interrupt_definition = tool_reg.ToolDefinition{
+    .name = "interrupt_agent",
+    .description = "Request cooperative cancellation of a subagent run; it stops at its next turn boundary.",
+    .category = .general,
+    .parameters_json =
+    \\{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}
+    ,
+};
+
+pub const send_definition = tool_reg.ToolDefinition{
+    .name = "send_message",
+    .description = "Queue a message for a running subagent; it is appended to the run before its next turn.",
+    .category = .general,
+    .parameters_json =
+    \\{"type":"object","properties":{"id":{"type":"string"},"message":{"type":"string"}},"required":["id","message"]}
+    ,
+};
+
 pub fn register(reg: *tool_reg.ToolRegistry) !void {
     try reg.register(definition);
     try reg.register(wait_definition);
+    try reg.register(interrupt_definition);
+    try reg.register(send_definition);
 }
 
 pub fn isAgentTool(name: []const u8) bool {
-    return std.mem.eql(u8, name, definition.name) or std.mem.eql(u8, name, wait_definition.name);
+    return std.mem.eql(u8, name, definition.name) or std.mem.eql(u8, name, wait_definition.name) or
+        std.mem.eql(u8, name, interrupt_definition.name) or std.mem.eql(u8, name, send_definition.name);
 }
 
 fn fail(a: std.mem.Allocator, msg: []const u8) !ToolResult {
@@ -96,8 +117,31 @@ fn waitAgent(a: std.mem.Allocator, args: []const u8) !ToolResult {
     }
 }
 
+fn interruptAgent(a: std.mem.Allocator, args: []const u8) !ToolResult {
+    const id = (try model.extractStringField(a, args, "id")) orelse
+        return fail(a, "interrupt_agent: missing 'id'");
+    defer a.free(id);
+    const reg = subagents_rpc.shared() catch return fail(a, "subagent registry unavailable");
+    if (!reg.requestCancel(id)) return fail(a, "interrupt_agent: unknown agent id");
+    return .{ .success = true, .output = try std.fmt.allocPrint(a, "cancellation requested for {s}", .{id}) };
+}
+
+fn sendMessage(a: std.mem.Allocator, args: []const u8) !ToolResult {
+    const id = (try model.extractStringField(a, args, "id")) orelse
+        return fail(a, "send_message: missing 'id'");
+    defer a.free(id);
+    const msg = (try model.extractStringField(a, args, "message")) orelse
+        return fail(a, "send_message: missing 'message'");
+    defer a.free(msg);
+    const reg = subagents_rpc.shared() catch return fail(a, "subagent registry unavailable");
+    if (!reg.enqueueMessage(id, msg)) return fail(a, "send_message: unknown agent id");
+    return .{ .success = true, .output = try std.fmt.allocPrint(a, "message queued for {s}", .{id}) };
+}
+
 pub fn execute(a: std.mem.Allocator, call: ToolCall) !ToolResult {
     if (std.mem.eql(u8, call.name, wait_definition.name)) return waitAgent(a, call.arguments);
+    if (std.mem.eql(u8, call.name, interrupt_definition.name)) return interruptAgent(a, call.arguments);
+    if (std.mem.eql(u8, call.name, send_definition.name)) return sendMessage(a, call.arguments);
     if (!std.mem.eql(u8, call.name, definition.name))
         return fail(a, "unknown agent tool");
     const reg = subagents_rpc.shared() catch return fail(a, "subagent registry unavailable");
@@ -155,4 +199,27 @@ test "wait_agent returns a finished run and times out a running one" {
     defer freeResult(a, &t);
     try testing.expect(t.success);
     try testing.expect(std.mem.indexOf(u8, t.output, "timed out") != null);
+}
+
+test "send_message and interrupt_agent act on the registry" {
+    const a = testing.allocator;
+    const reg = try subagents_rpc.shared();
+    try reg.recordStart(.{ .id = "subagent-msg-1", .parent_session_id = "s", .label = "m", .prompt = "p", .started_at_ms = 1 });
+
+    var s = try execute(a, .{ .name = "send_message", .arguments = "{\"id\":\"subagent-msg-1\",\"message\":\"ping\"}" });
+    defer freeResult(a, &s);
+    try testing.expect(s.success);
+    const drained = try reg.drainInbox(a, "subagent-msg-1");
+    defer if (drained) |d| a.free(d);
+    try testing.expect(drained != null);
+    try testing.expectEqualStrings("ping", drained.?);
+
+    var i = try execute(a, .{ .name = "interrupt_agent", .arguments = "{\"id\":\"subagent-msg-1\"}" });
+    defer freeResult(a, &i);
+    try testing.expect(i.success);
+    try testing.expect(reg.cancelRequested("subagent-msg-1"));
+
+    var bad = try execute(a, .{ .name = "send_message", .arguments = "{\"id\":\"absent\",\"message\":\"x\"}" });
+    defer freeResult(a, &bad);
+    try testing.expect(!bad.success);
 }
