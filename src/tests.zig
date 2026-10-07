@@ -57,6 +57,7 @@ comptime {
     _ = @import("pluginabi/loader.zig");
     _ = @import("pluginabi/wasm_loader.zig");
     _ = @import("sandbox/wasm.zig");
+    _ = @import("sandbox/native.zig"); // OS confinement (Seatbelt/bwrap)
     _ = @import("server/events.zig");
     _ = @import("server/static.zig");
     // Wave-4 hardening suites (corpus-driven parser robustness).

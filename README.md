@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Zig 0.17](https://img.shields.io/badge/Zig-0.17-orange.svg)](https://ziglang.org/)
-[![Tests](https://img.shields.io/badge/Tests-401%20passing-brightgreen.svg)](#testing)
+[![Tests](https://img.shields.io/badge/Tests-404%20passing-brightgreen.svg)](#testing)
 [![CI](https://github.com/chy3xyz/zharness/actions/workflows/ci.yml/badge.svg)](https://github.com/chy3xyz/zharness/actions/workflows/ci.yml)
 
 ---
@@ -35,9 +35,10 @@ zh run "analyze this repo and fix the build"
 - **MCP integration** — Model Context Protocol stdio servers
 
 ### 🛡️ Security & Sandboxing
-- **Level 0**: Native trusted (default for local dev)
-- **Level 1**: Process sandbox (deny-list + env allowlist + watchdog)
-- **Level 2**: WASM sandbox (via zcordis runtime)
+- **`native`** — OS-level confinement (macOS Seatbelt / Linux bubblewrap) with the deny-list pre-filter; writes are limited to the workspace and temp
+- **`process`** — deny-list + env allowlist + watchdog (defense in depth, not a kernel boundary)
+- **`none`** — no shell sandbox (trusted / danger mode)
+- **WASM plugin sandbox** — via the zcordis runtime
 
 ### 🌐 Server & Web UI
 - **HTTP API** — RESTful endpoints for sessions, prompts, health
@@ -294,7 +295,7 @@ zharness/
 ## Testing
 
 ```bash
-zig build test                             # full suite (401 tests)
+zig build test                             # full suite (404 tests)
 zig build test -Dtest-filter="shell echo"  # a single test by name
 ```
 

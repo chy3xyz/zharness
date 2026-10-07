@@ -29,10 +29,13 @@
 
 const std = @import("std");
 const clib = @import("../clib.zig");
+const native = @import("native.zig");
 
 pub const Level = enum {
     off,
     process,
+    /// Kernel/OS confinement (Seatbelt / bwrap) with the L1 pre-filter.
+    native,
 
     pub fn fromString(s: []const u8) Level {
         if (std.mem.eql(u8, s, "off")) return .off;
@@ -285,7 +288,7 @@ pub fn run(
     try appendQuoted(alloc, &full, cwd);
     try full.appendSlice(alloc, " && ");
 
-    if (policy.level == .process) {
+    if (policy.level != .off) {
         // Environment rebuild + watchdog. The payload runs under a
         // scrubbed-environment shell:
         //   cd CWD && env -i ALLOWED... /bin/sh -c 'PAYLOAD'
@@ -343,7 +346,19 @@ pub fn run(
         try full.appendSlice(alloc, " ; } 2>&1");
     }
 
-    const cmd_z = try alloc.dupeSentinel(u8, full.items, 0);
+    // .native: wrap the whole command in OS confinement when available. The
+    // L1 env-scrub + watchdog above still applies as a pre-filter.
+    var wrapped: ?[]u8 = null;
+    defer if (wrapped) |w| alloc.free(w);
+    var final_cmd: []const u8 = full.items;
+    if (policy.level == .native) {
+        if (try native.confine(alloc, cwd, full.items)) |w| {
+            wrapped = w;
+            final_cmd = w;
+        }
+    }
+
+    const cmd_z = try alloc.dupeSentinel(u8, final_cmd, 0);
     defer alloc.free(cmd_z);
 
     const fp = clib.popenRead(cmd_z.ptr) orelse return error.SpawnFailed;
@@ -506,4 +521,29 @@ test "watchdog kills hung command" {
     defer r.deinit(alloc);
     try std.testing.expect(!r.success);
     try std.testing.expect(r.timed_out);
+}
+
+test "native level confines writes outside the workspace" {
+    if (native.detect() == .none) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    // A benign command still runs under confinement.
+    var ok = try run(alloc, .{ .level = .native }, "/tmp", "echo confined-ok");
+    defer ok.deinit(alloc);
+    try std.testing.expect(ok.success);
+    try std.testing.expect(std.mem.indexOf(u8, ok.output, "confined-ok") != null);
+
+    // A write outside the allowed roots (HOME) is denied by the OS sandbox.
+    const home_z = getenv("HOME") orelse return error.SkipZigTest;
+    const home = std.mem.span(home_z);
+    const probe = try std.fmt.allocPrint(alloc, "{s}/zh_native_probe_{d}", .{ home, clib.nowTimestamp() });
+    defer alloc.free(probe);
+    const cmd = try std.fmt.allocPrint(alloc, "echo x > '{s}'", .{probe});
+    defer alloc.free(cmd);
+    var denied = try run(alloc, .{ .level = .native }, "/tmp", cmd);
+    defer denied.deinit(alloc);
+    try std.testing.expect(!denied.success);
+    const pz = try alloc.dupeSentinel(u8, probe, 0);
+    defer alloc.free(pz);
+    clib.unlinkPath(pz);
 }

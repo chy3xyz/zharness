@@ -510,17 +510,23 @@ fn matchLine(hay: []const u8, needle: []const u8, ic: bool) bool {
     return std.mem.indexOf(u8, hay, needle) != null;
 }
 
-/// Run a command via /bin/sh -c with cwd prefix and 2>&1 merge. When
-/// `sandbox_mode == .process` the command is executed through the L1 sandbox
-/// (policy classify → env allowlist → watchdog); a denied command never runs
-/// and surfaces its policy reason as a failed result.
+/// Run a command via /bin/sh -c with cwd prefix and 2>&1 merge. `.process` and
+/// `.native` execute through the sandbox (policy classify → env allowlist →
+/// watchdog); `.native` additionally wraps the command in OS confinement via
+/// sandbox/native.zig when available. A denied command never runs and surfaces
+/// its policy reason as a failed result.
 fn shell(alloc: std.mem.Allocator, cwd: []const u8, call: ToolCall, sandbox_mode: config.Config.SandboxMode) !ToolResult {
     var map = try parseArgs(alloc, call.arguments);
     defer freeArgs(alloc, &map);
     const cmd = map.get("command") orelse return failResult(alloc, "missing command");
 
-    if (sandbox_mode == .process) {
-        var r = sandbox_mod.run(alloc, .{}, cwd, cmd) catch |e| {
+    const sandbox_level: sandbox_mod.Level = switch (sandbox_mode) {
+        .native => .native,
+        .process => .process,
+        .none => .off,
+    };
+    if (sandbox_level != .off) {
+        var r = sandbox_mod.run(alloc, .{ .level = sandbox_level }, cwd, cmd) catch |e| {
             return ToolResult{
                 .success = false,
                 .output = "",

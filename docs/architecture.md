@@ -38,7 +38,7 @@ per-directory `addModule`; the pattern matches zcordis/zeepseek.
 | `model/model.zig` | The internal **Model IR** and `ChatClient.chat` (buffered + SSE via curl), dispatching on wire format |
 | `model/anthropic.zig` | IR ⇄ Anthropic Messages-API translation (tool_use/tool_result blocks) |
 | `tool/registry.zig` | `ToolRegistry` — single source of truth for capabilities; preset filtering removes entries |
-| `tool/builtin.zig` | Built-in executors (fs/grep/glob/shell/git); shell routes through the sandbox in `.process` mode |
+| `tool/builtin.zig` | Built-in executors (fs/grep/glob/shell/git); shell routes through the sandbox in `.process` / `.native` mode |
 | `tool/webfetch.zig` | `web_fetch` / `web_search` (curl-backed) |
 | `tool/spawn_agent.zig` | `spawn_agent` tool bridging to the SubAgent runner (recursion-guarded) |
 | `tool/mcp_bridge.zig` | Remote MCP tools projected into local naming (`mcp_<srv>_<tool>`) |
@@ -49,7 +49,8 @@ per-directory `addModule`; the pattern matches zcordis/zeepseek.
 | `memory/` | Working scratchpad + persistent KV store (`memory_get/set` tools) |
 | `session/session.zig` | Transcript store: legacy JSON array + append-only `<id>.jsonl` event log; `save` / `load` / resume |
 | `session/checkpoint.zig` | Turn-boundary snapshots (atomic publish, pruning) |
-| `sandbox/sandbox.zig` | Level-1 process sandbox: policy classify, env allowlist, watchdog timeout |
+| `sandbox/sandbox.zig` | Level-1 process sandbox: policy classify, env allowlist, watchdog timeout; `.native` adds OS confinement |
+| `sandbox/native.zig` | OS confinement: macOS Seatbelt profile, Linux bubblewrap wrapper |
 | `server/httpd.zig` | Minimal HTTP/1.1 server (libc sockets, poll-gated stop) |
 | `server/api.zig` | JSON routes over injected `ServerDeps` (run/chat/sessions/healthz/events) |
 | `workflow/` | JSON workflow parse/validate/cycle-check, topological executor, run reports |
@@ -142,5 +143,7 @@ used to free.
   (space-split argv, max 4, no quote handling).
 - Presets constrain the classic builtin toolset only; harness capabilities
   (plan/goal/memory/skill/web/mcp/plugin/spawn_agent) always stay available.
-- L2 WASM sandboxing awaits the zcordis wasm runtime; the process sandbox is
-  Level-1 (deny-list + env allowlist + watchdog), not a security boundary.
+- L2 WASM sandboxing awaits the zcordis wasm runtime. The `process` sandbox is
+  L1 defense-in-depth (deny-list + env allowlist + watchdog), not a boundary;
+  `native` adds OS confinement (macOS Seatbelt / Linux bubblewrap) when the
+  host provides it.
