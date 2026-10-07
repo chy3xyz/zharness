@@ -94,6 +94,27 @@ pub fn parseSkillMd(alloc: std.mem.Allocator, text: []const u8, source_path: []c
 // ── registry ────────────────────────────────────────────────────────────────
 
 pub const skill_use_name = "skill_use";
+/// Upstream 0.2.x model-facing name (alias of skill_use).
+pub const skillToolName = "skill";
+/// Directory containing the SKILL.md (base for relative resource paths), or
+/// null when the source path has no directory component.
+pub fn baseDirOf(source_path: []const u8) ?[]const u8 {
+    const slash = std.mem.lastIndexOfScalar(u8, source_path, '/') orelse return null;
+    if (slash == 0) return "/";
+    return source_path[0..slash];
+}
+
+/// The <skill_resources> guidance appended to a loaded skill body; empty when
+/// the skill has no base directory. Caller frees.
+pub fn resourcesBlock(alloc: std.mem.Allocator, source_path: []const u8) ![]const u8 {
+    const dir = baseDirOf(source_path) orelse return alloc.dupe(u8, "");
+    return std.fmt.allocPrint(
+        alloc,
+        "\n\n<skill_resources>\nBase directory for this skill: {s}\nResolve relative paths mentioned by this skill against the base directory before using them. Load referenced resources only as needed.\n</skill_resources>",
+        .{dir},
+    );
+}
+
 pub const skill_use_parameters_json =
     \\{"type":"object","properties":{"name":{"type":"string","description":"Skill name to activate"}},"required":["name"]}
 ;
@@ -215,4 +236,19 @@ test "registry dedup prompt section and body fetch" {
     defer alloc.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "2. Isolate") != null);
     try std.testing.expect((try r.getBody(alloc, "nope")) == null);
+}
+
+// ── tests ───────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "resourcesBlock names the skill base directory" {
+    const alloc = testing.allocator;
+    const block = try resourcesBlock(alloc, "/home/u/skills/coding/SKILL.md");
+    defer alloc.free(block);
+    try testing.expect(std.mem.indexOf(u8, block, "/home/u/skills/coding") != null);
+    try testing.expect(std.mem.indexOf(u8, block, "<skill_resources>") != null);
+    const none = try resourcesBlock(alloc, "SKILL.md");
+    defer alloc.free(none);
+    try testing.expectEqualStrings("", none);
 }

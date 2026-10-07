@@ -1043,7 +1043,11 @@ pub const LoopExtensions = struct {
         if (std.mem.eql(u8, call.name, "plan_set")) return try self.planSet(alloc, call);
         if (std.mem.eql(u8, call.name, "goal_set")) return try self.goalSet(alloc, call);
         if (std.mem.eql(u8, call.name, todo_mod.todo_write_name)) return try self.todoWrite(alloc, call);
-        if (std.mem.eql(u8, call.name, skill_mod.skill_use_name)) return try self.skillUse(alloc, call);
+        if (std.mem.eql(u8, call.name, skill_mod.skill_use_name) or
+            std.mem.eql(u8, call.name, skill_mod.skillToolName))
+        {
+            return try self.skillUse(alloc, call);
+        }
         if (std.mem.eql(u8, call.name, "memory_get")) return try self.memoryGet(alloc, call);
         if (std.mem.eql(u8, call.name, "memory_set")) return try self.memorySet(alloc, io, call);
         if (ask_user.isAskUserTool(call.name)) {
@@ -1216,8 +1220,17 @@ pub const LoopExtensions = struct {
             defer alloc.free(msg);
             return fail(alloc, msg);
         };
-        // body is allocated with `alloc` — same ownership as ToolResult.output.
-        return .{ .success = true, .output = body, .err_msg = null };
+        // Append the upstream <skill_resources> guidance so the model resolves
+        // the skill's relative paths against its own directory.
+        const skill = reg.get(name);
+        const block = if (skill) |s| try skill_mod.resourcesBlock(alloc, s.source_path) else try alloc.dupe(u8, "");
+        if (block.len == 0) {
+            // body is allocated with `alloc` — same ownership as ToolResult.output.
+            return .{ .success = true, .output = body, .err_msg = null };
+        }
+        defer alloc.free(body);
+        defer alloc.free(block);
+        return .{ .success = true, .output = try std.mem.concat(alloc, u8, &.{ body, block }), .err_msg = null };
     }
 
     fn memoryGet(self: *LoopExtensions, alloc: std.mem.Allocator, call: tool_builtin.ToolCall) !tool_builtin.ToolResult {
@@ -1300,6 +1313,12 @@ pub fn registerExtensionTools(reg: *tool_reg.ToolRegistry, opts: struct { skills
         try reg.register(.{
             .name = skill_mod.skill_use_name,
             .description = "Load a skill's full instructions into context by name. See 'Available skills' in your prompt for the index.",
+            .category = .general,
+            .parameters_json = skill_mod.skill_use_parameters_json,
+        });
+        try reg.register(.{
+            .name = skill_mod.skillToolName,
+            .description = "Load a skill's full instructions into context by name (upstream alias of skill_use).",
             .category = .general,
             .parameters_json = skill_mod.skill_use_parameters_json,
         });

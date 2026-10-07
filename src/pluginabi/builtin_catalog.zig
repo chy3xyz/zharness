@@ -68,7 +68,7 @@ pub const entries = [_]Builtin{
     .{
         .stable_id = "tool-skill",
         .module_name = "@deepseek-ai/dsh-tool-skill",
-        .tool_names = &.{"skill_use"},
+        .tool_names = &.{ "skill_use", "skill" },
         .entry_id = "builtin:tool-skill",
     },
     .{
