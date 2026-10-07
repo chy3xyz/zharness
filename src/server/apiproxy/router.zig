@@ -2536,6 +2536,12 @@ pub fn dispatch(
         const value = jsonx.getRaw(outcome, "value") orelse "null";
         const receipt = store_ptr.respondEvent(event_id, kind, value);
         if (receipt.accepted) return run(alloc, env, okValue(alloc, env.rpc_id, "null"));
+        // Approval waterfall answers settle here too (distinct id namespace).
+        if (questions.sharedApprovalStore() catch null) |astore| {
+            if (astore.resolveEvent(event_id, kind, value)) {
+                return run(alloc, env, okValue(alloc, env.rpc_id, "null"));
+            }
+        }
         return badRequest(alloc, env.rpc_id, receipt.reason);
     }
 

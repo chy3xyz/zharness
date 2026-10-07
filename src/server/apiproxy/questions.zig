@@ -376,11 +376,15 @@ pub const ApprovalStore = struct {
     /// Whether an interactive answerer is currently wired (mux publisher
     /// present). When false, `ask` requests fail closed to `unavailable`.
     has_answerer: bool = false,
+    /// Pending approval requests keyed by approval id. Value is an atomic
+    /// state byte: 0 waiting, 1 allowed-once, 2 rejected, 3 cancelled.
+    pending: std.StringHashMap(std.atomic.Value(u8)) = undefined,
 
     pub fn initInPlace(self: *ApprovalStore, alloc: std.mem.Allocator) void {
         self.* = .{
             .alloc = alloc,
             .policies = std.StringHashMap(ApprovalPolicy).init(alloc),
+            .pending = std.StringHashMap(std.atomic.Value(u8)).init(alloc),
             .has_answerer = false,
         };
     }
@@ -389,6 +393,76 @@ pub const ApprovalStore = struct {
         var it = self.policies.iterator();
         while (it.next()) |e| self.alloc.free(e.key_ptr.*);
         self.policies.deinit();
+        var pit = self.pending.iterator();
+        while (pit.next()) |e| self.alloc.free(e.key_ptr.*);
+        self.pending.deinit();
+    }
+
+    /// Whether an interactive answerer is currently wired.
+    pub fn hasAnswerer(self: *ApprovalStore) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.has_answerer;
+    }
+
+    /// Register a pending approval request (idempotent per id; resets state).
+    pub fn openRequest(self: *ApprovalStore, id: []const u8) !void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.pending.getEntry(id)) |e| {
+            e.value_ptr.store(0, .release);
+            return;
+        }
+        const key = try self.alloc.dupe(u8, id);
+        errdefer self.alloc.free(key);
+        try self.pending.put(key, std.atomic.Value(u8).init(0));
+    }
+
+    /// Settle a pending request. False when the id is unknown.
+    pub fn resolve(self: *ApprovalStore, id: []const u8, outcome: ApprovalOutcome) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const e = self.pending.getEntry(id) orelse return false;
+        const v: u8 = switch (outcome) {
+            .allowed_once => 1,
+            .rejected => 2,
+            .cancelled => 3,
+            .unavailable => 0,
+        };
+        e.value_ptr.store(v, .release);
+        return true;
+    }
+
+    /// Drop a pending request (caller owns the id string).
+    pub fn drop(self: *ApprovalStore, id: []const u8) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.pending.fetchRemove(id)) |kv| self.alloc.free(kv.key);
+    }
+
+    /// Poll a pending request until settled or `timeout_ms` elapses.
+    pub fn await(self: *ApprovalStore, id: []const u8, timeout_ms: u64, poll_ms: u64) ApprovalOutcome {
+        const deadline = monoMs() + @as(i64, @intCast(timeout_ms));
+        while (monoMs() < deadline) {
+            self.lock.lock();
+            const st: u8 = if (self.pending.get(id)) |p| p.load(.acquire) else 0;
+            self.lock.unlock();
+            switch (st) {
+                1 => return .allowed_once,
+                2 => return .rejected,
+                3 => return .cancelled,
+                else => {},
+            }
+            backoffSleepMs(poll_ms);
+        }
+        return .unavailable;
+    }
+
+    /// Settle a pending approval from a gateway `$events.result` payload.
+    pub fn resolveEvent(self: *ApprovalStore, event_id: []const u8, kind: []const u8, value_json: []const u8) bool {
+        if (std.mem.eql(u8, kind, "cancelled")) return self.resolve(event_id, .cancelled);
+        const outcome = parseOutcomeValue(value_json) orelse return false;
+        return self.resolve(event_id, outcome);
     }
 
     pub fn setHasAnswerer(self: *ApprovalStore, v: bool) void {
@@ -445,6 +519,36 @@ pub const ApprovalStore = struct {
         return outcome.isAllowed();
     }
 };
+
+fn outcomeFromStr(s: []const u8) ?ApprovalOutcome {
+    if (std.mem.eql(u8, s, "allowed-once")) return .allowed_once;
+    if (std.mem.eql(u8, s, "rejected")) return .rejected;
+    if (std.mem.eql(u8, s, "cancelled")) return .cancelled;
+    if (std.mem.eql(u8, s, "unavailable")) return .unavailable;
+    return null;
+}
+
+/// Parse an approval outcome from either a quoted string or an object with an
+/// `outcome` field. Null when unrecognized.
+fn parseOutcomeValue(value_json: []const u8) ?ApprovalOutcome {
+    const t = std.mem.trim(u8, value_json, " \t\r\n");
+    if (t.len > 0 and t[0] == '{') {
+        const needle = "\"outcome\"";
+        const p = std.mem.indexOf(u8, t, needle) orelse return null;
+        var i = p + needle.len;
+        while (i < t.len and (t[i] == ':' or t[i] == ' ' or t[i] == '\t')) i += 1;
+        if (i >= t.len or t[i] != '"') return null;
+        i += 1;
+        const s = i;
+        while (i < t.len and t[i] != '"') i += 1;
+        return outcomeFromStr(t[s..i]);
+    }
+    if (t.len >= 2 and t[0] == '"') {
+        const end = std.mem.indexOfScalarPos(u8, t, 1, '"') orelse return null;
+        return outcomeFromStr(t[1..end]);
+    }
+    return null;
+}
 
 var g_approval_store: ?*ApprovalStore = null;
 
@@ -826,6 +930,42 @@ fn qid(alloc: std.mem.Allocator, rpc_id: []const u8) ![]u8 {
 
 fn respondBodyOk(alloc: std.mem.Allocator, rpc_raw: []const u8, sid: []const u8, answer: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "{{\"type\":\"client-response\",\"rpcId\":{s},\"result\":{{\"ok\":true,\"value\":{{\"sessionId\":\"{s}\",\"answer\":{{\"answers\":{s}}}}}}}}}", .{ rpc_raw, sid, answer });
+}
+
+test "approval store: request/await/resolve closed outcomes" {
+    const alloc = std.testing.allocator;
+    var store: ApprovalStore = undefined;
+    store.initInPlace(alloc);
+    defer store.deinit();
+
+    try store.openRequest("a-1");
+    try std.testing.expect(store.resolve("a-1", .allowed_once));
+    try std.testing.expectEqual(ApprovalOutcome.allowed_once, store.await("a-1", 200, 5));
+
+    try store.openRequest("a-2");
+    try std.testing.expect(store.resolve("a-2", .rejected));
+    try std.testing.expectEqual(ApprovalOutcome.rejected, store.await("a-2", 200, 5));
+
+    // Unknown id never resolves; await times out to unavailable.
+    try std.testing.expect(!store.resolve("missing", .allowed_once));
+    try std.testing.expectEqual(ApprovalOutcome.unavailable, store.await("missing", 20, 5));
+
+    // Gateway value forms.
+    try store.openRequest("a-3");
+    try std.testing.expect(store.resolveEvent("a-3", "accepted", "\"allowed-once\""));
+    try std.testing.expectEqual(ApprovalOutcome.allowed_once, store.await("a-3", 200, 5));
+    try store.openRequest("a-4");
+    try std.testing.expect(store.resolveEvent("a-4", "cancelled", "null"));
+    try std.testing.expectEqual(ApprovalOutcome.cancelled, store.await("a-4", 200, 5));
+    try store.openRequest("a-5");
+    try std.testing.expect(store.resolveEvent("a-5", "accepted", "{\"outcome\":\"rejected\"}"));
+    try std.testing.expectEqual(ApprovalOutcome.rejected, store.await("a-5", 200, 5));
+
+    store.drop("a-1");
+    store.drop("a-2");
+    store.drop("a-3");
+    store.drop("a-4");
+    store.drop("a-5");
 }
 
 test "ask registers; respond settles answered; claimWaiter transfers answer" {

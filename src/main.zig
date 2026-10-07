@@ -483,6 +483,25 @@ var g_ask_storage: ask_user.AskCtx = .{};
 /// so a plain static outlives every per-run Built.
 var g_cordis_deps: preset_tools.CordisDeps = undefined;
 
+/// Publish an `approval/request` Remote-Event waterfall for the vendored
+/// ui-approval consumer. The client answers through `$events.result` with the
+/// same eventId; ApprovalStore.resolveEvent settles it.
+fn publishApprovalRequest(approval_id: []const u8, tool_name: []const u8, reason: []const u8, session_id: []const u8) void {
+    const alloc = gpaAlloc();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    out.appendSlice(alloc, "{\"type\":\"waterfall\",\"event\":\"approval/request\",\"eventId\":\"") catch return;
+    out.appendSlice(alloc, approval_id) catch return;
+    out.appendSlice(alloc, "\",\"agentId\":\"") catch return;
+    out.appendSlice(alloc, session_id) catch return;
+    out.appendSlice(alloc, "\",\"request\":{\"toolName\":\"") catch return;
+    model.escape(alloc, tool_name, &out) catch return;
+    out.appendSlice(alloc, "\",\"reason\":\"") catch return;
+    model.escape(alloc, reason, &out) catch return;
+    out.appendSlice(alloc, "\"}}") catch return;
+    remote_mux.publishEvents(alloc, out.items);
+}
+
 fn publishAskFrame(frame_json: []const u8) void {
     if (events_ws.sharedHubs()) |hubs| hubs.mux.publishFrame(frame_json) else |_| {}
     forwardQuestionWaterfall(frame_json);
@@ -589,6 +608,17 @@ fn emitObsRaw(event_type: []const u8, payload_json: []const u8) void {
 
 /// Monotonic approval-request id source for the audit pair.
 var g_approval_seq = std.atomic.Value(u64).init(0);
+/// How long the interactive approval round-trip waits for a client answer.
+const approval_wait_ms: u64 = 120_000;
+
+fn verdictOf(outcome: questions.ApprovalOutcome) agent.ApprovalVerdict {
+    return switch (outcome) {
+        .allowed_once => .allowed,
+        .rejected => .rejected,
+        .cancelled => .cancelled,
+        .unavailable => .unavailable,
+    };
+}
 
 fn obsBegin(alloc: std.mem.Allocator, io: std.Io, session_id: []const u8) void {
     const sink = alloc.create(obs_mod.JsonlSink) catch return;
@@ -877,14 +907,23 @@ pub const LoopExtensions = struct {
             .ask => .ask,
             .never => .never,
         }) catch return .unavailable;
+        // Interactive round-trip when a GUI answerer is attached: publish an
+        // approval/request waterfall and wait for the client's $events.result.
+        if (store.hasAnswerer()) {
+            var idbuf: [32]u8 = undefined;
+            const n = g_approval_seq.fetchAdd(1, .monotonic) + 1;
+            const aid = std.fmt.bufPrint(&idbuf, "approval-{d}", .{n}) catch return .unavailable;
+            store.openRequest(aid) catch return .unavailable;
+            defer store.drop(aid);
+            publishApprovalRequest(aid, tool_name, reason, self.session_id);
+            const outcome = store.await(aid, approval_wait_ms, 250);
+            auditApproval(tool_name, reason, outcome);
+            return verdictOf(outcome);
+        }
+
         const outcome = store.check(self.session_id);
         auditApproval(tool_name, reason, outcome);
-        return switch (outcome) {
-            .allowed_once => .allowed,
-            .rejected => .rejected,
-            .cancelled => .cancelled,
-            .unavailable => .unavailable,
-        };
+        return verdictOf(outcome);
     }
 
     /// Log-only approval audit pair (approval/asked + approval/decided),
@@ -1480,6 +1519,8 @@ fn cmdServe(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts, port_
     // it must be set before any thread observes it.
     try server_events.install(alloc);
     _ = events_ws.sharedHubs() catch {}; // eagerly create shared frame hubs
+    // Serve mode has a GUI answerer: enable the approval round-trip.
+    if (questions.sharedApprovalStore() catch null) |s| s.setHasAnswerer(true);
     obs_mod.fanout = &fanoutBoth;
     // Mux baseline: each new subscriber gets session/subscribed for every
     // known session (lastSeq 0 — no durable seq store in v1).
