@@ -4,7 +4,7 @@ Get zharness running in under 5 minutes.
 
 ## Prerequisites
 
-- **Zig 0.17.0-dev** — install via [zigup](https://github.com/marler8997/zigup)
+- **Zig 0.17.0** (stable) — install via [zigup](https://github.com/marler8997/zigup)
 - **curl** on PATH
 - **zcordis** at `../zcordis`:
 

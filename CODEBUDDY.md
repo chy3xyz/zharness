@@ -6,7 +6,7 @@ This file provides guidance to CodeBuddy Code when working with code in this rep
 
 ## Build / Run / Test commands
 
-Zig is the only toolchain. Requires Zig `0.17.0-dev` (the project pins `minimum_zig_version = "0.17.0"`).
+Zig is the only toolchain. Requires Zig `0.17.0` stable (the project pins `minimum_zig_version = "0.17.0"`).
 
 ```bash
 # Build the zharness executable (installs to zig-out/bin/zharness)

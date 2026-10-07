@@ -5,7 +5,7 @@ build, test, and contribute changes.
 
 ## Prerequisites
 
-- **Zig `0.17.0-dev`** — the project pins `minimum_zig_version = "0.17.0"`.
+- **Zig `0.17.0`** (stable) — the project pins `minimum_zig_version = "0.17.0"`.
   Install via [zigup](https://github.com/marler8997/zigup) or your package
   manager and make sure `zig` is on `PATH`.
 - **`curl`** — zharness posts chat requests through `curl`, so it must be

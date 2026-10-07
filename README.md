@@ -55,7 +55,7 @@ zh run "analyze this repo and fix the build"
 
 ### Prerequisites
 
-- **Zig 0.17.0-dev** — install via [zigup](https://github.com/marler8997/zigup)
+- **Zig 0.17.0** (stable) — install via [zigup](https://github.com/marler8997/zigup)
 - **curl** on PATH (for HTTPS requests)
 - A **zcordis** checkout at `../zcordis`:
 
