@@ -64,5 +64,6 @@ var → value table (surfaces, text, borders, shape, rhythm, motion).
 
 - Single-user local tool: no auth, no TLS, binds loopback only.
 - One synthesized workspace per server (no multi-workspace routing);
-  `host.listDirectory`/`createDirectory`, `session.fork`, and
-  `llm.discoverModels` upstream methods are not implemented.
+  `host.listDirectory`/`createDirectory` and `llm.discoverModels` upstream
+  methods are not implemented. `session.fork` is implemented; `atSeq`
+  anchoring is ignored and forks copy the full transcript.

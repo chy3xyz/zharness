@@ -56,6 +56,10 @@ const export_rpc = @import("export_rpc.zig");
 const config = @import("../../config.zig");
 const events_ws = @import("events_ws.zig");
 const clib = @import("../../clib.zig");
+const session_mod = @import("../../session/session.zig");
+const apx_sessions = @import("sessions.zig");
+
+extern "c" fn time(tloc: ?*c_long) c_long;
 
 // Dynamic Cordis runtime (src/dynamic/*): browser-half host endpoints +
 // the cordis leg of POST /api/respond (see dyn_wire below).
@@ -1197,6 +1201,66 @@ fn hSessionCancel(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: [
     const session_id = try reqString(alloc, payload, "sessionId");
     try deps.cancelSession(deps.ctx, alloc, session_id);
     return okValue(alloc, rpc_id, "{\"accepted\":true}");
+}
+
+fn freeTranscript(alloc: std.mem.Allocator, msgs: []apx_sessions.MsgRec) void {
+    for (msgs) |m| {
+        alloc.free(m.role);
+        alloc.free(m.content);
+        if (m.tool_call_id) |t| alloc.free(t);
+        if (m.tool_calls_json) |t| alloc.free(t);
+    }
+    alloc.free(msgs);
+}
+
+/// Copy a session transcript (log-preferred) into a fresh `<id>-fork-<ts>`
+/// session. Returns the child id. error.ForkUnavailable when the source has
+/// no transcript or no messages.
+pub fn forkSessionFiles(io: std.Io, alloc: std.mem.Allocator, cwd: []const u8, sid: []const u8) ![]u8 {
+    const src_path = try std.fmt.allocPrint(alloc, "{s}/.zharness/sessions/{s}.json", .{ cwd, sid });
+    defer alloc.free(src_path);
+    const msgs = apx_sessions.loadTranscript(io, alloc, src_path) catch return error.ForkUnavailable;
+    defer freeTranscript(alloc, msgs);
+    if (msgs.len == 0) return error.ForkUnavailable;
+
+    const now = @as(u64, @intCast(time(null)));
+    const child_id = try std.fmt.allocPrint(alloc, "{s}-fork-{d}", .{ sid, now });
+    errdefer alloc.free(child_id);
+    const child_path = try std.fmt.allocPrint(alloc, "{s}/.zharness/sessions/{s}.json", .{ cwd, child_id });
+    defer alloc.free(child_path);
+
+    var child = try session_mod.Session.init(alloc, child_id);
+    defer child.deinit();
+    for (msgs) |m| {
+        if (std.mem.eql(u8, m.role, "user")) {
+            try child.addUser(m.content);
+        } else if (std.mem.eql(u8, m.role, "assistant")) {
+            try child.addAssistant(m.content, m.tool_calls_json);
+        } else if (std.mem.eql(u8, m.role, "tool")) {
+            try child.addToolResult(m.tool_call_id orelse "", m.content);
+        }
+    }
+    try child.save(io, child_path);
+    return child_id;
+}
+
+fn hSessionFork(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8) !UnaryResponse {
+    const sid = (jsonx.getStringAlloc(alloc, payload, "sessionId") catch null) orelse
+        return badRequest(alloc, rpc_id, "session/fork requires sessionId");
+    defer alloc.free(sid);
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const child = forkSessionFiles(threaded.io(), alloc, deps.cwd, sid) catch |e| switch (e) {
+        error.ForkUnavailable => return badRequest(alloc, rpc_id, "session/fork-unavailable"),
+        else => return e,
+    };
+    defer alloc.free(child);
+    var value: std.ArrayList(u8) = .empty;
+    errdefer value.deinit(alloc);
+    try value.appendSlice(alloc, "{\"sessionId\":");
+    try jsonx.appendJsonString(alloc, &value, child);
+    try value.appendSlice(alloc, "}");
+    return okValue(alloc, rpc_id, value.items);
 }
 
 fn hSessionRename(deps: *const ApiProxyDeps, alloc: std.mem.Allocator, rpc_id: []const u8, payload: []const u8) !UnaryResponse {
@@ -2396,6 +2460,7 @@ pub fn dispatch(
     if (std.mem.eql(u8, m, "session.prompt")) return run(alloc, env, hSessionPrompt(deps, alloc, env.rpc_id, p));
     if (std.mem.eql(u8, m, "session.cancel")) return run(alloc, env, hSessionCancel(deps, alloc, env.rpc_id, p));
     if (std.mem.eql(u8, m, "session.rename")) return run(alloc, env, hSessionRename(deps, alloc, env.rpc_id, p));
+    if (std.mem.eql(u8, m, "session.fork") or std.mem.eql(u8, m, "session/fork")) return run(alloc, env, hSessionFork(deps, alloc, env.rpc_id, p));
 
     // subagent domain (wave-6: ui-subagent over the process-global registry)
     if (std.mem.eql(u8, m, "subagent.list")) {
@@ -2714,4 +2779,42 @@ pub fn handleApiRequest(
 
     const resp = try dispatch(deps, alloc, &env);
     return res.send(resp.status, .json, resp.body);
+}
+
+const testing = std.testing;
+
+test "forkSessionFiles copies a transcript into a new session" {
+    const alloc = testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = "/tmp/zh_fork_test/.zharness/sessions";
+    try std.Io.Dir.createDirPath(.cwd(), io, dir);
+
+    var s = try session_mod.Session.init(alloc, "zh_fork_src");
+    defer s.deinit();
+    try s.addUser("hello-fork");
+    try s.addAssistant("world-fork", null);
+    try s.save(io, dir ++ "/zh_fork_src.json");
+    defer std.Io.Dir.deleteFile(.cwd(), io, dir ++ "/zh_fork_src.json") catch {};
+    defer std.Io.Dir.deleteFile(.cwd(), io, dir ++ "/zh_fork_src.json.jsonl") catch {};
+    defer std.Io.Dir.deleteFile(.cwd(), io, dir ++ "/zh_fork_src.json.projections") catch {};
+
+    const child = try forkSessionFiles(io, alloc, "/tmp/zh_fork_test", "zh_fork_src");
+    defer alloc.free(child);
+    const child_path = try std.fmt.allocPrint(alloc, "{s}/{s}.json", .{ dir, child });
+    defer alloc.free(child_path);
+    defer std.Io.Dir.deleteFile(.cwd(), io, child_path) catch {};
+    const child_log = try std.fmt.allocPrint(alloc, "{s}.jsonl", .{child_path});
+    defer alloc.free(child_log);
+    defer std.Io.Dir.deleteFile(.cwd(), io, child_log) catch {};
+
+    const msgs = try apx_sessions.loadTranscript(io, alloc, child_path);
+    defer freeTranscript(alloc, msgs);
+    try testing.expectEqual(@as(usize, 2), msgs.len);
+    try testing.expectEqualStrings("hello-fork", msgs[0].content);
+    try testing.expectEqualStrings("world-fork", msgs[1].content);
+
+    // A missing source is fork-unavailable.
+    try testing.expectError(error.ForkUnavailable, forkSessionFiles(io, alloc, "/tmp/zh_fork_test", "zh_fork_absent"));
 }
