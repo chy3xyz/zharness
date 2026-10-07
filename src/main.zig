@@ -58,6 +58,7 @@ const read_image_mod = @import("tool/read_image.zig");
 const terminal_mod = @import("tool/terminal.zig");
 const session_query = @import("tool/session_query.zig");
 const schedule_mod = @import("tool/schedule.zig");
+const lsp_tool = @import("tool/lsp.zig");
 const goals_rpc = @import("server/apiproxy/goals_rpc.zig");
 const plan_frames = @import("server/apiproxy/plan_frames.zig");
 const jobs_rpc = @import("server/apiproxy/jobs_rpc.zig");
@@ -1020,6 +1021,7 @@ pub const LoopExtensions = struct {
         if (terminal_mod.isTerminalTool(call.name)) return try terminal_mod.execute(alloc, call);
         if (session_query.isSessionQueryTool(call.name)) return try session_query.execute(alloc, io, self.cwd, call);
         if (schedule_mod.isScheduleTool(call.name)) return try schedule_mod.execute(alloc, call);
+        if (lsp_tool.isLspTool(call.name)) return try lsp_tool.execute(alloc, io, self.cwd, call);
         if (std.mem.eql(u8, call.name, "read_image")) {
             const path = (model.extractStringField(alloc, call.arguments, "path") catch null) orelse
                 return .{ .success = false, .output = "", .err_msg = try alloc.dupe(u8, "read_image: missing 'path'") };
@@ -2565,6 +2567,7 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
     try terminal_mod.register(tools);
     try session_query.register(tools);
     try schedule_mod.register(tools);
+    try lsp_tool.register(tools);
     g_ask_storage = .{ .publish = publishAskFrame, .store = questions.sharedStore() catch null };
     ask_user.setAskCtx(&g_ask_storage);
 

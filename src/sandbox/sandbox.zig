@@ -124,7 +124,7 @@ pub fn classifyTool(name: []const u8) Action {
         "git_log",       "web_fetch",      "web_search",   "memory_get",    "skill_use",
         "ask_user",      "list_agents",    "job_list",     "job_output",    "plan_list",
         "todo_list",     "goal_get",       "present",      "read_image",    "terminal_list",
-        "terminal_read", "session_search", "session_read", "schedule_list",
+        "terminal_read", "session_search", "session_read", "schedule_list", "lsp_diagnostics",
     };
     for (read_only) |n| {
         if (std.mem.eql(u8, name, n)) return .read;

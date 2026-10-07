@@ -52,6 +52,7 @@ per-directory `addModule`; the pattern matches zcordis/zeepseek.
 | `sandbox/sandbox.zig` | Level-1 process sandbox: policy classify, env allowlist, watchdog timeout; `.native` adds OS confinement |
 | `sandbox/native.zig` | OS confinement: macOS Seatbelt profile, Linux bubblewrap wrapper |
 | `tool/terminal.zig` | Persistent shells: fork + pipes + reader thread, `terminal_*` tools |
+| `protocol/lsp.zig` | Minimal LSP client: Content-Length framed JSON-RPC 2.0 over stdio |
 | `server/httpd.zig` | Minimal HTTP/1.1 server (libc sockets, poll-gated stop) |
 | `server/api.zig` | JSON routes over injected `ServerDeps` (run/chat/sessions/healthz/events) |
 | `workflow/` | JSON workflow parse/validate/cycle-check, topological executor, run reports |

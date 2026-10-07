@@ -49,12 +49,14 @@ comptime {
     _ = @import("tool/terminal.zig"); // terminal_* persistent shells
     _ = @import("tool/session_query.zig"); // session_search / session_read
     _ = @import("tool/schedule.zig"); // schedule_create/list/update/delete
+    _ = @import("tool/lsp.zig"); // lsp_diagnostics
     _ = @import("tool/spawn_agent.zig");
     _ = @import("workflow/workflow.zig");
     _ = @import("workflow/executor.zig");
     _ = @import("workflow/run_report.zig");
     _ = @import("protocol/jsonrpc.zig");
     _ = @import("protocol/mcp.zig");
+    _ = @import("protocol/lsp.zig"); // LSP client (Content-Length framing)
     _ = @import("tool/mcp_bridge.zig");
     _ = @import("obs.zig");
     _ = @import("presets.zig");
