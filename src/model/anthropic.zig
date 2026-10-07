@@ -354,6 +354,7 @@ pub fn parseResponse(alloc: std.mem.Allocator, json: []const u8) !m.ChatResponse
         .tool_calls = try calls.toOwnedSlice(alloc),
         .finish_reason = try alloc.dupe(u8, fr_mapped),
         .has_tools = has_tools,
+        .usage = m.parseUsage(json),
     };
 }
 

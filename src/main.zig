@@ -2784,6 +2784,15 @@ fn agentRunOnce(
 
     const answer = try built.loop.run(prompt);
 
+    // Token accounting: provider-reported usage summed across the turns.
+    const usage = built.loop.usageTotals();
+    if (!usage.isZero()) {
+        std.debug.print(
+            "[tokens] input={d} output={d} total={d} cache_read={d} cache_write={d}\n",
+            .{ usage.input_tokens, usage.output_tokens, usage.total_tokens, usage.cache_read_tokens, usage.cache_write_tokens },
+        );
+    }
+
     if (session_ptr) |s| {
         try built.loop.syncToSession(s);
         built.goal_board.syncToSession(s) catch {};

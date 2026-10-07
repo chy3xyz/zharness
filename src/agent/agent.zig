@@ -119,6 +119,8 @@ pub const AgentLoop = struct {
     tools: *tool_reg.ToolRegistry,
     cwd: []const u8,
     messages: std.ArrayList(Message),
+    /// Cumulative provider-reported token usage across this loop's turns.
+    usage: model_mod.Usage = .{},
     on_event: ?*const fn (kind: EventKind, payload: []const u8) void,
     /// Main-owned checkpoint store; null disables checkpointing.
     checkpoints: ?*checkpoint_mod.CheckpointStore,
@@ -170,6 +172,11 @@ pub const AgentLoop = struct {
             if (m.tool_calls_json) |t| self.alloc.free(t);
         }
         self.messages.deinit(self.alloc);
+    }
+
+    /// Cumulative token usage across all completed model turns.
+    pub fn usageTotals(self: *const AgentLoop) model_mod.Usage {
+        return self.usage;
     }
 
     /// Seed the loop's transcript from a previously-loaded session so a
@@ -325,13 +332,14 @@ pub const AgentLoop = struct {
                 .stream = self.agent.config.stream,
             };
 
-            var resp = self.client.chat(req) catch |e| {
+            var resp = self.client.chatWithRetry(req) catch |e| {
                 self.agent.state = .failed;
                 const msg = try describeModelError(self.alloc, &self.client, e);
                 self.emit(.err, msg);
                 return msg;
             };
             defer resp.deinit(self.alloc);
+            self.usage = self.usage.add(resp.usage);
 
             // When the transport streamed live deltas through a wired sink,
             // the user already watched this content arrive — don't reprint it.

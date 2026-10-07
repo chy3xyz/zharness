@@ -77,6 +77,32 @@ pub const ChatRequest = struct {
     stream: bool,
 };
 
+/// Token accounting reported by a provider (OpenAI `usage` / Anthropic
+/// `usage`). All counters default to 0 and are additive across turns.
+pub const Usage = struct {
+    input_tokens: u64 = 0,
+    output_tokens: u64 = 0,
+    total_tokens: u64 = 0,
+    cache_read_tokens: u64 = 0,
+    cache_write_tokens: u64 = 0,
+
+    pub fn add(self: Usage, other: Usage) Usage {
+        return .{
+            .input_tokens = self.input_tokens + other.input_tokens,
+            .output_tokens = self.output_tokens + other.output_tokens,
+            .total_tokens = self.total_tokens + other.total_tokens,
+            .cache_read_tokens = self.cache_read_tokens + other.cache_read_tokens,
+            .cache_write_tokens = self.cache_write_tokens + other.cache_write_tokens,
+        };
+    }
+
+    pub fn isZero(self: Usage) bool {
+        return self.input_tokens == 0 and self.output_tokens == 0 and
+            self.total_tokens == 0 and self.cache_read_tokens == 0 and
+            self.cache_write_tokens == 0;
+    }
+};
+
 pub const ChatResponse = struct {
     content: []const u8,
     reasoning: []const u8,
@@ -84,6 +110,8 @@ pub const ChatResponse = struct {
     finish_reason: []const u8,
     /// True when the model requested tool calls (vs. a final answer).
     has_tools: bool,
+    /// Provider-reported token usage for this request (zeros when absent).
+    usage: Usage = .{},
 
     pub fn deinit(self: *ChatResponse, alloc: std.mem.Allocator) void {
         alloc.free(self.content);
@@ -143,6 +171,9 @@ pub const ChatClient = struct {
     /// cleared at the start of every request.
     last_err_buf: [512]u8 = undefined,
     last_err_len: usize = 0,
+    /// Set when the last failure was transient (empty/truncated transport
+    /// body) and `chatWithRetry` may safely replay the request.
+    retryable: bool = false,
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io, endpoint: []const u8, model: []const u8, api_key: []const u8) ChatClient {
         return .{
@@ -199,6 +230,7 @@ pub const ChatClient = struct {
 
     pub fn chat(self: *ChatClient, req: ChatRequest) !ChatResponse {
         self.last_err_len = 0;
+        self.retryable = false;
 
         // Anthropic dialect: non-streaming translator only (streaming is
         // deferred); a stream request degrades to a buffered call.
@@ -261,6 +293,7 @@ pub const ChatClient = struct {
         // rejection. Prose that merely contains the word "error" parses fine.
         if (resp_body.len == 0 or resp_body[0] != '{') {
             self.setLastError("provider returned an empty or non-JSON body");
+            self.retryable = true;
             return error.HttpError;
         }
         if (isErrorEnvelope(resp_body)) {
@@ -434,6 +467,7 @@ pub const ChatClient = struct {
 
         if (resp_body.len == 0 or resp_body[0] != '{') {
             self.setLastError("provider returned an empty or non-JSON body");
+            self.retryable = true;
             return error.HttpError;
         }
         if (anthropic_wire.isErrorEnvelope(resp_body)) {
@@ -568,7 +602,30 @@ pub const ChatClient = struct {
                 res.finish_reason = try self.alloc.dupe(u8, json[vs..ve]);
             }
         }
+        res.usage = parseUsage(json);
         return res;
+    }
+
+    pub const MaxAttempts: usize = 3;
+
+    /// Bounded retry wrapper around `chat`. Only buffered transports retry: a
+    /// streamed request may already have delivered deltas to the sink, so
+    /// replaying it would duplicate output. Transient failures only — provider
+    /// rejections (error envelopes) are returned immediately.
+    pub fn chatWithRetry(self: *ChatClient, req: ChatRequest) !ChatResponse {
+        const buffered = !req.stream or self.wire_format == .anthropic_messages;
+        if (!buffered) return self.chat(req);
+
+        var attempt: usize = 1;
+        while (true) : (attempt += 1) {
+            return self.chat(req) catch |e| {
+                if (attempt >= MaxAttempts or !self.retryable) return e;
+                // 100ms, 200ms, 400ms … bounded exponential backoff.
+                const backoff_ms = 100 * (@as(u64, 1) << @intCast(attempt - 1));
+                _ = usleep(@intCast(backoff_ms * 1000));
+                continue;
+            };
+        }
     }
 
     fn parseToolCalls(self: *ChatClient, json: []const u8) ![]ToolCall {
@@ -731,6 +788,94 @@ pub fn unescape(alloc: std.mem.Allocator, input: []const u8) ![]const u8 {
         }
     }
     return out.toOwnedSlice(alloc);
+}
+
+/// libc microsecond sleep (Zig 0.17 removed std.Thread.sleep).
+extern "c" fn usleep(usec: c_uint) c_int;
+
+/// Locate a top-level-ish `"key":{...}` object and return the braces slice
+/// (including both braces). Non-object values are skipped.
+pub fn findObjectField(json: []const u8, key: []const u8) ?[]const u8 {
+    var buf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&buf, "\"{s}\":", .{key}) catch return null;
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, json, idx, needle)) |p| {
+        var i = p + needle.len;
+        while (i < json.len and (json[i] == ' ' or json[i] == '\t')) i += 1;
+        if (i < json.len and json[i] == '{') {
+            const end = findMatchingBrace(json, i) orelse return null;
+            return json[i..end];
+        }
+        idx = p + needle.len;
+    }
+    return null;
+}
+
+/// `"key":<unsigned int>` inside a bounded JSON object slice; 0 when absent.
+pub fn extractU64Field(obj: []const u8, key: []const u8) u64 {
+    var buf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&buf, "\"{s}\"", .{key}) catch return 0;
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, obj, idx, needle)) |p| {
+        var i = p + needle.len;
+        while (i < obj.len and (obj[i] == ' ' or obj[i] == '\t')) i += 1;
+        if (i < obj.len and obj[i] == ':') {
+            i += 1;
+            while (i < obj.len and (obj[i] == ' ' or obj[i] == '\t')) i += 1;
+            var v: u64 = 0;
+            var digits = false;
+            while (i < obj.len and obj[i] >= '0' and obj[i] <= '9') : (i += 1) {
+                v = v * 10 + (obj[i] - '0');
+                digits = true;
+            }
+            if (digits) return v;
+        }
+        idx = p + needle.len;
+    }
+    return 0;
+}
+
+/// Provider usage object → `Usage`. Handles OpenAI (`prompt_tokens` /
+/// `completion_tokens` / `total_tokens`) and Anthropic (`input_tokens` /
+/// `output_tokens` / cache fields) in one pass; absent fields are 0.
+pub fn parseUsage(json: []const u8) Usage {
+    const u = findObjectField(json, "usage") orelse return .{};
+    const input = extractU64Field(u, "prompt_tokens") + extractU64Field(u, "input_tokens");
+    const output = extractU64Field(u, "completion_tokens") + extractU64Field(u, "output_tokens");
+    var total = extractU64Field(u, "total_tokens");
+    if (total == 0) total = input + output;
+    const cache_read = extractU64Field(u, "cache_read_input_tokens") +
+        extractU64Field(u, "cache_read_tokens") +
+        extractU64Field(u, "cached_tokens");
+    const cache_write = extractU64Field(u, "cache_creation_input_tokens") +
+        extractU64Field(u, "cache_write_tokens");
+    return .{
+        .input_tokens = input,
+        .output_tokens = output,
+        .total_tokens = total,
+        .cache_read_tokens = cache_read,
+        .cache_write_tokens = cache_write,
+    };
+}
+
+test "parseUsage reads OpenAI and Anthropic usage objects" {
+    const openai = "{\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":34,\"total_tokens\":46}}";
+    const oa = parseUsage(openai);
+    try std.testing.expectEqual(@as(u64, 12), oa.input_tokens);
+    try std.testing.expectEqual(@as(u64, 34), oa.output_tokens);
+    try std.testing.expectEqual(@as(u64, 46), oa.total_tokens);
+
+    const anthropic = "{\"usage\":{\"input_tokens\":7,\"output_tokens\":5,\"cache_read_input_tokens\":3}}";
+    const an = parseUsage(anthropic);
+    try std.testing.expectEqual(@as(u64, 7), an.input_tokens);
+    try std.testing.expectEqual(@as(u64, 5), an.output_tokens);
+    try std.testing.expectEqual(@as(u64, 12), an.total_tokens);
+    try std.testing.expectEqual(@as(u64, 3), an.cache_read_tokens);
+
+    try std.testing.expectEqual(@as(u64, 0), parseUsage("{}").input_tokens);
+    const sum = oa.add(an);
+    try std.testing.expectEqual(@as(u64, 19), sum.input_tokens);
+    try std.testing.expectEqual(@as(u64, 39), sum.output_tokens);
 }
 
 pub fn findMatchingBrace(json: []const u8, start: usize) ?usize {
