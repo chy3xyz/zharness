@@ -40,6 +40,7 @@ comptime {
     _ = @import("server/api.zig");
     _ = @import("tool/webfetch.zig");
     _ = @import("agent/subagent.zig");
+    _ = @import("agent/compaction.zig"); // context compaction: pure helpers + tests
     _ = @import("tool/spawn_agent.zig");
     _ = @import("workflow/workflow.zig");
     _ = @import("workflow/executor.zig");

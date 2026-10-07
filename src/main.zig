@@ -2628,6 +2628,8 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
         .reasoning_effort = cfg.reasoning_effort,
         .stream = cfg.stream,
         .sandbox_mode = cfg.sandbox_mode,
+        .compact_threshold = cfg.compact_threshold,
+        .compact_keep_recent = cfg.compact_keep_recent,
     };
     const ag = try agent.Agent.init(alloc, ctx.root, acfg);
 

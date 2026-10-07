@@ -25,6 +25,7 @@ const model_mod = @import("../model/model.zig");
 const tool_reg = @import("../tool/registry.zig");
 const tool_builtin = @import("../tool/builtin.zig");
 const session_mod = @import("../session/session.zig");
+const compaction_mod = @import("compaction.zig");
 const Message = model_mod.Message;
 const Role = model_mod.Role;
 const ChatClient = model_mod.ChatClient;
@@ -75,6 +76,10 @@ pub const AgentConfig = struct {
     stream: bool = true,
     /// Shell-tool sandbox level routed into builtin.execute (dev.md §XII).
     sandbox_mode: config_mod.Config.SandboxMode = .process,
+    /// Context-compaction character budget (0 disables; see compaction.zig).
+    compact_threshold: usize = 480_000,
+    /// Verbatim transcript tail retained by compaction.
+    compact_keep_recent: usize = 16,
 };
 
 /// Optional extension surface wired by main.zig (plain fn pointers, no
@@ -240,6 +245,17 @@ pub const AgentLoop = struct {
             const turn_msg = try std.fmt.allocPrint(self.alloc, "turn {d}", .{turn});
             defer self.alloc.free(turn_msg);
             self.emit(.turn_start, turn_msg);
+
+            // Context compaction: bound the transcript before asking the model
+            // so long sessions stay inside the window. Older messages collapse
+            // into one summary; the newest tail stays verbatim. Best-effort —
+            // OOM leaves the transcript untouched and never breaks the turn.
+            _ = compaction_mod.compactList(
+                self.alloc,
+                &self.messages,
+                self.agent.config.compact_threshold,
+                self.agent.config.compact_keep_recent,
+            );
 
             // Checkpoint the transcript at the turn boundary (best-effort).
             self.saveCheckpoint(turn_msg);

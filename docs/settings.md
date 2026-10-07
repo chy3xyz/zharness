@@ -34,6 +34,10 @@ upstream `settings-conflict` error.
 | ns | value shape | config.toml mapping | applies |
 |---|---|---|---|
 | `agent` | `{provider, model, maxTurns, reasoningEffort, stream, sandboxMode}` | `[model] provider/model`, `[agent] max_turns/reasoning_effort/stream`, `[general] sandbox_mode` | restart |
+
+`[agent] compact_threshold` / `compact_keep_recent` are read by the runtime at
+startup (context compaction, see `src/agent/compaction.zig`); they are not part
+of the `agent` settings RPC namespace, and the settings writer preserves them.
 | `llm-deepseek` | `{baseURL, apiKeyEnv?, models?: [{id,…}]}` | `[model] endpoint/api_key/models` | restart |
 | `ui-theme` | `{preference: light\|dark\|system}` | `[preferences] theme` | live* |
 | `locale` | `{preference?: zh\|en}` | `[preferences] locale` | live* |
@@ -58,6 +62,8 @@ endpoint = "https://api.deepseek.com/chat/completions"
 max_turns = 64
 reasoning_effort = "medium"
 stream = true
+compact_threshold = 480000  # transcript char budget; 0 disables compaction
+compact_keep_recent = 16    # verbatim tail messages compaction keeps
 
 [general]
 sandbox_mode = "process"

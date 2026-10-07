@@ -38,6 +38,13 @@ pub const Config = struct {
     stream: bool = true,
     cwd: []const u8 = ".",
     max_turns: usize = 64,
+    /// Context-compaction character budget for the whole transcript. When the
+    /// summed `content` lengths reach this, older messages collapse into one
+    /// summary (see agent/compaction.zig). 0 disables compaction.
+    compact_threshold: usize = 480_000,
+    /// Verbatim messages compaction keeps at the transcript tail (>= 1 keeps
+    /// the in-flight user turn intact).
+    compact_keep_recent: usize = 16,
     sandbox_mode: SandboxMode = .process,
 
     /// Anthropic credential from ANTHROPIC_API_KEY ("" when absent).
@@ -329,6 +336,10 @@ pub fn loadFromSnapshot(alloc: std.mem.Allocator, env: EnvSnapshot) !Config {
                     }
                 } else if (in_agent and std.mem.eql(u8, e.key, "max_turns")) {
                     if (e.val.int > 0) cfg.max_turns = @intCast(e.val.int);
+                } else if (in_agent and std.mem.eql(u8, e.key, "compact_threshold")) {
+                    if (e.val.int >= 0) cfg.compact_threshold = @intCast(e.val.int);
+                } else if (in_agent and std.mem.eql(u8, e.key, "compact_keep_recent")) {
+                    if (e.val.int > 0) cfg.compact_keep_recent = @intCast(e.val.int);
                 } else if (in_agent and std.mem.eql(u8, e.key, "reasoning_effort")) {
                     const v = try alloc.dupe(u8, e.val.str);
                     alloc.free(cfg.reasoning_effort);

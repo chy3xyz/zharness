@@ -83,6 +83,38 @@ pub fn freeCompacted(alloc: std.mem.Allocator, msgs: []CompactedMessage) void {
     alloc.free(msgs);
 }
 
+/// In-place transcript compaction for a live message list (the agent loop).
+///
+/// When `threshold` is non-zero and `totalContentChars(list.items)` reaches it,
+/// the list is replaced by `compact`'s output: older messages collapse into one
+/// synthetic summary, the newest `keep_recent` stay verbatim, and the old
+/// elements are freed. Returns true iff compaction ran.
+///
+/// Best-effort by design: on OOM the list is left untouched and false is
+/// returned, so a compaction failure can never break an agent turn.
+pub fn compactList(
+    alloc: std.mem.Allocator,
+    list: *std.ArrayList(model.Message),
+    threshold: usize,
+    keep_recent: usize,
+) bool {
+    if (threshold == 0) return false;
+    if (!shouldCompact(totalContentChars(list.items), threshold)) return false;
+
+    const compacted = compact(alloc, list.items, keep_recent) catch return false;
+
+    // Free the old elements; keep the list capacity for the append below.
+    for (list.items) |*m| freeDuped(alloc, m);
+    list.clearRetainingCapacity();
+
+    list.appendSlice(alloc, compacted) catch {
+        freeCompacted(alloc, compacted);
+        return false;
+    };
+    alloc.free(compacted);
+    return true;
+}
+
 // ── internals ────────────────────────────────────────────────────────────────
 
 /// "[Context compacted: N messages summarized. Key topics: a… | b…]"
@@ -252,4 +284,36 @@ test "totalContentChars sums contents" {
         .{ .role = .assistant, .content = "" },
     };
     try testing.expectEqual(@as(usize, 8), totalContentChars(&msgs));
+}
+
+test "compactList rewrites an over-budget transcript in place" {
+    const alloc = testing.allocator;
+    var list: std.ArrayList(model.Message) = .empty;
+    defer {
+        for (list.items) |*m| freeDuped(alloc, m);
+        list.deinit(alloc);
+    }
+
+    var big: [100]u8 = undefined;
+    @memset(&big, 'x');
+    for (0..3) |_| {
+        try list.append(alloc, .{ .role = .user, .content = try alloc.dupe(u8, &big) });
+        try list.append(alloc, .{ .role = .assistant, .content = try alloc.dupe(u8, "ok") });
+    }
+    // Content total: 3*100 + 3*2 = 306.
+
+    // threshold 0 disables compaction; below budget is a no-op.
+    try testing.expect(!compactList(alloc, &list, 0, 2));
+    try testing.expect(!compactList(alloc, &list, 1_000, 2));
+    try testing.expectEqual(@as(usize, 6), list.items.len);
+
+    // At budget with a 2-message tail, the 4 older messages collapse into one.
+    try testing.expect(compactList(alloc, &list, 300, 2));
+    try testing.expectEqual(@as(usize, 3), list.items.len);
+    try testing.expectEqual(model.Role.user, list.items[0].role);
+    try testing.expect(std.mem.startsWith(u8, list.items[0].content, "[Context compacted: 4 messages summarized."));
+    try testing.expectEqualStrings("ok", list.items[2].content);
+
+    // Now well under budget: idempotent no-op.
+    try testing.expect(!compactList(alloc, &list, 1_000, 2));
 }
