@@ -665,6 +665,77 @@ test "agent loop extensions serve tools and fall back to builtins" {
     try std.testing.expectEqual(@as(usize, 1), fake.renders);
 }
 
+test "permission gate blocks mutating tools under read-only preset" {
+    const alloc = std.testing.allocator;
+    var ctx = try cordis.Context.init(alloc);
+    defer ctx.deinit();
+    const io = ctx.io();
+
+    var reg = try tool_reg.ToolRegistry.init(alloc);
+    defer reg.deinit();
+    try tool_reg.registerBuiltins(&reg);
+
+    const client = model.ChatClient.init(alloc, io, "https://localhost.invalid", "m", "");
+
+    // read-only + ask: mutating tools are gated. No answerer is wired here, so
+    // the ask fails closed into a denial.
+    const cfg_ro = agent.AgentConfig{
+        .system_prompt = "sys",
+        .max_turns = 4,
+        .reasoning_effort = null,
+        .sandbox_mode = .none,
+        .permission_preset = .read_only,
+    };
+    const ag_ro = try agent.Agent.init(alloc, ctx.root, &cfg_ro);
+    defer ag_ro.deinit(alloc);
+    var loop_ro = try agent.AgentLoop.init(alloc, ctx, ag_ro, client, &reg, "/tmp", null, null, null);
+    defer loop_ro.deinit();
+
+    var write = try loop_ro.dispatchTool(.{ .id = "1", .name = "file_write", .arguments = "{\"path\":\"/tmp/zh_gate.txt\",\"content\":\"x\"}" });
+    defer tool_builtin.freeResult(alloc, &write);
+    try std.testing.expect(!write.success);
+    try std.testing.expect(std.mem.indexOf(u8, write.err_msg.?, "blocked by permission policy") != null);
+
+    // A read-only tool is not permission-blocked (it never runs the gate).
+    var read = try loop_ro.dispatchTool(.{ .id = "2", .name = "glob", .arguments = "{\"pattern\":\"*\"}" });
+    defer tool_builtin.freeResult(alloc, &read);
+    try std.testing.expect(!std.mem.startsWith(u8, read.err_msg orelse "", "blocked by permission policy"));
+
+    // approval policy "never" rejects deterministically.
+    const cfg_never = agent.AgentConfig{
+        .system_prompt = "sys",
+        .max_turns = 4,
+        .reasoning_effort = null,
+        .sandbox_mode = .none,
+        .permission_preset = .read_only,
+        .approval_mode = .never,
+    };
+    const ag_never = try agent.Agent.init(alloc, ctx.root, &cfg_never);
+    defer ag_never.deinit(alloc);
+    var loop_never = try agent.AgentLoop.init(alloc, ctx, ag_never, client, &reg, "/tmp", null, null, null);
+    defer loop_never.deinit();
+    var never = try loop_never.dispatchTool(.{ .id = "3", .name = "shell", .arguments = "{\"command\":\"echo nope\"}" });
+    defer tool_builtin.freeResult(alloc, &never);
+    try std.testing.expect(!never.success);
+    try std.testing.expect(std.mem.indexOf(u8, never.err_msg.?, "approval policy 'never'") != null);
+
+    // danger-full-access leaves mutating tools ungated.
+    const cfg_danger = agent.AgentConfig{
+        .system_prompt = "sys",
+        .max_turns = 4,
+        .reasoning_effort = null,
+        .sandbox_mode = .none,
+        .permission_preset = .danger_full_access,
+    };
+    const ag_danger = try agent.Agent.init(alloc, ctx.root, &cfg_danger);
+    defer ag_danger.deinit(alloc);
+    var loop_danger = try agent.AgentLoop.init(alloc, ctx, ag_danger, client, &reg, "/tmp", null, null, null);
+    defer loop_danger.deinit();
+    var ok = try loop_danger.dispatchTool(.{ .id = "4", .name = "shell", .arguments = "{\"command\":\"echo gate-ok\"}" });
+    defer tool_builtin.freeResult(alloc, &ok);
+    try std.testing.expect(ok.success);
+}
+
 test "loop extensions wiring: plan goal memory skills end to end" {
     const alloc = std.testing.allocator;
     var ctx = try cordis.Context.init(alloc);

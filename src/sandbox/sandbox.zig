@@ -109,6 +109,54 @@ pub fn configForPreset(preset: []const u8) ?PresetMapping {
     return null;
 }
 
+/// Coarse action class used by the permission gate. Unknown tools classify as
+/// `.write` so read-only modes fail safe on anything unrecognised.
+pub const Action = enum { read, write };
+
+/// Tools that only observe the workspace/host. Everything else (including
+/// extension, MCP and plugin tools) is treated as mutating.
+pub fn classifyTool(name: []const u8) Action {
+    const read_only = [_][]const u8{
+        "file_read", "glob",        "grep",       "git_status", "git_diff",
+        "git_log",   "web_fetch",   "web_search", "memory_get", "skill_use",
+        "ask_user",  "list_agents", "job_list",   "job_output", "plan_list",
+        "todo_list", "goal_get",
+    };
+    for (read_only) |n| {
+        if (std.mem.eql(u8, name, n)) return .read;
+    }
+    return .write;
+}
+
+/// Permission-gate decision for one tool call under a preset.
+pub const Decision = union(enum) {
+    allow,
+    ask: []const u8,
+    deny: []const u8,
+};
+
+/// Evaluate a preset against an action. `danger-full-access` and
+/// `workspace-write` allow (the shell sandbox still confines the latter);
+/// `read-only` asks before mutating tools; `custom` preserves the
+/// historical unrestricted behaviour.
+pub fn decide(preset: PresetId, action: Action) Decision {
+    return switch (preset) {
+        .danger_full_access, .workspace_write, .custom => .allow,
+        .read_only => switch (action) {
+            .read => .allow,
+            .write => .{ .ask = "read-only permission preset: mutating tool requires approval" },
+        },
+    };
+}
+
+/// Map a config.toml [general] sandbox_mode spelling
+/// ("native" | "process" | "none") onto the permission preset it represents.
+pub fn presetForSandboxModeName(name: []const u8) PresetId {
+    if (std.mem.eql(u8, name, "native")) return .read_only;
+    if (std.mem.eql(u8, name, "none")) return .danger_full_access;
+    return .workspace_write;
+}
+
 pub const Verdict = union(enum) {
     allow,
     deny: []const u8, // static reason text
@@ -353,6 +401,33 @@ fn appendQuoted(alloc: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
+
+test "classifyTool marks reads and defaults unknown tools to write" {
+    try std.testing.expectEqual(Action.read, classifyTool("file_read"));
+    try std.testing.expectEqual(Action.read, classifyTool("git_log"));
+    try std.testing.expectEqual(Action.read, classifyTool("web_search"));
+    try std.testing.expectEqual(Action.write, classifyTool("file_write"));
+    try std.testing.expectEqual(Action.write, classifyTool("shell"));
+    try std.testing.expectEqual(Action.write, classifyTool("mcp_srv_tool"));
+}
+
+test "decide: read-only asks on writes, other presets allow" {
+    try std.testing.expectEqual(Decision.allow, decide(.danger_full_access, .write));
+    try std.testing.expectEqual(Decision.allow, decide(.workspace_write, .write));
+    try std.testing.expectEqual(Decision.allow, decide(.custom, .write));
+    try std.testing.expectEqual(Decision.allow, decide(.read_only, .read));
+    switch (decide(.read_only, .write)) {
+        .ask => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "presetForSandboxModeName maps config spellings" {
+    try std.testing.expectEqual(PresetId.read_only, presetForSandboxModeName("native"));
+    try std.testing.expectEqual(PresetId.workspace_write, presetForSandboxModeName("process"));
+    try std.testing.expectEqual(PresetId.danger_full_access, presetForSandboxModeName("none"));
+    try std.testing.expectEqual(PresetId.workspace_write, presetForSandboxModeName("bogus"));
+}
 
 test "classify denies destructive patterns, allows benign" {
     const alloc = std.testing.allocator;

@@ -66,7 +66,8 @@ compact_threshold = 480000  # transcript char budget; 0 disables compaction
 compact_keep_recent = 16    # verbatim tail messages compaction keeps
 
 [general]
-sandbox_mode = "process"
+sandbox_mode = "process"   # native | process | none (permission preset)
+approval_policy = "ask"    # ask | never (never = fail-closed deny)
 
 [preferences]
 theme = "dark"              # absent ⇒ system

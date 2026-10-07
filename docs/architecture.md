@@ -32,7 +32,7 @@ per-directory `addModule`; the pattern matches zcordis/zeepseek.
 | File / dir | Responsibility |
 |------------|----------------|
 | `main.zig` | CLI entry (`run` / `chat` / `serve` / `workflow` / `plugin`), flag parsing, session wiring, loop extensions, observability setup |
-| `cli_flags.zig` | Strict subcommand flag parser (`--model/--provider/--no-stream/--session/--preset/--sandbox/--port/--mcp`) |
+| `cli_flags.zig` | Strict subcommand flag parser (`--model/--provider/--no-stream/--session/--preset/--sandbox/--approval/--permission-preset/--port/--mcp`) |
 | `config.zig` | `Config` (provider, model, key, endpoint, cwd, max_turns, sandbox_mode). API-key precedence: `ZHARNESS_API_KEY` → provider env (`DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, …) → `~/.zharness/config.toml`. |
 | `model/provider.zig` | Provider profiles: endpoint/auth/wire-format defaults for deepseek, openai-compat, anthropic, ollama |
 | `model/model.zig` | The internal **Model IR** and `ChatClient.chat` (buffered + SSE via curl), dispatching on wire format |

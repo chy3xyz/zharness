@@ -46,6 +46,9 @@ pub const Config = struct {
     /// the in-flight user turn intact).
     compact_keep_recent: usize = 16,
     sandbox_mode: SandboxMode = .process,
+    /// Approval policy for permission-gated tool calls (upstream
+    /// approval/policy): `ask` prompts, `never` auto-rejects (fail-closed).
+    approval_mode: ApprovalMode = .ask,
 
     /// Anthropic credential from ANTHROPIC_API_KEY ("" when absent).
     anthropic_key: []const u8 = "",
@@ -63,6 +66,32 @@ pub const Config = struct {
             if (std.mem.eql(u8, s, "native")) return .native;
             if (std.mem.eql(u8, s, "none")) return .none;
             return .process;
+        }
+        pub fn asStr(self: SandboxMode) []const u8 {
+            return switch (self) {
+                .native => "native",
+                .process => "process",
+                .none => "none",
+            };
+        }
+    };
+
+    /// Approval policy for permission-gated tool calls (upstream
+    /// approval/policy): `ask` prompts, `never` auto-rejects (fail-closed).
+    pub const ApprovalMode = enum {
+        ask,
+        never,
+
+        pub fn fromString(s: []const u8) ?ApprovalMode {
+            if (std.mem.eql(u8, s, "ask")) return .ask;
+            if (std.mem.eql(u8, s, "never")) return .never;
+            return null;
+        }
+        pub fn asStr(self: ApprovalMode) []const u8 {
+            return switch (self) {
+                .ask => "ask",
+                .never => "never",
+            };
         }
     };
 
@@ -348,6 +377,10 @@ pub fn loadFromSnapshot(alloc: std.mem.Allocator, env: EnvSnapshot) !Config {
                     cfg.stream = e.val.boolean;
                 } else if (in_general and std.mem.eql(u8, e.key, "sandbox_mode")) {
                     if (e.val == .str) cfg.sandbox_mode = Config.SandboxMode.fromString(e.val.str);
+                } else if (in_general and std.mem.eql(u8, e.key, "approval_policy")) {
+                    if (e.val == .str) {
+                        if (Config.ApprovalMode.fromString(e.val.str)) |m| cfg.approval_mode = m;
+                    }
                 }
                 // [preferences] * and unknown keys: owned by the settings
                 // store / deliberately ignored by the runtime.

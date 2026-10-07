@@ -31,6 +31,7 @@ const subagent_mod = @import("agent/subagent.zig");
 const run_code = @import("tool/run_code.zig");
 const instructions_mod = @import("agent/instructions.zig");
 const compaction_mod = @import("agent/compaction.zig");
+const sandbox_mod = @import("sandbox/sandbox.zig");
 const preset_tools = @import("dynamic/preset_tools.zig");
 const wf_mod = @import("workflow/workflow.zig");
 const wf_exec = @import("workflow/executor.zig");
@@ -792,6 +793,35 @@ fn applySandboxOverride(cfg: *config.Config, flag: ?[]const u8) void {
     cfg.sandbox_mode = config.Config.SandboxMode.fromString(v);
 }
 
+/// Apply the permission flags onto the loaded config. --sandbox and --approval
+/// set the individual knobs; --permission-preset bundles both atomically and
+/// wins over them (upstream dsh-permission-presets).
+fn applyPermissionFlagOverrides(cfg: *config.Config, flags: cli_flags.SubFlags) void {
+    applySandboxOverride(cfg, flags.sandbox);
+    if (flags.approval) |a| {
+        cfg.approval_mode = config.Config.ApprovalMode.fromString(a) orelse {
+            std.debug.print("error: unknown approval policy '{s}' (ask | never)\n", .{a});
+            std.process.exit(1);
+        };
+    }
+    if (flags.permission_preset) |p| {
+        const m = sandbox_mod.configForPreset(p) orelse {
+            std.debug.print(
+                "error: unknown permission preset '{s}' (read-only | workspace-write | danger-full-access)\n",
+                .{p},
+            );
+            std.process.exit(1);
+        };
+        cfg.sandbox_mode = switch (m.preset) {
+            .read_only => .native,
+            .workspace_write => .process,
+            .danger_full_access => .none,
+            .custom => return,
+        };
+        cfg.approval_mode = if (std.mem.eql(u8, m.approval, "never")) .never else .ask;
+    }
+}
+
 /// The agent-loop extension state. Everything here is main-owned; the loop
 /// only sees the two fn pointers exposed via `extensions()`.
 pub const LoopExtensions = struct {
@@ -814,9 +844,30 @@ pub const LoopExtensions = struct {
     cwd: []const u8,
     /// Current session id for GUI projection publishers; empty for CLI runs.
     session_id: []const u8 = "",
+    /// Approval policy consulted by the permission gate (from config).
+    approval_mode: config.Config.ApprovalMode = .ask,
 
     pub fn extensions(self: *LoopExtensions) agent.Extensions {
-        return .{ .ctx = self, .renderContext = renderContext, .executeTool = execTool };
+        return .{
+            .ctx = self,
+            .renderContext = renderContext,
+            .executeTool = execTool,
+            .approve = approve,
+        };
+    }
+
+    /// Permission gate: consult the shared ApprovalStore for this session.
+    /// Fail-closed — with no interactive answerer \`ask\` resolves unavailable
+    /// (a denial) and \`never\` rejects outright.
+    fn approve(ctx: *anyopaque, reason: []const u8) bool {
+        _ = reason;
+        const self: *LoopExtensions = @ptrCast(@alignCast(ctx));
+        const store = questions.sharedApprovalStore() catch return false;
+        store.setPolicy(self.session_id, switch (self.approval_mode) {
+            .ask => .ask,
+            .never => .never,
+        }) catch return false;
+        return store.checkFailClosed(self.session_id);
     }
 
     /// Dynamic system-prompt section: skill index + goal + plan checklist +
@@ -2131,7 +2182,11 @@ fn printUsage() void {
         \\  --no-stream      Disable streaming
         \\  --session ID     Resume/save a named session (.zharness/sessions/)
         \\  --preset NAME    standard | minimal | ptc | creative
-        \\  --sandbox MODE   off | process (shell policy + env allowlist)
+        \\  --sandbox MODE   native | process | none (shell policy + env allowlist)
+        \\  --approval P     ask | never (never = fail-closed deny)
+        \\  --permission-preset NAME
+        \\                   read-only | workspace-write | danger-full-access
+        \\                   (sets sandbox + approval atomically)
         \\  --mcp "CMD"      Attach an MCP stdio server (repeatable, max 4;
         \\                   split on spaces — no quote handling)
         \\
@@ -2368,6 +2423,7 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
         .wasm = wasm_reg,
         .cwd = cfg.cwd,
         .session_id = opts.session_id,
+        .approval_mode = cfg.approval_mode,
     };
     const ext_iface = try alloc.create(agent.Extensions);
     errdefer alloc.destroy(ext_iface);
@@ -2630,6 +2686,8 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
         .sandbox_mode = cfg.sandbox_mode,
         .compact_threshold = cfg.compact_threshold,
         .compact_keep_recent = cfg.compact_keep_recent,
+        .permission_preset = sandbox_mod.presetForSandboxModeName(cfg.sandbox_mode.asStr()),
+        .approval_mode = cfg.approval_mode,
     };
     const ag = try agent.Agent.init(alloc, ctx.root, acfg);
 
@@ -2885,7 +2943,7 @@ pub fn main(init: std.process.Init) !void {
         var cfg = try config.load(alloc);
         defer cfg.deinit();
         try cfg.applyOverrides(flags.model, flags.provider, flags.no_stream);
-        applySandboxOverride(&cfg, flags.sandbox);
+        applyPermissionFlagOverrides(&cfg, flags);
 
         if (cfg.api_key.len == 0) {
             std.debug.print(
@@ -2915,7 +2973,7 @@ pub fn main(init: std.process.Init) !void {
         var cfg = try config.load(alloc);
         defer cfg.deinit();
         try cfg.applyOverrides(flags.model, flags.provider, flags.no_stream);
-        applySandboxOverride(&cfg, flags.sandbox);
+        applyPermissionFlagOverrides(&cfg, flags);
 
         if (cfg.api_key.len == 0) {
             std.debug.print(
@@ -2942,9 +3000,8 @@ pub fn main(init: std.process.Init) !void {
         var cfg = try config.load(alloc);
         defer cfg.deinit();
         try cfg.applyOverrides(flags.model, flags.provider, flags.no_stream);
-        applySandboxOverride(&cfg, flags.sandbox);
+        applyPermissionFlagOverrides(&cfg, flags);
         const lopts = try optsFromFlags(alloc, &flags);
-        applySandboxOverride(&cfg, flags.sandbox);
         const ov = ServeOverrides{
             .model = flags.model,
             .provider = flags.provider,

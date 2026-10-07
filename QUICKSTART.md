@@ -56,7 +56,9 @@ zh run "summarize git log" --no-stream
 | `--no-stream` | Disable streaming |
 | `--session ID` | Resume / persist a named session |
 | `--preset P` | Use a preset (`standard`, `minimal`, `ptc`, `creative`) |
-| `--sandbox S` | Sandbox mode (`off`, `process`) |
+| `--sandbox S` | Sandbox mode (`native`, `process`, `none`) |
+| `--approval P` | Approval policy (`ask`, `never`) |
+| `--permission-preset N` | `read-only` / `workspace-write` / `danger-full-access` (bundles sandbox + approval) |
 
 ## Next Steps
 

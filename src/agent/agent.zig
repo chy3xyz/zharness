@@ -26,6 +26,7 @@ const tool_reg = @import("../tool/registry.zig");
 const tool_builtin = @import("../tool/builtin.zig");
 const session_mod = @import("../session/session.zig");
 const compaction_mod = @import("compaction.zig");
+const sandbox_mod = @import("../sandbox/sandbox.zig");
 const Message = model_mod.Message;
 const Role = model_mod.Role;
 const ChatClient = model_mod.ChatClient;
@@ -80,6 +81,10 @@ pub const AgentConfig = struct {
     compact_threshold: usize = 480_000,
     /// Verbatim transcript tail retained by compaction.
     compact_keep_recent: usize = 16,
+    /// Permission preset gating tool dispatch (upstream permission-presets).
+    permission_preset: sandbox_mod.PresetId = .workspace_write,
+    /// What happens when a gated tool call needs approval.
+    approval_mode: config_mod.Config.ApprovalMode = .ask,
 };
 
 /// Optional extension surface wired by main.zig (plain fn pointers, no
@@ -91,6 +96,10 @@ pub const Extensions = struct {
     /// Extra system-prompt text appended after the configured prompt, rendered
     /// fresh on every turn. Caller frees; "" contributes nothing.
     renderContext: *const fn (ctx: *anyopaque, alloc: std.mem.Allocator) anyerror![]const u8,
+    /// Permission gate callback: return true to grant an approval-gated tool
+    /// call. Null (or returning false) fails closed. main.zig wires this to
+    /// the ApprovalStore; it stays absent in tests and headless runs.
+    approve: ?*const fn (ctx: *anyopaque, reason: []const u8) bool = null,
     /// Try to serve a tool call from extension state. Return `null` when the
     /// tool name is unknown so the loop falls back to the builtin executors.
     executeTool: *const fn (
@@ -204,11 +213,38 @@ pub const AgentLoop = struct {
     /// (skills / memory / plan / goal), then the builtin executors with the
     /// configured sandbox level.
     pub fn dispatchTool(self: *AgentLoop, tc: ToolCall) !tool_builtin.ToolResult {
+        // Permission gate (upstream permission-presets): classify the tool and
+        // consult the active preset before anything runs. `ask` fails closed
+        // when nothing grants it — an unavailable approval is a denial.
+        switch (sandbox_mod.decide(self.agent.config.permission_preset, sandbox_mod.classifyTool(tc.name))) {
+            .allow => {},
+            .deny => |why| return self.deniedResult("permission policy", why),
+            .ask => |why| {
+                if (self.agent.config.approval_mode == .never) {
+                    return self.deniedResult("approval policy 'never'", why);
+                }
+                const granted = if (self.ext) |e|
+                    (e.approve orelse return self.deniedResult("permission policy", why))(e.ctx, why)
+                else
+                    false;
+                if (!granted) return self.deniedResult("permission policy", why);
+            },
+        }
         const call = tool_builtin.ToolCall{ .name = tc.name, .arguments = tc.arguments };
         if (self.ext) |e| {
             if (try e.executeTool(e.ctx, self.alloc, self.client.io, call)) |r| return r;
         }
         return tool_builtin.execute(self.alloc, self.client.io, self.cwd, call, self.agent.config.sandbox_mode);
+    }
+
+    /// Failed tool result for a permission denial (ownership matches
+    /// tool_builtin.freeResult: output/err_msg are allocator-owned).
+    fn deniedResult(self: *AgentLoop, kind: []const u8, reason: []const u8) !tool_builtin.ToolResult {
+        return .{
+            .success = false,
+            .output = "",
+            .err_msg = try std.fmt.allocPrint(self.alloc, "blocked by {s}: {s}", .{ kind, reason }),
+        };
     }
 
     fn emit(self: *AgentLoop, kind: EventKind, payload: []const u8) void {
