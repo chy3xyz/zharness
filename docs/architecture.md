@@ -47,7 +47,7 @@ per-directory `addModule`; the pattern matches zcordis/zeepseek.
 | `agent/plan.zig`, `goal.zig` | Plan checklist + goal tracker rendered into per-turn context |
 | `skill/` | SKILL.md discovery + registry (`skill_use` tool) |
 | `memory/` | Working scratchpad + persistent KV store (`memory_get/set` tools) |
-| `session/session.zig` | JSON transcript store; `save` / `load` / resume |
+| `session/session.zig` | Transcript store: legacy JSON array + append-only `<id>.jsonl` event log; `save` / `load` / resume |
 | `session/checkpoint.zig` | Turn-boundary snapshots (atomic publish, pruning) |
 | `sandbox/sandbox.zig` | Level-1 process sandbox: policy classify, env allowlist, watchdog timeout |
 | `server/httpd.zig` | Minimal HTTP/1.1 server (libc sockets, poll-gated stop) |
@@ -117,6 +117,11 @@ session (if `--session <id>` is given), seeds the loop's message list, runs the
 turn, then mirrors the loop transcript back into the session and saves it. The
 system prompt is intentionally **not** part of the transcript — it is supplied
 fresh on each run from `SYSTEM_PROMPT` in `main.zig`.
+
+Alongside the legacy JSON array, `save` maintains an append-only JSONL event
+log at `.zharness/sessions/<id>.jsonl` with a format-version header (see
+[session-format.md](session-format.md)); `load` prefers the log and falls back
+to the legacy JSON, which is the migration seam.
 
 ## Memory ownership
 

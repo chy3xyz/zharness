@@ -25,7 +25,7 @@ zig build test -Dtest-filter="shell echo"
 zig build --help
 ```
 
-`build.zig` defines two steps: install the `zh` executable, and `zig build test` (builds a test executable from `src/tests.zig` linking the `cordis` module). Tests live inline in each module (`test { ... }` blocks); the suite is currently **399 tests**.
+`build.zig` defines two steps: install the `zh` executable, and `zig build test` (builds a test executable from `src/tests.zig` linking the `cordis` module). Tests live inline in each module (`test { ... }` blocks); the suite is currently **401 tests**.
 
 ## Dependencies and module layout
 
@@ -56,6 +56,6 @@ The data flows: `CLI → Config → AgentLoop → ChatClient (model IR) ⇄ tool
 MVP-1 (CLI agent), MVP-2 (HTTP server + Web GUI + MCP + skills/memory/plan/goal) and
 MVP-3 (subagents, workflows, WASM plugin sandbox, dynamic Cordis runtime,
 observability) are implemented — `zig build` and `zig build test` are green
-(399/399). Remaining roadmap items live under "Production" in `README.md`
+(401/401). Remaining roadmap items live under "Production" in `README.md`
 (OpenTelemetry, advanced sandboxing, plugin marketplace, multi-agent
 coordination). See `AGENTS.md` for the operational cheat-sheet.

@@ -16,6 +16,7 @@ const std = @import("std");
 const clib = @import("../clib.zig");
 const cordis = @import("cordis");
 const model_mod = @import("../model/model.zig");
+const log_mod = @import("log.zig");
 
 /// Durable goal snapshot stored in the session sidecar (mirrors
 /// `agent/goal.zig` GoalSnapshot but owns strings via `Session.alloc`).
@@ -42,6 +43,8 @@ pub const Session = struct {
     id: []const u8,
     alloc: std.mem.Allocator,
     messages: std.ArrayList(model_mod.Message),
+    /// Messages already present in the append-only JSONL log (<path>.jsonl).
+    logged_count: usize = 0,
     created_at: i64,
     metadata: std.StringHashMap([]const u8),
 
@@ -281,7 +284,7 @@ pub const Session = struct {
         return std.fmt.allocPrint(alloc, "{s}.projections", .{path});
     }
 
-    pub fn save(self: *const Session, io: std.Io, path: []const u8) !void {
+    pub fn save(self: *Session, io: std.Io, path: []const u8) !void {
         var buf = try std.ArrayList(u8).initCapacity(self.alloc, 0);
         errdefer buf.deinit(self.alloc);
 
@@ -329,6 +332,45 @@ pub const Session = struct {
         }
         // Sidecar: durable goal/todo projections
         try self.saveProjections(io, path);
+        // Append-only JSONL event log (dsh session-format alignment). The
+        // legacy JSON array above stays for GUI readers; the log is the
+        // migration substrate. Best-effort: a log failure never fails the save.
+        self.saveLog(io, path) catch {};
+    }
+
+    /// Append messages not yet in the JSONL log, or rewrite it when the
+    /// session was cleared / the log is being started.
+    fn saveLog(self: *Session, io: std.Io, path: []const u8) !void {
+        const log_path = try std.fmt.allocPrint(self.alloc, "{s}.jsonl", .{path});
+        defer self.alloc.free(log_path);
+
+        if (self.logged_count > self.messages.items.len) self.logged_count = 0;
+
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.alloc);
+
+        if (self.logged_count == 0) {
+            const h = try log_mod.headerLine(self.alloc, self.id);
+            defer self.alloc.free(h);
+            try buf.appendSlice(self.alloc, h);
+            for (self.messages.items, 0..) |m, i| {
+                const line = try log_mod.messageLine(self.alloc, i + 1, m);
+                defer self.alloc.free(line);
+                try buf.appendSlice(self.alloc, line);
+            }
+            try log_mod.overwrite(io, log_path, buf.items);
+            self.logged_count = self.messages.items.len;
+            return;
+        }
+
+        if (self.logged_count >= self.messages.items.len) return;
+        for (self.messages.items[self.logged_count..], 0..) |m, i| {
+            const line = try log_mod.messageLine(self.alloc, self.logged_count + i + 1, m);
+            defer self.alloc.free(line);
+            try buf.appendSlice(self.alloc, line);
+        }
+        try log_mod.append(io, log_path, buf.items);
+        self.logged_count = self.messages.items.len;
     }
 
     fn saveProjections(self: *const Session, io: std.Io, path: []const u8) !void {
@@ -434,6 +476,21 @@ pub const Session = struct {
     }
 
     pub fn load(self: *Session, io: std.Io, path: []const u8) !void {
+        // Prefer the append-only JSONL log; fall back to the legacy JSON
+        // transcript (the migration seam) when no log exists yet.
+        const log_path = try std.fmt.allocPrint(self.alloc, "{s}.jsonl", .{path});
+        defer self.alloc.free(log_path);
+        if (log_mod.readMessages(self.alloc, io, log_path)) |msgs| {
+            defer self.alloc.free(msgs);
+            for (msgs) |m| try self.messages.append(self.alloc, m);
+            self.logged_count = self.messages.items.len;
+            self.loadProjections(io, path) catch {};
+            return;
+        } else |e| switch (e) {
+            error.FileNotFound => {},
+            else => return e,
+        }
+
         const raw = std.Io.Dir.readFileAlloc(.cwd(), io, path, self.alloc, .unlimited) catch |e| switch (e) {
             error.FileNotFound => return, // empty session, OK
             else => return e,
@@ -813,6 +870,7 @@ test "session add and roundtrip" {
     const io = ctx.io();
     defer std.Io.Dir.deleteFile(.cwd(), io, tmp) catch {};
     defer std.Io.Dir.deleteFile(.cwd(), io, "zharness_session_test.json.projections") catch {};
+    defer std.Io.Dir.deleteFile(.cwd(), io, "zharness_session_test.json.jsonl") catch {};
 
     try s1.save(io, tmp);
 

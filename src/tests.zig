@@ -15,6 +15,7 @@ const tool_reg = @import("tool/registry.zig");
 const tool_builtin = @import("tool/builtin.zig");
 const agent = @import("agent/agent.zig");
 const session = @import("session/session.zig");
+const log_mod = @import("session/log.zig");
 
 // Orphan modules wired by W1-integration — imported so their inline test
 // blocks join `zig build test`.
@@ -41,6 +42,7 @@ comptime {
     _ = @import("tool/webfetch.zig");
     _ = @import("agent/subagent.zig");
     _ = @import("agent/compaction.zig"); // context compaction: pure helpers + tests
+    _ = @import("session/log.zig"); // append-only JSONL session log
     _ = @import("tool/spawn_agent.zig");
     _ = @import("workflow/workflow.zig");
     _ = @import("workflow/executor.zig");
@@ -365,6 +367,7 @@ test "session roundtrip" {
     try std.testing.expectEqual(s2.count(), s.count());
 
     std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, "/tmp/zharness_session_test.json.jsonl") catch {};
 }
 
 test "model findMatchingBracket sample" {
@@ -496,6 +499,61 @@ test "session multi-turn resume integration" {
     try std.testing.expectEqual(model.Role.assistant, s.messages.items[1].role);
     try std.testing.expectEqual(model.Role.user, s.messages.items[4].role);
     try std.testing.expectEqual(model.Role.assistant, s.messages.items[5].role);
+}
+
+test "session JSONL log round-trips and migrates from legacy JSON" {
+    const alloc = std.testing.allocator;
+    var ctx = try cordis.Context.init(alloc);
+    defer ctx.deinit();
+    const io = ctx.io();
+
+    const dir = try w1TempDir(alloc, "sessionlog");
+    defer alloc.free(dir);
+    try std.Io.Dir.createDirPath(.cwd(), io, dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/s.json", .{dir});
+    defer alloc.free(path);
+    const log_path = try std.fmt.allocPrint(alloc, "{s}.jsonl", .{path});
+    defer alloc.free(log_path);
+
+    // Save writes both the legacy JSON transcript and the JSONL log.
+    var s = try session.Session.init(alloc, "s-log");
+    defer s.deinit();
+    try s.addUser("hello");
+    try s.addAssistant("world", null);
+    try s.save(io, path);
+
+    const logged = try log_mod.readMessages(alloc, io, log_path);
+    defer {
+        for (logged) |*m| {
+            alloc.free(m.content);
+            if (m.tool_call_id) |t| alloc.free(t);
+            if (m.tool_calls_json) |t| alloc.free(t);
+        }
+        alloc.free(logged);
+    }
+    try std.testing.expectEqual(@as(usize, 2), logged.len);
+    try std.testing.expectEqualStrings("hello", logged[0].content);
+
+    // A fresh Session loads from the log (preferred over the legacy JSON).
+    var s2 = try session.Session.init(alloc, "s-log2");
+    defer s2.deinit();
+    try s2.load(io, path);
+    try std.testing.expectEqual(@as(usize, 2), s2.count());
+
+    // Incremental save appends only the new message.
+    try s2.addUser("third");
+    try s2.save(io, path);
+    const logged2 = try log_mod.readMessages(alloc, io, log_path);
+    defer {
+        for (logged2) |*m| {
+            alloc.free(m.content);
+            if (m.tool_call_id) |t| alloc.free(t);
+            if (m.tool_calls_json) |t| alloc.free(t);
+        }
+        alloc.free(logged2);
+    }
+    try std.testing.expectEqual(@as(usize, 3), logged2.len);
+    try std.testing.expectEqualStrings("third", logged2[2].content);
 }
 
 // ── W1-integration tests (sandbox / checkpoint / extension wiring) ──────────
