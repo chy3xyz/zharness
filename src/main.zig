@@ -59,6 +59,7 @@ const terminal_mod = @import("tool/terminal.zig");
 const session_query = @import("tool/session_query.zig");
 const schedule_mod = @import("tool/schedule.zig");
 const lsp_tool = @import("tool/lsp.zig");
+const otel = @import("telemetry/otel.zig");
 const goals_rpc = @import("server/apiproxy/goals_rpc.zig");
 const plan_frames = @import("server/apiproxy/plan_frames.zig");
 const jobs_rpc = @import("server/apiproxy/jobs_rpc.zig");
@@ -651,7 +652,6 @@ fn obsEnd(alloc: std.mem.Allocator) void {
 /// JSONL envelope per event when observability is active. Best-effort:
 /// formatting/allocation failures drop the event instead of failing the turn.
 fn obsEmit(kind: agent.AgentLoop.EventKind, payload: []const u8) void {
-    const st = g_obs orelse return;
     const et: []const u8 = switch (kind) {
         .turn_start => "agent.turn_start",
         .thinking => "model.thinking",
@@ -661,6 +661,9 @@ fn obsEmit(kind: agent.AgentLoop.EventKind, payload: []const u8) void {
         .done => "agent.stopped",
         .err => "error",
     };
+    // Mirror the event as an OTLP span when ZHARNESS_OTEL_PATH is set.
+    otel.emitEvent(et, payload);
+    const st = g_obs orelse return;
     var pj: std.ArrayList(u8) = .empty;
     defer pj.deinit(st.alloc);
     pj.appendSlice(st.alloc, "{\"detail\":\"") catch return;
