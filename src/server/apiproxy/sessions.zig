@@ -36,6 +36,7 @@
 const std = @import("std");
 const jsonx = @import("jsonx.zig");
 const router = @import("router.zig");
+const log_mod = @import("../../session/log.zig");
 
 // ── records ────────────────────────────────────────────────────────────────
 
@@ -64,6 +65,29 @@ pub fn transcriptPath(alloc: std.mem.Allocator, cwd: []const u8, id: []const u8)
 /// empty session), matching session.Session.load semantics. Malformed JSON
 /// degrades to whatever prefix parses (per-object best effort).
 pub fn loadTranscript(io: std.Io, alloc: std.mem.Allocator, path: []const u8) ![]MsgRec {
+    // Prefer the append-only JSONL log (session/log.zig); fall back to the
+    // legacy JSON array when the log is absent or empty. The log path is the
+    // transcript path plus ".jsonl". Unknown versions / bad lines fall
+    // through to JSON rather than failing the read.
+    const log_path = try std.fmt.allocPrint(alloc, "{s}.jsonl", .{path});
+    defer alloc.free(log_path);
+    if (log_mod.readMessages(alloc, io, log_path)) |msgs| {
+        if (msgs.len > 0) {
+            const out = try alloc.alloc(MsgRec, msgs.len);
+            for (msgs, 0..) |m, i| {
+                out[i] = .{
+                    .role = try alloc.dupe(u8, m.role.asStr()),
+                    .content = m.content,
+                    .tool_call_id = m.tool_call_id,
+                    .tool_calls_json = m.tool_calls_json,
+                };
+            }
+            alloc.free(msgs); // strings transferred into out
+            return out;
+        }
+        alloc.free(msgs);
+    } else |_| {}
+
     // Skip very large session files (>50MB) — parsing them would take too
     // long and the GUI can't render thousands of events meaningfully.
     const stat = std.Io.Dir.statFile(.cwd(), io, path, .{}) catch {
@@ -115,6 +139,36 @@ pub fn parseTranscript(alloc: std.mem.Allocator, raw: []const u8) ![]MsgRec {
         });
     }
     return out.toOwnedSlice(alloc);
+}
+
+test "loadTranscript reads the JSONL log when the legacy JSON is absent" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try std.Io.Dir.createDirPath(.cwd(), io, "/tmp/zh_apx_log_test");
+    const path = "/tmp/zh_apx_log_test/s.json";
+    const log_path = "/tmp/zh_apx_log_test/s.json.jsonl";
+    defer std.Io.Dir.deleteFile(.cwd(), io, log_path) catch {};
+
+    const h = try log_mod.headerLine(alloc, "s");
+    defer alloc.free(h);
+    try log_mod.append(io, log_path, h);
+    const m1 = try log_mod.messageLine(alloc, 1, .{ .role = .user, .content = "hello-log" });
+    defer alloc.free(m1);
+    try log_mod.append(io, log_path, m1);
+
+    const msgs = try loadTranscript(io, alloc, path);
+    defer {
+        for (msgs) |m| {
+            alloc.free(m.role);
+            alloc.free(m.content);
+            if (m.tool_call_id) |t| alloc.free(t);
+            if (m.tool_calls_json) |t| alloc.free(t);
+        }
+        alloc.free(msgs);
+    }
+    try testing.expectEqual(@as(usize, 1), msgs.len);
+    try testing.expectEqualStrings("hello-log", msgs[0].content);
 }
 
 fn lessStr(_: void, a: []const u8, b: []const u8) bool {

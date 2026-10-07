@@ -33,3 +33,6 @@ Every later line is one message event:
 `<id>.json` array and sets the log cursor to 0, so the next `save` writes a fresh
 log. Cleared sessions rewrite the log; ordinary saves append only the new
 messages.
+
+The apiproxy transcript reader (`server/apiproxy/sessions.zig:loadTranscript`)
+uses the same order, so GUI session history also reads the log when present.
