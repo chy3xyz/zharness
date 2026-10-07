@@ -2543,6 +2543,9 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
 
     // ── MCP stdio servers via --mcp "<command>" (dev.md §XX) ───────────────
     var mcp_clients: []*mcp_mod.McpClient = &.{};
+    // MCP `initialize` instructions, joined into the system prompt below.
+    var mcp_instr: std.ArrayList(u8) = .empty;
+    defer mcp_instr.deinit(alloc);
     errdefer {
         for (mcp_clients) |c| {
             c.deinit();
@@ -2567,12 +2570,20 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
                 alloc.destroy(box);
                 continue;
             };
-            _ = box.initialize() catch |e| {
+            var init = box.initialize() catch |e| {
                 std.debug.print("[mcp] {s} ({s}): initialize failed: {s}\n", .{ label, cmd, @errorName(e) });
                 box.deinit();
                 alloc.destroy(box);
                 continue;
             };
+            defer init.deinit(alloc);
+            if (init.instructions.len > 0) {
+                if (mcp_instr.items.len > 0) mcp_instr.appendSlice(alloc, "\n\n") catch {};
+                mcp_instr.appendSlice(alloc, "MCP server ") catch {};
+                mcp_instr.appendSlice(alloc, label) catch {};
+                mcp_instr.appendSlice(alloc, " instructions:\n") catch {};
+                mcp_instr.appendSlice(alloc, init.instructions) catch {};
+            }
             const registered = mcp_bridge.registerServerTools(alloc, tools, label, box) catch |e| blk: {
                 std.debug.print("[mcp] {s} ({s}): tool listing failed: {s}\n", .{ label, cmd, @errorName(e) });
                 break :blk 0;
@@ -2707,6 +2718,14 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
             if (system_prompt.ptr != SYSTEM_PROMPT.ptr) alloc.free(system_prompt);
             system_prompt = augmented;
         }
+    }
+
+    // MCP server instructions (initialize result) join the system prompt so
+    // the model sees each attached server's operating guidance.
+    if (mcp_instr.items.len > 0) {
+        const augmented = try std.fmt.allocPrint(alloc, "{s}\n\n{s}", .{ system_prompt, mcp_instr.items });
+        if (system_prompt.ptr != SYSTEM_PROMPT.ptr) alloc.free(system_prompt);
+        system_prompt = augmented;
     }
 
     const acfg = try alloc.create(agent.AgentConfig);

@@ -69,12 +69,16 @@ pub const InitInfo = struct {
     capabilities_json: []const u8,
     server_name: []const u8,
     server_version: []const u8,
+    /// Server-provided operating guidance from the initialize result ("" when
+    /// absent). Injected into the agent system prompt when non-empty.
+    instructions: []const u8,
 
     pub fn deinit(self: *const InitInfo, alloc: std.mem.Allocator) void {
         alloc.free(self.protocol_version);
         alloc.free(self.capabilities_json);
         alloc.free(self.server_name);
         alloc.free(self.server_version);
+        alloc.free(self.instructions);
     }
 };
 
@@ -399,6 +403,7 @@ pub const McpClient = struct {
             // All fields are heap-owned so deinit can free unconditionally.
             .server_name = try allocEmpty(self.alloc),
             .server_version = try allocEmpty(self.alloc),
+            .instructions = try stringFieldOrDefault(self.alloc, result_text, 0, "instructions", ""),
         };
         errdefer info.deinit(self.alloc);
         if (try findField(result_text, 0, "serverInfo")) |srv| {
@@ -790,7 +795,7 @@ test "initialize handshake round-trip over pipe pair" {
     defer h.teardown();
 
     const init_result =
-        "{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"fake\",\"version\":\"1.2\"}}";
+        "{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"fake\",\"version\":\"1.2\"},\"instructions\":\"Use rtk.\"}";
     const init_wire = try jsonrpc.encodeResult(alloc, 0, init_result);
     defer alloc.free(init_wire);
     try h.script(&.{init_wire});
@@ -801,6 +806,7 @@ test "initialize handshake round-trip over pipe pair" {
     try testing.expectEqualStrings("fake", info.server_name);
     try testing.expectEqualStrings("1.2", info.server_version);
     try testing.expectEqualStrings("{\"tools\":{}}", info.capabilities_json);
+    try testing.expectEqualStrings("Use rtk.", info.instructions);
 
     // Verify wire: initialize request then the initialized notification.
     const sent = try h.drainSent(alloc);
