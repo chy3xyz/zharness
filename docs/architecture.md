@@ -149,7 +149,8 @@ used to free.
 - L2 WASM sandboxing awaits the zcordis wasm runtime. The `process` sandbox is
   L1 defense-in-depth (deny-list + env allowlist + watchdog), not a boundary;
   `native` adds OS confinement (macOS Seatbelt / Linux bubblewrap) when the
-  host provides it.
+  host provides it. Sandboxed shells also set kernel resource limits
+  (`ulimit -t` CPU seconds, `ulimit -n` open files) via `sandbox.limitsPrelude`.
 - Permission gating: every tool call passes the preset/approval gate in
   `AgentLoop.dispatchTool` (fail-closed). In serve mode the gate publishes an
   `approval/request` waterfall and waits for the GUI's `$events.result`; CLI

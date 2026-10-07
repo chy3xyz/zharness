@@ -207,6 +207,10 @@ pub const Policy = struct {
     level: Level = .process,
     /// Seconds before the watchdog kills the command.
     max_timeout_secs: u32 = 300,
+    /// OS-enforced CPU seconds per sandboxed command (ulimit -t).
+    max_cpu_secs: u32 = 60,
+    /// OS-enforced open-file limit per sandboxed command (ulimit -n).
+    max_open_files: u32 = 256,
     /// Extra passthrough prefixes (e.g. "ZHARNESS_").
     env_prefix_allowlist: []const []const u8 = &.{"ZHARNESS_"},
 
@@ -259,6 +263,18 @@ fn environNext(index: *usize) ?Envar {
         const eq = std.mem.indexOfScalar(u8, s, '=') orelse continue;
         return .{ .name = s[0..eq], .value = s[eq + 1 ..] };
     }
+}
+
+/// Shell prelude enforcing OS resource limits via ulimit. Empty for .off
+/// (no sandbox). Applied inside the sandboxed shell so the kernel enforces
+/// the limits on every descendant process.
+pub fn limitsPrelude(alloc: std.mem.Allocator, policy: Policy) ![]u8 {
+    if (policy.level == .off) return alloc.dupe(u8, "");
+    return std.fmt.allocPrint(
+        alloc,
+        "ulimit -t {d} 2>/dev/null; ulimit -n {d} 2>/dev/null; ",
+        .{ policy.max_cpu_secs, policy.max_open_files },
+    );
 }
 
 /// Execute `command` inside `cwd` under the given policy. Output merges
@@ -325,6 +341,9 @@ pub fn run(
 
         var payload: std.ArrayList(u8) = .empty;
         defer payload.deinit(alloc);
+        const prelude = try limitsPrelude(alloc, policy);
+        defer alloc.free(prelude);
+        try payload.appendSlice(alloc, prelude);
         // Watchdog without orphaned pipe holders: poll the command's liveness
         // in decisecond steps instead of backgrounding a sleeper (a killed
         // watcher subshell would leave its `sleep` child holding the popen
@@ -416,6 +435,17 @@ fn appendQuoted(alloc: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
+
+test "limitsPrelude enforces ulimits for sandboxed levels" {
+    const alloc = std.testing.allocator;
+    const on = try limitsPrelude(alloc, .{ .level = .process, .max_cpu_secs = 42, .max_open_files = 77 });
+    defer alloc.free(on);
+    try std.testing.expect(std.mem.indexOf(u8, on, "ulimit -t 42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, on, "ulimit -n 77") != null);
+    const off = try limitsPrelude(alloc, .{ .level = .off });
+    defer alloc.free(off);
+    try std.testing.expectEqualStrings("", off);
+}
 
 test "classifyTool marks reads and defaults unknown tools to write" {
     try std.testing.expectEqual(Action.read, classifyTool("file_read"));
