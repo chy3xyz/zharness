@@ -52,6 +52,7 @@ const questions = @import("server/apiproxy/questions.zig");
 const ask_user = @import("tool/ask_user.zig");
 const attachments = @import("server/apiproxy/attachments.zig");
 const tool_attachments = @import("tool/attachments.zig");
+const present_mod = @import("tool/present.zig");
 const goals_rpc = @import("server/apiproxy/goals_rpc.zig");
 const plan_frames = @import("server/apiproxy/plan_frames.zig");
 const jobs_rpc = @import("server/apiproxy/jobs_rpc.zig");
@@ -579,6 +580,12 @@ fn gpaAlloc() std.mem.Allocator {
 /// go through a cordis Context. Null for run/chat (they use the ctx's io).
 var g_io: ?std.Io = null;
 
+/// Emit a log-only observability event with a pre-serialized JSON payload.
+fn emitObsRaw(event_type: []const u8, payload_json: []const u8) void {
+    const st = g_obs orelse return;
+    st.sink.emitAt(st.io, &st.trace, .info, event_type, payload_json);
+}
+
 /// Monotonic approval-request id source for the audit pair.
 var g_approval_seq = std.atomic.Value(u64).init(0);
 
@@ -959,6 +966,11 @@ pub const LoopExtensions = struct {
     /// falls back to the builtin executors).
     fn execTool(ctx: *anyopaque, alloc: std.mem.Allocator, io: std.Io, call: tool_builtin.ToolCall) anyerror!?tool_builtin.ToolResult {
         const self: *LoopExtensions = @ptrCast(@alignCast(ctx));
+        if (std.mem.eql(u8, call.name, "present")) {
+            const r = try present_mod.execute(alloc, io, self.cwd, call);
+            if (r.success) emitObsRaw("deliverable/presented", call.arguments);
+            return r;
+        }
         if (std.mem.eql(u8, call.name, "plan_add") or std.mem.eql(u8, call.name, "plan_update"))
             return try self.planBoardTool(alloc, call);
         if (std.mem.eql(u8, call.name, "plan_set")) return try self.planSet(alloc, call);
@@ -2483,6 +2495,7 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
         try tools.register(ask_user.canonical_definition);
     }
     try tool_attachments.registerAttachments(tools);
+    try present_mod.register(tools);
     g_ask_storage = .{ .publish = publishAskFrame, .store = questions.sharedStore() catch null };
     ask_user.setAskCtx(&g_ask_storage);
 
