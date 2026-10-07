@@ -2,14 +2,14 @@
 
 This file provides guidance to CodeBuddy Code when working with code in this repository.
 
-`zharness` is a native coding-agent harness written in **Zig 0.17**, ported from the DeepSeek Harness ("everything is a plugin") philosophy. It runs on top of the **zcordis** runtime kernel (also Zig 0.17, located at `../zcordis`). The first working target (MVP-1) is a CLI coding agent: `zharness run "..."` drives a model (DeepSeek by default) plus filesystem/shell/git tools through an agent loop.
+`zharness` is a native coding-agent harness written in **Zig 0.17**, ported from the DeepSeek Harness ("everything is a plugin") philosophy. It runs on top of the **zcordis** runtime kernel (also Zig 0.17, located at `../zcordis`). It now ships a full CLI + HTTP/GUI harness: `zh run "..."` drives a model (DeepSeek by default) plus filesystem/shell/git/web/MCP tools through an agent loop.
 
 ## Build / Run / Test commands
 
 Zig is the only toolchain. Requires Zig `0.17.0` stable (the project pins `minimum_zig_version = "0.17.0"`).
 
 ```bash
-# Build the zharness executable (installs to zig-out/bin/zharness)
+# Build the zharness executable (installs to zig-out/bin/zh)
 zig build
 
 # Run a task via the coding agent (needs ZHARNESS_API_KEY or DEEPSEEK_API_KEY)
@@ -20,14 +20,12 @@ zig build test
 
 # Run a single test by name
 zig build test -Dtest-filter="shell echo"
-# or directly:
-zig test src/tool/builtin.zig --main-pkg-path .
 
 # Clean
 zig build --help
 ```
 
-`build.zig` defines two steps: install the `zharness` executable, and `zig build test` (builds a test executable from `src/tests.zig` linking the `cordis` module). Tests live inline in each module (`test { ... }` blocks).
+`build.zig` defines two steps: install the `zh` executable, and `zig build test` (builds a test executable from `src/tests.zig` linking the `cordis` module). Tests live inline in each module (`test { ... }` blocks); the suite is currently **387 tests**.
 
 ## Dependencies and module layout
 
@@ -53,6 +51,11 @@ The data flows: `CLI → Config → AgentLoop → ChatClient (model IR) ⇄ tool
 - **Sandbox**: tools only touch paths inside `cwd`. System-wide reads must go through `shell` (approval is stubbed; `SandboxMode` exists in config but is not yet wired into `builtin.zig`).
 - **zcordis coupling**: `AgentLoop` holds a `*cordis.Context`; services/events follow the zcordis API (`ctx.emit`, `scope.on`, `ctx.provide`). Consult `../zcordis/src/cordis.zig` for the public surface.
 
-## Work still to do (per todo.md / dev.md MVP-1)
+## Project status
 
-`src/main.zig` (CLI entry) and `src/tests.zig` (test root) are **not yet written** — `build.zig` references both and will fail until they exist. Also planned but absent: `session/` (message store + SQLite persistence), `skill/`, `sandbox/` wiring, MCP client, and `serve` (HTTP/WebSocket) per dev.md §XV/§XIX/§XX/§XXIII. The MVP-1 goal is: `zharness run "fix the test errors in this project"` end-to-end.
+MVP-1 (CLI agent), MVP-2 (HTTP server + Web GUI + MCP + skills/memory/plan/goal) and
+MVP-3 (subagents, workflows, WASM plugin sandbox, dynamic Cordis runtime,
+observability) are implemented — `zig build` and `zig build test` are green
+(387/387). Remaining roadmap items live under "Production" in `README.md`
+(OpenTelemetry, advanced sandboxing, plugin marketplace, multi-agent
+coordination). See `AGENTS.md` for the operational cheat-sheet.

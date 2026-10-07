@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    name: Zig build & test
+    runs-on: macos-latest
+    steps:
+      - name: Checkout zharness
+        uses: actions/checkout@v4
+        with:
+          path: zharness
+
+      # build.zig.zon has a path dependency on ../zcordis, so the kernel is
+      # checked out next to zharness before building.
+      - name: Checkout zcordis (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: chy3xyz/zcordis
+          path: zcordis
+
+      - name: Set up Zig (pinned, matches .zigversion)
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Format check
+        working-directory: zharness
+        run: zig fmt --check src test examples build.zig
+
+      - name: Build (Debug)
+        working-directory: zharness
+        run: zig build
+
+      - name: Test (Debug)
+        working-directory: zharness
+        run: zig build test
+
+      - name: Test (ReleaseSafe)
+        working-directory: zharness
+        run: zig build test -Doptimize=ReleaseSafe
+
+      - name: Build (ReleaseSmall)
+        working-directory: zharness
+        run: zig build -Doptimize=ReleaseSmall

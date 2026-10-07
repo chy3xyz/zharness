@@ -20,21 +20,21 @@ build, test, and contribute changes.
 ## Building
 
 ```bash
-zig build            # produces ./zig-out/bin/zharness
+zig build            # produces ./zig-out/bin/zh
 ```
 
 ## Running
 
 ```bash
 export ZHARNESS_API_KEY="sk-..."
-./zig-out/bin/zharness run "fix the failing tests in this project"
+./zig-out/bin/zh run "fix the failing tests in this project"
 ```
 
 ## Testing
 
 ```bash
-zig build test                       # full suite (17 tests)
-zig test src/tool/registry.zig       # a single module's inline tests
+zig build test                             # full suite (387 tests)
+zig build test -Dtest-filter="shell echo"  # a single test by name
 ```
 
 Tests live inline in each module as `test { ... }` blocks; `src/tests.zig` is
