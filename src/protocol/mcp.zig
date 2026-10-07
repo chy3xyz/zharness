@@ -461,6 +461,38 @@ pub const McpClient = struct {
         return .{ .tools = slice };
     }
 
+    /// Raw successful `result` JSON for an arbitrary request (owned). A
+    /// JSON-RPC error response maps to `ServerRejectedRequest`.
+    pub fn requestResult(self: *McpClient, method: []const u8, params_json: []const u8) McpError![]u8 {
+        const id = try self.sendRequest(method, params_json);
+        var resp = try self.awaitResponse(id);
+        defer resp.deinit(self.alloc);
+        return switch (resp) {
+            .response_ok => |r| self.alloc.dupe(u8, r.result_json) catch error.OutOfMemory,
+            .response_err => error.ServerRejectedRequest,
+            else => error.ProtocolViolation,
+        };
+    }
+
+    /// `resources/list` — raw result JSON (owned).
+    pub fn listResources(self: *McpClient) McpError![]u8 {
+        return self.requestResult("resources/list", "{}");
+    }
+
+    /// `resources/templates/list` — raw result JSON (owned).
+    pub fn listResourceTemplates(self: *McpClient) McpError![]u8 {
+        return self.requestResult("resources/templates/list", "{}");
+    }
+
+    /// `resources/read` for one URI — raw result JSON (owned).
+    pub fn readResource(self: *McpClient, uri: []const u8) McpError![]u8 {
+        const esc = jsonrpc.escapeJsonString(self.alloc, uri) catch return error.OutOfMemory;
+        defer self.alloc.free(esc);
+        const params = std.fmt.allocPrint(self.alloc, "{{\"uri\":\"{s}\"}}", .{esc}) catch return error.OutOfMemory;
+        defer self.alloc.free(params);
+        return self.requestResult("resources/read", params);
+    }
+
     /// Invoke a remote tool. `args_json` must be a JSON object (empty string
     /// means `{}`). Text content blocks are joined with "\n"; non-text blocks
     /// are skipped; an `isError:true` result flips `ok` but keeps the text.
@@ -821,6 +853,21 @@ test "initialize handshake round-trip over pipe pair" {
     defer d1.deinit(alloc);
     try testing.expect(d1 == .notification);
     try testing.expectEqualStrings("notifications/initialized", d1.notification.method);
+}
+
+test "requestResult returns the raw result for resources/list" {
+    const alloc = testing.allocator;
+    var h = try FakeHarness.setup(alloc);
+    defer h.teardown();
+
+    const result = "{\"resources\":[{\"uri\":\"file:///x\",\"name\":\"x\"}]}";
+    const wire = try jsonrpc.encodeResult(alloc, 0, result);
+    defer alloc.free(wire);
+    try h.script(&.{wire});
+
+    const raw = try h.client.listResources();
+    defer alloc.free(raw);
+    try testing.expectEqualStrings(result, raw);
 }
 
 test "listTools translates descriptors with schema passthrough" {

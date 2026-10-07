@@ -18,6 +18,7 @@
 const std = @import("std");
 const registry = @import("registry.zig");
 const builtin = @import("builtin.zig");
+const model = @import("../model/model.zig");
 const mcp = @import("../protocol/mcp.zig");
 
 /// Longest permitted local tool name (keeps provider-side name limits safe).
@@ -124,6 +125,34 @@ const Entry = struct {
 
 var instances: ?std.StringHashMap(Entry) = null;
 
+/// server label -> client, for the resource inspection tools. Clients are
+/// owned by the spawner, not this map.
+var servers: ?std.StringHashMap(*mcp.McpClient) = null;
+
+pub fn putServer(alloc: std.mem.Allocator, label: []const u8, client: *mcp.McpClient) std.mem.Allocator.Error!void {
+    if (servers == null) servers = std.StringHashMap(*mcp.McpClient).init(alloc);
+    const map = &servers.?;
+    if (map.getPtr(label)) |slot| {
+        slot.* = client;
+        return;
+    }
+    const key = try alloc.dupe(u8, label);
+    errdefer alloc.free(key);
+    try map.put(key, client);
+}
+
+pub fn getServer(label: []const u8) ?*mcp.McpClient {
+    const map = &(servers orelse return null);
+    return map.get(label);
+}
+
+fn firstServer() ?*mcp.McpClient {
+    const map = &(servers orelse return null);
+    var it = map.valueIterator();
+    if (it.next()) |p| return p.*;
+    return null;
+}
+
 fn ensureMap(alloc: std.mem.Allocator) std.mem.Allocator.Error!*std.StringHashMap(Entry) {
     if (instances == null) {
         instances = std.StringHashMap(Entry).init(alloc);
@@ -185,6 +214,12 @@ pub fn clearInstances() void {
         map.deinit();
         instances = null;
     }
+    if (servers) |*map| {
+        var it = map.iterator();
+        while (it.next()) |entry| map.allocator.free(entry.key_ptr.*);
+        map.deinit();
+        servers = null;
+    }
 }
 
 // ── execution ───────────────────────────────────────────────────────────────
@@ -198,9 +233,50 @@ fn failedResult(alloc: std.mem.Allocator, msg: []const u8) builtin.ToolResult {
 /// Execute a bridged tool by its LOCAL name. Output/err_msg are allocated
 /// with `alloc`; free them via `builtin.freeResult`.
 pub fn execute(alloc: std.mem.Allocator, name: []const u8, arguments: []const u8) builtin.ToolResult {
+    if (std.mem.eql(u8, name, "list_mcp_resources")) return resourceTool(alloc, arguments, .list);
+    if (std.mem.eql(u8, name, "list_mcp_resource_templates")) return resourceTool(alloc, arguments, .templates);
+    if (std.mem.eql(u8, name, "read_mcp_resource")) return resourceRead(alloc, arguments);
     const entry = getInstance(name) orelse
         return failedResult(alloc, "unknown bridged MCP tool");
     return executeEntry(alloc, entry, arguments);
+}
+
+const ResourceOp = enum { list, templates };
+
+fn pickServer(alloc: std.mem.Allocator, arguments: []const u8) ?*mcp.McpClient {
+    const want = model.extractStringField(alloc, arguments, "server") catch null;
+    defer if (want) |w| alloc.free(w);
+    if (want) |w| return getServer(w);
+    return firstServer();
+}
+
+fn transportFail(alloc: std.mem.Allocator, what: []const u8, e: anyerror) builtin.ToolResult {
+    const detail = std.fmt.allocPrint(alloc, "{s}: {s}", .{ what, @errorName(e) }) catch what;
+    return .{ .success = false, .output = alloc.dupe(u8, "") catch "", .err_msg = detail };
+}
+
+fn resourceTool(alloc: std.mem.Allocator, arguments: []const u8, op: ResourceOp) builtin.ToolResult {
+    const client = pickServer(alloc, arguments) orelse
+        return failedResult(alloc, "no attached MCP server matches 'server'");
+    const raw = (switch (op) {
+        .list => client.listResources(),
+        .templates => client.listResourceTemplates(),
+    }) catch |e| return transportFail(alloc, "mcp resources", e);
+    defer alloc.free(raw);
+    const out = alloc.dupe(u8, raw) catch return failedResult(alloc, "oom copying mcp output");
+    return .{ .success = true, .output = out, .err_msg = null };
+}
+
+fn resourceRead(alloc: std.mem.Allocator, arguments: []const u8) builtin.ToolResult {
+    const client = pickServer(alloc, arguments) orelse
+        return failedResult(alloc, "no attached MCP server matches 'server'");
+    const uri = (model.extractStringField(alloc, arguments, "uri") catch null) orelse
+        return failedResult(alloc, "read_mcp_resource: missing 'uri'");
+    defer alloc.free(uri);
+    const raw = client.readResource(uri) catch |e| return transportFail(alloc, "mcp read_resource", e);
+    defer alloc.free(raw);
+    const out = alloc.dupe(u8, raw) catch return failedResult(alloc, "oom copying mcp output");
+    return .{ .success = true, .output = out, .err_msg = null };
 }
 
 fn executeEntry(
@@ -259,12 +335,58 @@ pub fn registerServerTools(
         try putInstance(alloc, local, client, tool.name);
         registered += 1;
     }
+    if (registered > 0) try putServer(alloc, server_label, client);
     return registered;
+}
+
+/// Register the MCP resource inspection tools (once, when any server is
+/// attached). They resolve a server by optional label, else the first.
+pub fn registerResourceTools(reg: *registry.ToolRegistry) !void {
+    try reg.register(.{
+        .name = "list_mcp_resources",
+        .description = "List resources exposed by an attached MCP server. Optional 'server' label; defaults to the first attached server.",
+        .category = .general,
+        .parameters_json =
+        \\{"type":"object","properties":{"server":{"type":"string","description":"MCP server label (mcp0, mcp1, ...)"}},"required":[]}
+        ,
+    });
+    try reg.register(.{
+        .name = "list_mcp_resource_templates",
+        .description = "List parameterized resource templates exposed by an attached MCP server.",
+        .category = .general,
+        .parameters_json =
+        \\{"type":"object","properties":{"server":{"type":"string"}},"required":[]}
+        ,
+    });
+    try reg.register(.{
+        .name = "read_mcp_resource",
+        .description = "Read one MCP resource by URI from an attached server.",
+        .category = .general,
+        .parameters_json =
+        \\{"type":"object","properties":{"server":{"type":"string"},"uri":{"type":"string","description":"Resource URI from list_mcp_resources"}},"required":["uri"]}
+        ,
+    });
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "resource tools register and fail closed without a server" {
+    const alloc = testing.allocator;
+    var reg = try registry.ToolRegistry.init(alloc);
+    defer reg.deinit();
+    clearInstances();
+    try registerResourceTools(&reg);
+    try testing.expect(reg.contains("list_mcp_resources"));
+    try testing.expect(reg.contains("list_mcp_resource_templates"));
+    try testing.expect(reg.contains("read_mcp_resource"));
+
+    var r = execute(alloc, "list_mcp_resources", "{}");
+    defer builtin.freeResult(alloc, &r);
+    try testing.expect(!r.success);
+    try testing.expect(std.mem.indexOf(u8, r.err_msg.?, "no attached MCP server") != null);
+}
 
 test "sanitizeToken lowercases and replaces invalid characters" {
     var buf: [64]u8 = undefined;

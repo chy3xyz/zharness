@@ -141,8 +141,9 @@ used to free.
   `.zharness/logs/events.jsonl`).
 - MCP servers attach per invocation via repeated `--mcp "<cmd>"` flags
   (space-split argv, max 4, no quote handling). Server `instructions` from
-  the initialize result are injected into the system prompt; MCP *resources*
-  and prompts are not bridged yet.
+  the initialize result are injected into the system prompt, and resources are
+  bridged via `list_mcp_resources` / `list_mcp_resource_templates` /
+  `read_mcp_resource`; prompts are not bridged yet.
 - Presets constrain the classic builtin toolset only; harness capabilities
   (plan/goal/memory/skill/web/mcp/plugin/spawn_agent) always stay available.
 - L2 WASM sandboxing awaits the zcordis wasm runtime. The `process` sandbox is

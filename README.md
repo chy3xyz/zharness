@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Zig 0.17](https://img.shields.io/badge/Zig-0.17-orange.svg)](https://ziglang.org/)
-[![Tests](https://img.shields.io/badge/Tests-406%20passing-brightgreen.svg)](#testing)
+[![Tests](https://img.shields.io/badge/Tests-408%20passing-brightgreen.svg)](#testing)
 [![CI](https://github.com/chy3xyz/zharness/actions/workflows/ci.yml/badge.svg)](https://github.com/chy3xyz/zharness/actions/workflows/ci.yml)
 
 ---
@@ -208,6 +208,7 @@ The coding agent has access to:
 | `goal_set`   | Goal tracking |
 | `present`    | Declare the final files this turn delivers (deliverables) |
 | `mcp_*`      | MCP server tools (projected as `mcp_<srv>_<tool>`) |
+| `list_mcp_resources` / `list_mcp_resource_templates` / `read_mcp_resource` | Inspect and read MCP server resources |
 
 Tools only touch paths inside the workspace root (`cwd`). The shell tool
 expects a direct command string (e.g. `"ls -la"`) — do not wrap it in
@@ -296,7 +297,7 @@ zharness/
 ## Testing
 
 ```bash
-zig build test                             # full suite (406 tests)
+zig build test                             # full suite (408 tests)
 zig build test -Dtest-filter="shell echo"  # a single test by name
 ```
 

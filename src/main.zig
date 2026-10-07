@@ -2625,6 +2625,7 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
             mcp_clients = shrunk;
         }
     }
+    if (mcp_clients.len > 0) try mcp_bridge.registerResourceTools(tools);
 
     // ── preset filtering (dev.md §XXVIII): narrow the core builtin surface.
     // Only the classic coding-toolset names (the union of the preset
