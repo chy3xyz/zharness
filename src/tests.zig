@@ -48,6 +48,7 @@ comptime {
     _ = @import("tool/read_image.zig"); // read_image loader
     _ = @import("tool/terminal.zig"); // terminal_* persistent shells
     _ = @import("tool/session_query.zig"); // session_search / session_read
+    _ = @import("tool/schedule.zig"); // schedule_create/list/update/delete
     _ = @import("tool/spawn_agent.zig");
     _ = @import("workflow/workflow.zig");
     _ = @import("workflow/executor.zig");

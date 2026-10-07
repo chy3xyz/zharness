@@ -57,6 +57,7 @@ const jobs_tool = @import("tool/jobs.zig");
 const read_image_mod = @import("tool/read_image.zig");
 const terminal_mod = @import("tool/terminal.zig");
 const session_query = @import("tool/session_query.zig");
+const schedule_mod = @import("tool/schedule.zig");
 const goals_rpc = @import("server/apiproxy/goals_rpc.zig");
 const plan_frames = @import("server/apiproxy/plan_frames.zig");
 const jobs_rpc = @import("server/apiproxy/jobs_rpc.zig");
@@ -998,6 +999,10 @@ pub const LoopExtensions = struct {
             const s = try wm.snapshotPrompt(alloc);
             if (s.len > 0) try parts.append(alloc, s) else alloc.free(s);
         }
+        {
+            const s = try schedule_mod.renderSection(alloc);
+            if (s.len > 0) try parts.append(alloc, s) else alloc.free(s);
+        }
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(alloc);
         for (parts.items, 0..) |p, i| {
@@ -1014,6 +1019,7 @@ pub const LoopExtensions = struct {
         if (jobs_tool.isJobTool(call.name)) return try jobs_tool.execute(alloc, io, self.cwd, call);
         if (terminal_mod.isTerminalTool(call.name)) return try terminal_mod.execute(alloc, call);
         if (session_query.isSessionQueryTool(call.name)) return try session_query.execute(alloc, io, self.cwd, call);
+        if (schedule_mod.isScheduleTool(call.name)) return try schedule_mod.execute(alloc, call);
         if (std.mem.eql(u8, call.name, "read_image")) {
             const path = (model.extractStringField(alloc, call.arguments, "path") catch null) orelse
                 return .{ .success = false, .output = "", .err_msg = try alloc.dupe(u8, "read_image: missing 'path'") };
@@ -2558,6 +2564,7 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
     try read_image_mod.register(tools);
     try terminal_mod.register(tools);
     try session_query.register(tools);
+    try schedule_mod.register(tools);
     g_ask_storage = .{ .publish = publishAskFrame, .store = questions.sharedStore() catch null };
     ask_user.setAskCtx(&g_ask_storage);
 
