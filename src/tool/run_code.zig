@@ -100,7 +100,9 @@ pub const definition = tool_reg.ToolDefinition{
     \\known up front — it removes one model round trip per call. In
     \\sequential mode execution stops at the first failed step; in parallel
     \\mode every step runs independently. Results come back as a JSON array
-    \\of {step, tool, ok, output} entries in order.
+    \\of {step, tool, ok, output} entries in order. Later steps may splice
+    \\earlier results into their args with {{steps[N].output}}, {{steps[N].error}}
+    \\or {{prev.output}} (JSON-escaped into the surrounding string).
     ,
     .category = .general,
     .parameters_json =
@@ -261,6 +263,63 @@ fn appendEscaped(alloc: std.mem.Allocator, out: *std.ArrayList(u8), input: []con
     }
 }
 
+/// Resolve a {{...}} placeholder token against prior step results. Returns
+/// the value to splice, or null when the token is unknown (left literal).
+fn lookupToken(token: []const u8, outputs: []const []const u8, errors: []const []const u8) ?[]const u8 {
+    var idx: usize = 0;
+    var field: []const u8 = undefined;
+    if (std.mem.startsWith(u8, token, "prev.")) {
+        if (outputs.len == 0) return null;
+        idx = outputs.len - 1;
+        field = token["prev.".len..];
+    } else if (std.mem.startsWith(u8, token, "steps[")) {
+        const close = std.mem.indexOfScalar(u8, token, ']') orelse return null;
+        idx = std.fmt.parseInt(usize, token["steps[".len..close], 10) catch return null;
+        if (close + 1 >= token.len or token[close + 1] != '.') return null;
+        field = token[close + 2 ..];
+    } else {
+        return null;
+    }
+    if (idx >= outputs.len) return null;
+    if (std.mem.eql(u8, field, "output")) return outputs[idx];
+    if (std.mem.eql(u8, field, "error")) return errors[idx];
+    return null;
+}
+
+/// Replace {{prev.output}} / {{steps[N].output}} (and .error) tokens in a
+/// step's raw args with JSON-escaped prior results. Unknown tokens stay
+/// literal. Caller frees.
+fn resolveArgs(
+    alloc: std.mem.Allocator,
+    args: []const u8,
+    outputs: []const []const u8,
+    errors: []const []const u8,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < args.len) {
+        if (i + 1 < args.len and args[i] == '{' and args[i + 1] == '{') {
+            const close = std.mem.indexOfPos(u8, args, i + 2, "}}") orelse {
+                try out.append(alloc, args[i]);
+                i += 1;
+                continue;
+            };
+            const token = std.mem.trim(u8, args[i + 2 .. close], " \t");
+            if (lookupToken(token, outputs, errors)) |val| {
+                try appendEscaped(alloc, &out, val);
+            } else {
+                try out.appendSlice(alloc, args[i .. close + 2]);
+            }
+            i = close + 2;
+        } else {
+            try out.append(alloc, args[i]);
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(alloc);
+}
+
 // ── executor ────────────────────────────────────────────────────────────────
 
 /// One parsed step awaiting execution.
@@ -355,6 +414,17 @@ pub fn execute(alloc: std.mem.Allocator, call: ToolCall) !ToolResult {
 
     var any_failed = false;
     var stopped_early = false;
+    // Prior step results, for {{...}} placeholder resolution.
+    var prior_outputs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (prior_outputs.items) |s| alloc.free(s);
+        prior_outputs.deinit(alloc);
+    }
+    var prior_errors: std.ArrayList([]u8) = .empty;
+    defer {
+        for (prior_errors.items) |s| alloc.free(s);
+        prior_errors.deinit(alloc);
+    }
     for (steps, 0..) |step, idx| {
         if (sequential and any_failed) {
             stopped_early = true;
@@ -373,11 +443,13 @@ pub fn execute(alloc: std.mem.Allocator, call: ToolCall) !ToolResult {
             // Recursion guard: a batch invoking itself is unbounded by design.
             err_copy = try alloc.dupe(u8, "run_code cannot invoke itself");
         } else {
+            const resolved_args = try resolveArgs(alloc, step.args, prior_outputs.items, prior_errors.items);
+            defer alloc.free(resolved_args);
             const r = builtin_tools.execute(
                 alloc,
                 deps.io,
                 deps.cwd,
-                .{ .name = step.tool, .arguments = step.args },
+                .{ .name = step.tool, .arguments = resolved_args },
                 deps.sandbox_mode,
             ) catch |e| blk: {
                 break :blk builtin_tools.ToolResult{
@@ -392,6 +464,8 @@ pub fn execute(alloc: std.mem.Allocator, call: ToolCall) !ToolResult {
             if (r.err_msg) |m| err_copy = try alloc.dupe(u8, m);
         }
         if (!ok) any_failed = true;
+        try prior_outputs.append(alloc, try alloc.dupe(u8, out_copy orelse ""));
+        try prior_errors.append(alloc, try alloc.dupe(u8, err_copy orelse ""));
 
         if (idx > 0) try out.append(alloc, ',');
         try out.appendSlice(alloc, "{\"step\":");
@@ -642,4 +716,13 @@ test "nested shadowing: args containing a tool key does not confuse parsing" {
     defer freeResult(alloc, &res);
     try std.testing.expect(res.success);
     try std.testing.expect(std.mem.indexOf(u8, res.output, "nested-ok") != null);
+}
+
+test "resolveArgs splices prior step results with JSON escaping" {
+    const alloc = std.testing.allocator;
+    const outputs = [_][]const u8{ "a\"b\nc", "second" };
+    const errors = [_][]const u8{ "", "boom" };
+    const got = try resolveArgs(alloc, "{\"x\":\"{{steps[0].output}}\",\"y\":\"{{prev.error}}\",\"z\":\"{{nope}}\"}", &outputs, &errors);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("{\"x\":\"a\\\"b\\nc\",\"y\":\"boom\",\"z\":\"{{nope}}\"}", got);
 }
