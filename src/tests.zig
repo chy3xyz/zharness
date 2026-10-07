@@ -45,6 +45,7 @@ comptime {
     _ = @import("session/log.zig"); // append-only JSONL session log
     _ = @import("tool/present.zig"); // present (deliverables) tool
     _ = @import("tool/jobs.zig"); // job_list / job_output / job_kill
+    _ = @import("tool/read_image.zig"); // read_image loader
     _ = @import("tool/spawn_agent.zig");
     _ = @import("workflow/workflow.zig");
     _ = @import("workflow/executor.zig");
@@ -851,6 +852,42 @@ test "permission gate hands the tool name to the approval callback" {
     defer tool_builtin.freeResult(alloc, &r);
     try std.testing.expect(r.success);
     try std.testing.expectEqualStrings("shell", rec.tool_buf[0..rec.tool_len]);
+}
+
+test "read_image attachments ride the next request" {
+    const alloc = std.testing.allocator;
+    var ctx = try cordis.Context.init(alloc);
+    defer ctx.deinit();
+    const io = ctx.io();
+
+    var reg = try tool_reg.ToolRegistry.init(alloc);
+    defer reg.deinit();
+    try tool_reg.registerBuiltins(&reg);
+
+    const cfg = agent.AgentConfig{ .system_prompt = "sys", .max_turns = 4, .reasoning_effort = null, .sandbox_mode = .none };
+    const ag = try agent.Agent.init(alloc, ctx.root, &cfg);
+    defer ag.deinit(alloc);
+    const client = model.ChatClient.init(alloc, io, "https://localhost.invalid", "m", "");
+    var loop = try agent.AgentLoop.init(alloc, ctx, ag, client, &reg, "/tmp", null, null, null);
+    defer loop.deinit();
+
+    const b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    const n = try std.base64.standard.Decoder.calcSizeForSlice(b64);
+    const raw = try alloc.alloc(u8, n);
+    defer alloc.free(raw);
+    try std.base64.standard.Decoder.decode(raw, b64);
+    try std.Io.Dir.writeFile(.cwd(), io, .{ .sub_path = "/tmp/zh_read_image_loop.png", .data = raw });
+    defer std.Io.Dir.deleteFile(.cwd(), io, "/tmp/zh_read_image_loop.png") catch {};
+
+    var r = try loop.attachImage(io, "zh_read_image_loop.png");
+    defer tool_builtin.freeResult(alloc, &r);
+    try std.testing.expect(r.success);
+
+    try loop.deliverPendingImages();
+    const last = loop.messages.items[loop.messages.items.len - 1];
+    try std.testing.expectEqual(model.Role.user, last.role);
+    try std.testing.expectEqual(@as(usize, 1), last.images.len);
+    try std.testing.expectEqualStrings("image/png", last.images[0].media_type);
 }
 
 test "loop extensions wiring: plan goal memory skills end to end" {

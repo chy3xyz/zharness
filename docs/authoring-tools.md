@@ -120,7 +120,7 @@ files with `std.Io.Dir.deleteFile(.cwd(), io, path)`.
 Run:
 
 ```bash
-zig build test                             # full suite (410 tests)
+zig build test                             # full suite (413 tests)
 zig build test -Dtest-filter="<name>"       # only tests whose name matches
 ```
 

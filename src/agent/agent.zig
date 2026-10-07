@@ -27,6 +27,7 @@ const tool_builtin = @import("../tool/builtin.zig");
 const session_mod = @import("../session/session.zig");
 const compaction_mod = @import("compaction.zig");
 const sandbox_mod = @import("../sandbox/sandbox.zig");
+const read_image_mod = @import("../tool/read_image.zig");
 const Message = model_mod.Message;
 const Role = model_mod.Role;
 const ChatClient = model_mod.ChatClient;
@@ -115,6 +116,14 @@ pub const Extensions = struct {
     ) anyerror!?tool_builtin.ToolResult,
 };
 
+/// One read_image attachment owned by the loop.
+const OwnedImage = struct {
+    media_type: []u8,
+    data_b64: []u8,
+    name: []u8,
+    delivered: bool = false,
+};
+
 /// The driver: a loop that alternates model inference and tool execution.
 pub const AgentLoop = struct {
     alloc: std.mem.Allocator,
@@ -131,6 +140,10 @@ pub const AgentLoop = struct {
     checkpoints: ?*checkpoint_mod.CheckpointStore,
     /// Loop-native tools + dynamic prompt sections; null when unwired.
     ext: ?*const Extensions,
+    /// read_image attachments awaiting delivery as an extra user message.
+    attached: std.ArrayList(OwnedImage) = .empty,
+    /// ImagePart slices referenced by messages (freed with the loop).
+    image_blocks: std.ArrayList([]model_mod.ImagePart) = .empty,
     /// Optional image parts attached to the next user prompt. Borrowed for
     /// the duration of run(); the caller owns the backing slices.
     first_user_images: []const model_mod.ImagePart = &.{},
@@ -177,6 +190,74 @@ pub const AgentLoop = struct {
             if (m.tool_calls_json) |t| self.alloc.free(t);
         }
         self.messages.deinit(self.alloc);
+        for (self.image_blocks.items) |b| self.alloc.free(b);
+        self.image_blocks.deinit(self.alloc);
+        for (self.attached.items) |a| {
+            self.alloc.free(a.media_type);
+            self.alloc.free(a.data_b64);
+            self.alloc.free(a.name);
+        }
+        self.attached.deinit(self.alloc);
+    }
+
+    /// Load a workspace image and queue it for the next model request.
+    pub fn attachImage(self: *AgentLoop, io: std.Io, path: []const u8) !tool_builtin.ToolResult {
+        const l = read_image_mod.load(self.alloc, io, self.cwd, path) catch |e| {
+            return .{
+                .success = false,
+                .output = "",
+                .err_msg = try std.fmt.allocPrint(self.alloc, "read_image: {s}", .{@errorName(e)}),
+            };
+        };
+        self.attached.append(self.alloc, .{
+            .media_type = l.media_type,
+            .data_b64 = l.data_b64,
+            .name = l.name,
+        }) catch |e| {
+            var mut = l;
+            read_image_mod.freeLoaded(self.alloc, &mut);
+            return e;
+        };
+        return .{
+            .success = true,
+            .output = try std.fmt.allocPrint(
+                self.alloc,
+                "attached {s} ({s}, {d} bytes) to the next model request",
+                .{ path, l.media_type, l.byte_len },
+            ),
+            .err_msg = null,
+        };
+    }
+
+    /// Deliver queued read_image attachments as one extra user message so the
+    /// model sees them on this turn. No-op when nothing is pending.
+    pub fn deliverPendingImages(self: *AgentLoop) !void {
+        var n: usize = 0;
+        for (self.attached.items) |a| {
+            if (!a.delivered) n += 1;
+        }
+        if (n == 0) return;
+
+        const parts = try self.alloc.alloc(model_mod.ImagePart, n);
+        var i: usize = 0;
+        var content: std.ArrayList(u8) = .empty;
+        defer content.deinit(self.alloc);
+        try content.appendSlice(self.alloc, "[image attached: ");
+        for (self.attached.items) |*a| {
+            if (a.delivered) continue;
+            parts[i] = .{ .media_type = a.media_type, .data_b64 = a.data_b64, .name = a.name };
+            if (i > 0) try content.appendSlice(self.alloc, ", ");
+            try content.appendSlice(self.alloc, a.name);
+            a.delivered = true;
+            i += 1;
+        }
+        try content.appendSlice(self.alloc, "]");
+        try self.image_blocks.append(self.alloc, parts);
+        try self.messages.append(self.alloc, .{
+            .role = .user,
+            .content = try self.alloc.dupe(u8, content.items),
+            .images = parts,
+        });
     }
 
     /// Cumulative token usage across all completed model turns.
@@ -308,6 +389,9 @@ pub const AgentLoop = struct {
                 self.agent.config.compact_threshold,
                 self.agent.config.compact_keep_recent,
             );
+
+            // Deliver any read_image attachments queued since the last turn.
+            try self.deliverPendingImages();
 
             // Checkpoint the transcript at the turn boundary (best-effort).
             self.saveCheckpoint(turn_msg);

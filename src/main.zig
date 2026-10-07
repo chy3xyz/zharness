@@ -54,6 +54,7 @@ const attachments = @import("server/apiproxy/attachments.zig");
 const tool_attachments = @import("tool/attachments.zig");
 const present_mod = @import("tool/present.zig");
 const jobs_tool = @import("tool/jobs.zig");
+const read_image_mod = @import("tool/read_image.zig");
 const goals_rpc = @import("server/apiproxy/goals_rpc.zig");
 const plan_frames = @import("server/apiproxy/plan_frames.zig");
 const jobs_rpc = @import("server/apiproxy/jobs_rpc.zig");
@@ -887,6 +888,8 @@ pub const LoopExtensions = struct {
     session_id: []const u8 = "",
     /// Approval policy consulted by the permission gate (from config).
     approval_mode: config.Config.ApprovalMode = .ask,
+    /// The owning loop (set after construction) for image attachments.
+    loop: ?*agent.AgentLoop = null,
 
     pub fn extensions(self: *LoopExtensions) agent.Extensions {
         return .{
@@ -1007,6 +1010,14 @@ pub const LoopExtensions = struct {
     fn execTool(ctx: *anyopaque, alloc: std.mem.Allocator, io: std.Io, call: tool_builtin.ToolCall) anyerror!?tool_builtin.ToolResult {
         const self: *LoopExtensions = @ptrCast(@alignCast(ctx));
         if (jobs_tool.isJobTool(call.name)) return try jobs_tool.execute(alloc, io, self.cwd, call);
+        if (std.mem.eql(u8, call.name, "read_image")) {
+            const path = (model.extractStringField(alloc, call.arguments, "path") catch null) orelse
+                return .{ .success = false, .output = "", .err_msg = try alloc.dupe(u8, "read_image: missing 'path'") };
+            defer alloc.free(path);
+            const lp = self.loop orelse
+                return .{ .success = false, .output = "", .err_msg = try alloc.dupe(u8, "read_image: loop not wired") };
+            return try lp.attachImage(io, path);
+        }
         if (std.mem.eql(u8, call.name, "present")) {
             const r = try present_mod.execute(alloc, io, self.cwd, call);
             if (r.success) emitObsRaw("deliverable/presented", call.arguments);
@@ -2540,6 +2551,7 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
     try tool_attachments.registerAttachments(tools);
     try present_mod.register(tools);
     try jobs_tool.register(tools);
+    try read_image_mod.register(tools);
     g_ask_storage = .{ .publish = publishAskFrame, .store = questions.sharedStore() catch null };
     ask_user.setAskCtx(&g_ask_storage);
 
@@ -2805,6 +2817,7 @@ fn buildLoop(alloc: std.mem.Allocator, cfg: *config.Config, opts: LoopOpts) !Bui
     errdefer alloc.destroy(loop);
     loop.* = try agent.AgentLoop.init(alloc, ctx, ag, client, tools, run_cwd, onEvent, checkpoints, ext_iface);
     loop.first_user_images = opts.images;
+    lext.loop = loop;
 
     return .{
         .ctx = ctx,
