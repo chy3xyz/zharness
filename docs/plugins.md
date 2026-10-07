@@ -164,7 +164,7 @@ Every failure mode is contained and recorded in `PluginRegistry.report`
 | Tool execution returns NULL | failed tool result back to the model; loop continues |
 
 Nothing ever panics the host. Tests prove leak-freedom under
-`std.testing.allocator` (`zig test -lc test/_t_plug.zig`).
+`std.testing.allocator` (covered by `zig build test`).
 
 > Note: ABI v1 does not fork-isolate `zh_tool_execute`. A plugin that
 > segfaults takes down the host process — same trust level as a native
@@ -174,11 +174,11 @@ Nothing ever panics the host. Tests prove leak-freedom under
 
 - Pure logic (manifest parse/validation, name sanitization, ABI-version
   check): inline tests in `src/pluginabi/loader.zig` — no dlopen needed.
-- One smoke test in `test/_t_plug.zig` loads
+- One smoke test in the plugin-loader test root loads
   `examples/plugin-hello/build/*` **only if it exists** (run `build.sh`
   once to enable it); otherwise it skips, keeping CI hermetic.
 
-Run: `zig test -lc test/_t_plug.zig`
+Run: `zig build test`
 
 ---
 

@@ -291,12 +291,15 @@ zharness/
 ## Testing
 
 ```bash
-zig build test                              # full suite (387 tests)
-zig test test/_t_g1.zig                    # a single test root
+zig build test                             # full suite (387 tests)
+zig build test -Dtest-filter="shell echo"  # a single test by name
 ```
 
-Test files live in `test/` as standalone roots (`_t_*.zig`). Each can be run
-independently or through the build system.
+Tests live inline in each module as `test { ... }` blocks, pulled into the
+build by `src/tests.zig`. The `test/_t_*.zig` files are the original per-area
+swarm roots; their modules are already folded into `zig build test`, so they
+are not runnable standalone (Zig's module path disallows `../src` imports
+from `test/`).
 
 ## Architecture
 

@@ -24,7 +24,6 @@ to the process CWD, so run the server from the repository root.
 | `webui/dist/plugins/`                     | Client plugin manifests                        |
 | `src/server/apiproxy/`                        | Zig apiproxy (RPC + WebSocket hubs)            |
 | `src/server/static.zig`                       | Static file server                             |
-| `test/_t_static.zig`                          | Pure routing tests                             |
 
 ## API endpoints consumed
 

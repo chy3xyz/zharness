@@ -120,8 +120,8 @@ files with `std.Io.Dir.deleteFile(.cwd(), io, path)`.
 Run:
 
 ```bash
-zig build test
-zig test src/tool/builtin.zig --main-pkg-path .
+zig build test                             # full suite (387 tests)
+zig build test -Dtest-filter="<name>"       # only tests whose name matches
 ```
 
 ## Checklist
