@@ -33,6 +33,14 @@ pub const definitions = [_]tool_reg.ToolDefinition{
         \\{"type":"object","properties":{"query":{"type":"string"},"sessionId":{"type":"string"},"limit":{"type":"integer"}},"required":["query"]}
         ,
     },
+    .{
+        .name = "session_trace",
+        .description = "Summarize one session event log as a compact timeline: role counts, tool-call count and per-event seq/role/size rows.",
+        .category = .general,
+        .parameters_json =
+        \\{"type":"object","properties":{"sessionId":{"type":"string"},"limit":{"type":"integer"}},"required":["sessionId"]}
+        ,
+    },
 };
 
 pub fn register(reg: *tool_reg.ToolRegistry) !void {
@@ -67,6 +75,7 @@ fn parseLimit(args: []const u8) ?usize {
 pub fn execute(a: std.mem.Allocator, io: std.Io, cwd: []const u8, call: ToolCall) !ToolResult {
     if (std.mem.eql(u8, call.name, "session_event_read")) return readEvents(a, io, cwd, call.arguments);
     if (std.mem.eql(u8, call.name, "session_event_search")) return searchEvents(a, io, cwd, call.arguments);
+    if (std.mem.eql(u8, call.name, "session_trace")) return traceSession(a, io, cwd, call.arguments);
     return fail(a, "unknown session event tool");
 }
 
@@ -198,6 +207,78 @@ fn scanSession(
     return false;
 }
 
+fn traceSession(a: std.mem.Allocator, io: std.Io, cwd: []const u8, args: []const u8) !ToolResult {
+    const sid = (try model.extractStringField(a, args, "sessionId")) orelse
+        return fail(a, "session_trace: missing 'sessionId'");
+    defer a.free(sid);
+    const limit = parseLimit(args) orelse return fail(a, "session_trace: limit must be 1..200");
+
+    const path = try logPath(a, cwd, sid);
+    defer a.free(path);
+    const lines = log_mod.readEventLines(a, io, path) catch |e| switch (e) {
+        error.FileNotFound => return fail(a, "session_trace: unknown session id"),
+        else => return fail(a, @errorName(e)),
+    };
+    defer log_mod.freeEventLines(a, lines);
+
+    var user: usize = 0;
+    var assistant: usize = 0;
+    var tool: usize = 0;
+    var system: usize = 0;
+    var calls: usize = 0;
+    for (lines) |ln| {
+        const role = (jsonx.getStringAlloc(a, ln.raw, "role") catch null) orelse continue;
+        defer a.free(role);
+        if (std.mem.eql(u8, role, "user")) user += 1 else if (std.mem.eql(u8, role, "assistant")) assistant += 1 else if (std.mem.eql(u8, role, "tool")) tool += 1 else if (std.mem.eql(u8, role, "system")) system += 1;
+        if (jsonx.getRaw(ln.raw, "tool_calls_json")) |tcj| {
+            if (!std.mem.eql(u8, std.mem.trim(u8, tcj, " "), "null")) calls += 1;
+        }
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    try out.appendSlice(a, "{\"sessionId\":");
+    try jsonx.appendJsonString(a, &out, sid);
+    try out.appendSlice(a, ",\"events\":");
+    try jsonx.appendInt(a, &out, @intCast(lines.len));
+    try out.appendSlice(a, ",\"roles\":{\"user\":");
+    try jsonx.appendInt(a, &out, @intCast(user));
+    try out.appendSlice(a, ",\"assistant\":");
+    try jsonx.appendInt(a, &out, @intCast(assistant));
+    try out.appendSlice(a, ",\"tool\":");
+    try jsonx.appendInt(a, &out, @intCast(tool));
+    try out.appendSlice(a, ",\"system\":");
+    try jsonx.appendInt(a, &out, @intCast(system));
+    try out.appendSlice(a, "},\"toolCalls\":");
+    try jsonx.appendInt(a, &out, @intCast(calls));
+    try out.appendSlice(a, ",\"trace\":[");
+    var shown: usize = 0;
+    var more = false;
+    for (lines) |ln| {
+        if (shown >= limit) {
+            more = true;
+            break;
+        }
+        const role = (jsonx.getStringAlloc(a, ln.raw, "role") catch null) orelse "unknown";
+        defer a.free(role);
+        const content = (jsonx.getStringAlloc(a, ln.raw, "content") catch null) orelse "";
+        defer if (content.len > 0) a.free(content);
+        if (shown > 0) try out.append(a, ',');
+        try out.appendSlice(a, "{\"seq\":");
+        try jsonx.appendInt(a, &out, ln.seq);
+        try out.appendSlice(a, ",\"role\":");
+        try jsonx.appendJsonString(a, &out, role);
+        try out.appendSlice(a, ",\"chars\":");
+        try jsonx.appendInt(a, &out, @intCast(content.len));
+        try out.append(a, '}');
+        shown += 1;
+    }
+    try out.append(a, ']');
+    if (more) try out.appendSlice(a, ",\"truncated\":true");
+    try out.append(a, '}');
+    return .{ .success = true, .output = try out.toOwnedSlice(a) };
+}
+
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -237,4 +318,35 @@ test "session event read and search decode the JSONL log" {
     try testing.expect(std.mem.indexOf(u8, s.output, "zh_evt_a") != null);
     try testing.expect(std.mem.indexOf(u8, s.output, "\"seq\":1") != null);
     try testing.expect(std.mem.indexOf(u8, s.output, "irrelevant") == null);
+}
+
+test "session_trace summarizes roles and tool calls" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cwd = "/tmp/zh_trace_test";
+    try std.Io.Dir.createDirPath(.cwd(), io, cwd ++ "/.zharness/sessions");
+    const path = cwd ++ "/.zharness/sessions/zh_trace_a.json.jsonl";
+    defer std.Io.Dir.deleteFile(.cwd(), io, path) catch {};
+
+    const h = try log_mod.headerLine(a, "zh_trace_a");
+    defer a.free(h);
+    try log_mod.append(io, path, h);
+    const m1 = try log_mod.messageLine(a, 1, .{ .role = .user, .content = "do it" });
+    defer a.free(m1);
+    try log_mod.append(io, path, m1);
+    const m2 = try log_mod.messageLine(a, 2, .{ .role = .assistant, .content = "calling", .tool_calls_json = "[{\"id\":\"t1\"}]" });
+    defer a.free(m2);
+    try log_mod.append(io, path, m2);
+    const m3 = try log_mod.messageLine(a, 3, .{ .role = .tool, .content = "result", .tool_call_id = "t1" });
+    defer a.free(m3);
+    try log_mod.append(io, path, m3);
+
+    var r = try execute(a, io, cwd, .{ .name = "session_trace", .arguments = "{\"sessionId\":\"zh_trace_a\"}" });
+    defer freeResult(a, &r);
+    try testing.expect(r.success);
+    try testing.expect(std.mem.indexOf(u8, r.output, "\"events\":3") != null);
+    try testing.expect(std.mem.indexOf(u8, r.output, "\"user\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, r.output, "\"assistant\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, r.output, "\"tool\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, r.output, "\"toolCalls\":1") != null);
 }

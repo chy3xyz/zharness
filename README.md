@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Zig 0.17](https://img.shields.io/badge/Zig-0.17-orange.svg)](https://ziglang.org/)
-[![Tests](https://img.shields.io/badge/Tests-437%20passing-brightgreen.svg)](#testing)
+[![Tests](https://img.shields.io/badge/Tests-438%20passing-brightgreen.svg)](#testing)
 [![CI](https://github.com/chy3xyz/zharness/actions/workflows/ci.yml/badge.svg)](https://github.com/chy3xyz/zharness/actions/workflows/ci.yml)
 
 ---
@@ -211,6 +211,7 @@ The coding agent has access to:
 | `terminal_open` / `terminal_send` / `terminal_read` / `terminal_list` / `terminal_close` | Persistent shells (`/bin/sh`) whose cwd/env survive across calls |
 | `session_search` / `session_read` | Search past session transcripts and read one session |
 | `session_event_read` / `session_event_search` | Read/search a session's seq-numbered event log |
+| `session_trace` | Compact timeline (roles, tool calls, sizes) of one session log |
 | `team_task_create` / `team_task_list` / `team_task_get` / `team_task_update` | Shared task board with CAS revisions, ownership and dependencies |
 | `list_agents` / `wait_agent` / `send_message` / `interrupt_agent` | List, wait on, message or cooperatively cancel subagent runs |
 | `schedule_create` / `schedule_list` / `schedule_update` / `schedule_delete` | One-shot reminders surfaced in the system prompt |
@@ -306,7 +307,7 @@ zharness/
 ## Testing
 
 ```bash
-zig build test                             # full suite (437 tests)
+zig build test                             # full suite (438 tests)
 zig build test -Dtest-filter="shell echo"  # a single test by name
 ```
 
