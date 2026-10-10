@@ -357,6 +357,7 @@ pub const WasmRegistry = struct {
                 error.MemoryTooLarge => self.addReport(path, "memory declaration exceeds sandbox cap ({d} pages)", .{self.limits.max_memory_pages}),
                 error.ImportDenied => self.addReport(path, "requests imports outside the sandbox allowlist", .{}),
                 error.ExecutionLimit => self.addReport(path, "start function exceeded step budget ({d})", .{self.limits.step_budget}),
+                error.CallDepthExceeded => self.addReport(path, "start function exceeded call depth ({d})", .{self.limits.max_call_depth}),
                 error.OutOfMemory => self.addReport(path, "out of memory", .{}),
             }
             return;
@@ -492,6 +493,7 @@ pub const WasmRegistry = struct {
     ) void {
         switch (e) {
             error.ExecutionLimit => self.addReport(path, "'{s}' exceeded step budget ({d})", .{ export_name, self.limits.step_budget }),
+            error.CallDepthExceeded => self.addReport(path, "'{s}' exceeded call depth ({d})", .{ export_name, self.limits.max_call_depth }),
             error.GuestTrap => self.addReport(path, "'{s}' trapped", .{export_name}),
             error.MemoryFault => self.addReport(path, "'{s}' hit the memory cap", .{export_name}),
             error.UnknownExport => self.addReport(path, "'{s}' vanished between validation and call", .{export_name}),
@@ -688,6 +690,7 @@ pub const WasmRegistry = struct {
         }) catch |e| {
             const msg = switch (e) {
                 error.ExecutionLimit => try std.fmt.allocPrint(alloc, "tool '{s}' exceeded its step budget", .{host_tool_name}),
+                error.CallDepthExceeded => try std.fmt.allocPrint(alloc, "tool '{s}' exceeded its call depth", .{host_tool_name}),
                 error.GuestTrap => try std.fmt.allocPrint(alloc, "tool '{s}' trapped", .{host_tool_name}),
                 error.MemoryFault => try std.fmt.allocPrint(alloc, "tool '{s}' hit the memory cap", .{host_tool_name}),
                 else => try std.fmt.allocPrint(alloc, "tool '{s}' failed: {s}", .{ host_tool_name, @errorName(e) }),

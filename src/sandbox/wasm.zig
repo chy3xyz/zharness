@@ -51,6 +51,9 @@ pub const wasm = @import("cordis").wasm;
 pub const default_step_budget: usize = 10_000_000;
 /// Default linear-memory ceiling: 256 pages = 16 MiB.
 pub const default_max_memory_pages: u32 = 256;
+/// Default recursion ceiling (call frames per instance). Tighter than the
+/// zcordis default of 1024.
+pub const default_max_call_depth: usize = 256;
 /// Default on-disk module size cap: 8 MiB.
 pub const default_max_module_bytes: usize = 8 * 1024 * 1024;
 /// Headroom added ON TOP of `max_memory_pages * page_size` for interpreter
@@ -65,6 +68,9 @@ pub const Limits = struct {
     /// Hard ceiling for linear memory (declared min pages must fit; runtime
     /// growth stops here too).
     max_memory_pages: u32 = default_max_memory_pages,
+    /// Recursion ceiling: calls deeper than this trap instead of growing the
+    /// frame stack without bound (kernel `setMaxCallDepth`, zcordis v0.2.0).
+    max_call_depth: usize = default_max_call_depth,
     /// Refuse modules larger than this before parsing.
     max_module_bytes: usize = default_max_module_bytes,
 };
@@ -98,12 +104,16 @@ pub const LoadError = error{
     ImportDenied,
     /// The start function burned the whole step budget while instantiating.
     ExecutionLimit,
+    /// The start function recursed past limits.max_call_depth.
+    CallDepthExceeded,
     OutOfMemory,
 };
 
 pub const CallError = error{
     /// Step budget exhausted (fuel model).
     ExecutionLimit,
+    /// Recursion past limits.max_call_depth.
+    CallDepthExceeded,
     /// Guest bug: trap, stack underflow, div-by-zero, bad opcode, indirect
     /// call type mismatch … folded into one name — guest faults are data,
     /// not crashes.
@@ -262,10 +272,12 @@ pub const WasmVm = struct {
         ) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.ExecutionLimit => return error.ExecutionLimit, // start fn burned the budget
+            error.CallDepthExceeded => return error.CallDepthExceeded, // start fn recursed too deep
             else => return error.MalformedModule, // start fn trapped / bad link
         };
         errdefer inst.deinit();
         inst.setStepBudget(limits.step_budget);
+        inst.setMaxCallDepth(limits.max_call_depth);
 
         const self = try alloc.create(WasmVm);
         errdefer alloc.destroy(self);
@@ -297,6 +309,7 @@ pub const WasmVm = struct {
         return self.inst.callExport(name, args) catch |e| switch (e) {
             error.OutOfMemory => error.OutOfMemory,
             error.ExecutionLimit => error.ExecutionLimit,
+            error.CallDepthExceeded => error.CallDepthExceeded,
             error.MemoryOutOfBounds => error.MemoryFault,
             error.UnknownExport => error.UnknownExport,
             error.NotAFunction => error.UnknownExport,
@@ -493,4 +506,19 @@ test "runtime memory growth beyond the sandbox page cap is MemoryFault" {
     defer vm2.deinit();
     _ = try vm2.call("run", &.{});
     try testing.expectEqual(@as(usize, 300 * wasm.page_size), vm2.memory().len);
+}
+
+test "recursion past max_call_depth is rejected, not fatal" {
+    const alloc = testing.allocator;
+    // run() calls itself (call 0) unconditionally: the depth cap must trip
+    // before the frame stack grows unbounded (zcordis v0.2.0 hardening).
+    // Body = locals-count 0, then call 0, then end.
+    const body = [_]u8{ 0x00, 0x10, 0x00, 0x0b };
+    const bytes = try buildTinyModule(alloc, &body);
+    defer alloc.free(bytes);
+    var limits = default_limits;
+    limits.max_call_depth = 16;
+    var vm = try WasmVm.load(alloc, bytes, limits, default_policy);
+    defer vm.deinit();
+    try testing.expectError(error.CallDepthExceeded, vm.call("run", &.{}));
 }

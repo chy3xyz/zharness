@@ -149,8 +149,11 @@ used to free.
   `read_mcp_resource`; prompts are not bridged yet.
 - Presets constrain the classic builtin toolset only; harness capabilities
   (plan/goal/memory/skill/web/mcp/plugin/spawn_agent) always stay available.
-- L2 WASM sandboxing awaits the zcordis wasm runtime. The `process` sandbox is
-  L1 defense-in-depth (deny-list + env allowlist + watchdog), not a boundary;
+- The L2 WASM sandbox wraps the zcordis runtime (`sandbox/wasm.zig`): a
+  per-instance instruction budget (`setStepBudget`), a linear-memory cap, a
+  module-size cap, an import allowlist and — with zcordis v0.2.0 — a call-depth
+  bound (`setMaxCallDepth`, default 256). The `process` sandbox is L1
+  defense-in-depth (deny-list + env allowlist + watchdog), not a boundary;
   `native` adds OS confinement (macOS Seatbelt / Linux bubblewrap) when the
   host provides it. Sandboxed shells also set kernel resource limits
   (`ulimit -t` CPU seconds, `ulimit -n` open files) via `sandbox.limitsPrelude`.
